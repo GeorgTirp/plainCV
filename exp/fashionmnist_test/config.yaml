@@ -1,0 +1,15 @@
+batch_size: 128
+dataset: fashion_mnist
+exp_name: fashionmnist_test
+image_size: 28
+lr: 0.001
+model: resnet_small
+num_channels: 1
+num_classes: 10
+num_epochs: 5
+optim: adamw
+out_dir: ./exp
+over_write: true
+print_progress: true
+seed: 0
+use_wandb: false
