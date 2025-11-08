@@ -1,3 +1,3 @@
-from .dataloaders import get_dataloaders
+from .fashion_mnist import get_datasets
 
-__all__ = ['get_dataloaders']
+__all__ = ['get_datasets']

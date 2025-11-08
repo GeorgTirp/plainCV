@@ -1,3 +1,4 @@
-from .construct import construct_model, get_param_groups
+from .mlp import MLP
+from .resnet_small import SmallResNet
 
-__all__ = ['construct_model', 'get_param_groups']
+__all__ = ['MLP', 'SmallResNet']
