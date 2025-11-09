@@ -25,6 +25,7 @@ class TrainState(train_state.TrainState):
     batch_stats: Any = None  # for BatchNorm (mutable collections)
 
 
+
 def create_train_state(
     rng,
     model_def,
@@ -42,7 +43,12 @@ def create_train_state(
     if cfg is None:
         tx = optax.adamw(learning_rate)
     else:
-        tx = get_optimizer(cfg, model_def=model_def, curvature_batch=curvature_batch)
+        tx = get_optimizer(
+            cfg,
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,      # <-- NEW
+        )
 
     state = TrainState.create(
         apply_fn=model_def.apply,

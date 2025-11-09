@@ -49,6 +49,7 @@ def softmax_cross_entropy_hessian_vec(
 
 def make_ggn_matvec_fn(
     model_def: Any,
+    batch_stats: Any,
     curvature_batch: Tuple[Array, Array],
 ) -> GGNMatvecFn:
     """Build a GGN matvec function for a Flax classifier with softmax CE.
@@ -77,8 +78,16 @@ def make_ggn_matvec_fn(
         """Forward pass returning logits only."""
         # NOTE: no dropout rngs here; you can add rngs={"dropout": rng} later.
         variables = {"params": params}
-        logits = model_def.apply(variables, images, train=True)
-        return logits  # (B, C)
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        logits = model_def.apply(
+            variables, 
+            images, 
+            train=True,
+            mutable=False,
+        )  # (B, C)
+        return logits 
 
     # We will use jvp + vjp around logits_fn:
     #   1) jvp(logits_fn, (params,), (vec_pytree,)) -> (logits, J v)

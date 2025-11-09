@@ -236,39 +236,49 @@ def pns_eigenadam(
         # -------------------------------------------------------------------
         # 1. Optionally update curvature (GGN eigenbasis) every N steps
         # -------------------------------------------------------------------
-        if (
-            ggn_matvec_fn is not None
-            and params is not None
-            and (step % curvature_update_every == 0)
-        ):
-            # Flatten params to know the dimension
-            flat_params, unravel_params = ravel_pytree(params)
-            dim = flat_params.shape[0]
-
-            # We also need a way to flatten/unflatten tangent vectors with the
-            # same structure as params. We'll re-use unravel_params for that.
-            def matvec_flat(v_flat: Array) -> Array:
-                # v_flat -> PyTree with same shape as params
-                v_pytree = unravel_params(v_flat)
-                # Apply user-provided GGN matvec in PyTree space
-                Hv_pytree = ggn_matvec_fn(params, v_pytree, rng_key)
-                # Flatten back
-                Hv_flat, _ = ravel_pytree(Hv_pytree)
-                return Hv_flat
-
-            rng_key, lanczos_key = jax.random.split(rng_key)
-
-            evals, evecs = lanczos(
-                matvec=matvec_flat,
-                dim=dim,
-                num_iter=lanczos_iters,
-                key=lanczos_key,
+        if ggn_matvec_fn is not None and params is not None:
+            # JAX boolean scalar
+            should_update = (step % curvature_update_every) == 0
+    
+            def do_update(carry):
+                eigenvalues, eigenvectors, rng_key, params = carry
+    
+                # Flatten params to know the dimension
+                flat_params, unravel_params = ravel_pytree(params)
+                dim = flat_params.shape[0]
+    
+                def matvec_flat(v_flat: Array) -> Array:
+                    v_pytree = unravel_params(v_flat)
+                    Hv_pytree = ggn_matvec_fn(params, v_pytree, rng_key)
+                    Hv_flat, _ = ravel_pytree(Hv_pytree)
+                    return Hv_flat
+    
+                rng_key, lanczos_key = jax.random.split(rng_key)
+    
+                evals, evecs = lanczos(
+                    matvec=matvec_flat,
+                    dim=dim,
+                    num_iter=lanczos_iters,
+                    key=lanczos_key,
+                )
+    
+                k = jnp.minimum(max_eigenvectors, evals.shape[0])
+                # use jnp.minimum so shapes stay JAX-friendly
+                eigenvalues = evals[:k]
+                eigenvectors = evecs[:k]
+    
+                return (eigenvalues, eigenvectors, rng_key, params)
+    
+            def dont_update(carry):
+                # just keep current eigenvalues/eigenvectors and rng_key
+                return carry
+    
+            eigenvalues, eigenvectors, rng_key, _ = jax.lax.cond(
+                should_update,
+                do_update,
+                dont_update,
+                operand=(eigenvalues, eigenvectors, rng_key, params),
             )
-
-            # Keep only the top-k eigenpairs
-            k = min(max_eigenvectors, evals.shape[0])
-            eigenvalues = evals[:k]
-            eigenvectors = evecs[:k]
 
         # -------------------------------------------------------------------
         # 2. Precondition gradients in eigenbasis

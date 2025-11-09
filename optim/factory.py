@@ -11,6 +11,7 @@ def get_optimizer(
     cfg,
     model_def: Optional[Any] = None,
     curvature_batch: Optional[Any] = None,
+    batch_stats: Optional[Any] = None, 
 ) -> optax.GradientTransformation:
     name = getattr(cfg, "optim", "adamw").lower()
     lr = float(cfg.lr)
@@ -36,12 +37,13 @@ def get_optimizer(
         beta1 = getattr(cfg, "beta1", 0.9)
         beta2 = getattr(cfg, "beta2", 0.999)
         eps = getattr(cfg, "eps", 1e-8)
-        curvature_update_every = getattr(cfg, "curvature_update_every", 100)
+        curvature_update_every = getattr(cfg, "curvature_update_every", 1)
         max_eigenvectors = getattr(cfg, "max_eigenvectors", 16)
 
         ggn_mv = make_ggn_matvec_fn(
             model_def=model_def,
             curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
         )
 
         return pns_eigenadam(
