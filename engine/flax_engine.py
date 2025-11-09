@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax.training import train_state
 import optax
+from optim.factory import get_optimizer
 
 
 def cross_entropy_loss(logits, labels):
@@ -24,15 +25,17 @@ class TrainState(train_state.TrainState):
     batch_stats: Any = None  # for BatchNorm (mutable collections)
 
 
-def create_train_state(rng, model_def, learning_rate: float, image_shape, num_classes: int):
-    """Initialize model + optimizer."""
+def create_train_state(rng, model_def, learning_rate: float, image_shape, num_classes: int, cfg=None):
     dummy_batch = jnp.zeros(image_shape, dtype=jnp.float32)
-
     variables = model_def.init(rng, dummy_batch, train=True)
     params = variables["params"]
     batch_stats = variables.get("batch_stats")
 
-    tx = optax.adamw(learning_rate)
+    if cfg is None:
+        # Fallback to simple AdamW if no config passed
+        tx = optax.adamw(learning_rate)
+    else:
+        tx = get_optimizer(cfg)
 
     state = TrainState.create(
         apply_fn=model_def.apply,

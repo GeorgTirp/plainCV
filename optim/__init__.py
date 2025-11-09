@@ -1,3 +1,13 @@
-from .init_optim import intialize_optimizer, initialize_scheduler
+# optim/__init__.py
+"""Public exports for the optim package."""
 
-__all__ = ['intialize_optimizer', 'initialize_scheduler']
+from .base import GradientTransformation, StepState
+from .factory import get_optimizer
+from .pns_eigenadam import pns_eigenadam
+
+__all__ = [
+    "GradientTransformation",
+    "StepState",
+    "get_optimizer",
+    "pns_eigenadam",
+]

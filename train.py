@@ -6,11 +6,19 @@ from absl import app, flags
 import jax
 import jax.numpy as jnp
 
+from flax.metrics.tensorboard import SummaryWriter
+
 from data.fashion_mnist import get_datasets
 from engine.flax_engine import create_train_state, make_train_step, make_eval_step
 from models.mlp import MLP
 from models.resnet_small import SmallResNet
-from utils import load_config, maybe_make_dir, init_wandb, log_scalar_dict
+from utils import (
+    load_config,
+    maybe_make_dir,
+    init_wandb,
+    log_scalar_dict,
+    get_exp_dir_path,
+)
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string("config", "config/config.yaml", "Path to config.yaml file.")
@@ -27,20 +35,19 @@ def construct_model(cfg):
 
 
 def main(_argv):
-    # Now FLAGS.config is parsed and safe to use
+    # FLAGS.config is parsed and safe to use
     cfg, _ = load_config(FLAGS.config)
 
     maybe_make_dir(cfg)
     init_wandb(cfg)
 
-    rng = jax.random.PRNGKey(cfg.seed)
-    rng, init_rng, step_rng = jax.random.split(rng, 3)
+    # TensorBoard writer in the experiment directory
+    exp_dir = get_exp_dir_path(cfg)
+    writer = SummaryWriter(log_dir=exp_dir)
 
-    # Data
-    train_ds, test_ds = get_datasets(
-        batch_size=cfg.batch_size,
-        seed=cfg.seed,
-    )
+    # RNG setup
+    rng = jax.random.PRNGKey(cfg.seed)
+    rng, init_rng = jax.random.split(rng)
 
     # Model
     model_def = construct_model(cfg)
@@ -59,6 +66,7 @@ def main(_argv):
         learning_rate=cfg.lr,
         image_shape=image_shape,
         num_classes=cfg.num_classes,
+        cfg=cfg,
     )
 
     train_step = make_train_step()
@@ -68,14 +76,24 @@ def main(_argv):
     for epoch in range(1, cfg.num_epochs + 1):
         start_time = time.time()
 
+        # Recreate fresh dataset iterators each epoch
+        train_ds, test_ds = get_datasets(
+            batch_size=cfg.batch_size,
+            seed=cfg.seed + epoch,  # optional: vary seed per epoch
+        )
+
+        # --------------------
         # Train
+        # --------------------
         train_metrics = []
         for batch in train_ds:
-            rng, batch_rng = jax.random.split(step_rng)
+            rng, batch_rng = jax.random.split(rng)
             state, metrics = train_step(state, batch, batch_rng)
             train_metrics.append(metrics)
 
+        # --------------------
         # Eval
+        # --------------------
         eval_metrics = []
         for batch in test_ds:
             metrics = eval_step(state, batch)
@@ -92,6 +110,7 @@ def main(_argv):
 
         epoch_time = time.time() - start_time
 
+        # Console + optional wandb logging
         log_scalar_dict(
             cfg,
             {
@@ -104,6 +123,13 @@ def main(_argv):
             },
         )
 
+        # TensorBoard logging
+        writer.scalar("train/loss", float(train_summary["loss"]), step=epoch)
+        writer.scalar("train/accuracy", float(train_summary["accuracy"]), step=epoch)
+        writer.scalar("eval/loss", float(eval_summary["loss"]), step=epoch)
+        writer.scalar("eval/accuracy", float(eval_summary["accuracy"]), step=epoch)
+        writer.scalar("epoch_time", float(epoch_time), step=epoch)
+
         print(
             f"Epoch {epoch:03d} | "
             f"train loss {train_summary['loss']:.4f}, "
@@ -112,6 +138,9 @@ def main(_argv):
             f"eval acc {eval_summary['accuracy']:.4f} | "
             f"time {epoch_time:.2f}s"
         )
+
+    writer.flush()
+    writer.close()
 
 
 if __name__ == "__main__":
