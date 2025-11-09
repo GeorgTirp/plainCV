@@ -1,11 +1,15 @@
 # train.py
 """Train a small CNN or MLP on Fashion-MNIST in JAX/Flax."""
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"  # e.g. use at most 60% of GPU
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
 import time
 from absl import app, flags
 
 import jax
 import jax.numpy as jnp
-
 from flax.metrics.tensorboard import SummaryWriter
 
 from data.fashion_mnist import get_datasets
@@ -25,7 +29,7 @@ flags.DEFINE_string("config", "config/config.yaml", "Path to config.yaml file.")
 
 
 def construct_model(cfg):
-    # cfg.model is a string in a flat config: "mlp" or "resnet_small"
+    """Build model from config."""
     if cfg.model == "mlp":
         return MLP(num_classes=cfg.num_classes)
     elif cfg.model == "resnet_small":
@@ -35,13 +39,12 @@ def construct_model(cfg):
 
 
 def main(_argv):
-    # FLAGS.config is parsed and safe to use
+    # Parse config
     cfg, _ = load_config(FLAGS.config)
 
+    # Experiment dir + logging
     maybe_make_dir(cfg)
     init_wandb(cfg)
-
-    # TensorBoard writer in the experiment directory
     exp_dir = get_exp_dir_path(cfg)
     writer = SummaryWriter(log_dir=exp_dir)
 
@@ -60,40 +63,50 @@ def main(_argv):
         cfg.num_channels,
     )
 
+    # Curvature batch for GGN / PN-EigenAdam (one deterministic batch)
+    curv_train_ds, _ = get_datasets(
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,  # fixed seed for reproducibility
+    )
+    curv_images, curv_labels = next(iter(curv_train_ds))
+    curvature_batch = (curv_images, curv_labels)
+
+    # Create train state (params + optimizer)
+    # NOTE: create_train_state should accept cfg and curvature_batch even if
+    # it currently ignores curvature_batch for plain AdamW.
     state = create_train_state(
-        init_rng,
+        rng=init_rng,
         model_def=model_def,
         learning_rate=cfg.lr,
         image_shape=image_shape,
         num_classes=cfg.num_classes,
         cfg=cfg,
+        curvature_batch=curvature_batch,
     )
 
     train_step = make_train_step()
     eval_step = make_eval_step()
 
+    # --------------------
     # Training loop
+    # --------------------
     for epoch in range(1, cfg.num_epochs + 1):
         start_time = time.time()
 
-        # Recreate fresh dataset iterators each epoch
+        # Fresh dataset iterators each epoch
         train_ds, test_ds = get_datasets(
             batch_size=cfg.batch_size,
             seed=cfg.seed + epoch,  # optional: vary seed per epoch
         )
 
-        # --------------------
-        # Train
-        # --------------------
+        # ---- Train ----
         train_metrics = []
         for batch in train_ds:
             rng, batch_rng = jax.random.split(rng)
             state, metrics = train_step(state, batch, batch_rng)
             train_metrics.append(metrics)
 
-        # --------------------
-        # Eval
-        # --------------------
+        # ---- Eval ----
         eval_metrics = []
         for batch in test_ds:
             metrics = eval_step(state, batch)

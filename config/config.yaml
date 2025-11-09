@@ -1,14 +1,14 @@
 seed: 0
 
 dataset: "fashion_mnist"
-batch_size: 128
+batch_size: 64
 image_size: 28
 num_channels: 1
 num_classes: 10
 
 model: "resnet_small"  # or "mlp"
 
-optim: "adamw"
+optim: "pns_eigenadam"
 lr: 0.001              # <= scalar float, NOT [0.001] and not "0.001"
 
 num_epochs: 5

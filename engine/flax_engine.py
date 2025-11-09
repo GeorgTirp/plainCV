@@ -25,17 +25,24 @@ class TrainState(train_state.TrainState):
     batch_stats: Any = None  # for BatchNorm (mutable collections)
 
 
-def create_train_state(rng, model_def, learning_rate: float, image_shape, num_classes: int, cfg=None):
+def create_train_state(
+    rng,
+    model_def,
+    learning_rate: float,
+    image_shape,
+    num_classes: int,
+    cfg=None,
+    curvature_batch=None,
+):
     dummy_batch = jnp.zeros(image_shape, dtype=jnp.float32)
     variables = model_def.init(rng, dummy_batch, train=True)
     params = variables["params"]
     batch_stats = variables.get("batch_stats")
 
     if cfg is None:
-        # Fallback to simple AdamW if no config passed
         tx = optax.adamw(learning_rate)
     else:
-        tx = get_optimizer(cfg)
+        tx = get_optimizer(cfg, model_def=model_def, curvature_batch=curvature_batch)
 
     state = TrainState.create(
         apply_fn=model_def.apply,

@@ -1,15 +1,24 @@
 # data/fashion_mnist.py
 from typing import Iterator, Tuple
 
+import os
+import tensorflow as tf
 import tensorflow_datasets as tfds
 import jax
 import jax.numpy as jnp
+
+# --- NEW: disable TF using the GPU, it should stay CPU-only ---
+try:
+    tf.config.set_visible_devices([], "GPU")
+except Exception:
+    # If TF is older / API mismatch, just ignore.
+    pass
+# ---------------------------------------------------------------
 
 
 def _preprocess(example):
     image = example["image"]          # uint8 (28, 28, 1)
     label = example["label"]          # int64
-    # We'll normalize in the model, but ensure dtype and shape here
     return {
         "image": image,
         "label": label,
@@ -29,10 +38,9 @@ def get_datasets(batch_size: int, seed: int = 0):
         ds = ds.batch(batch_size, drop_remainder=True)
         ds = ds.prefetch(1)
 
-        # Turn TF tensors into device arrays lazily
         for batch in tfds.as_numpy(ds):
-            images = batch["image"]    # (B, 28,28,1), uint8
-            labels = batch["label"]    # (B,)
+            images = batch["image"]
+            labels = batch["label"]
             yield jnp.array(images), jnp.array(labels)
 
     return (
