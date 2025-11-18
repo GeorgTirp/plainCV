@@ -3,19 +3,27 @@ seed: 0
 dataset: "fashion_mnist"
 batch_size: 64
 image_size: 28
+num_epochs: 10
 num_channels: 1
 num_classes: 10
 
 model: "resnet_small"  # or "mlp"
 
-optim: "pns_eigenadam"
-lr: 0.001              # <= scalar float, NOT [0.001] and not "0.001"
+optim: muon
+lr: 0.001
+weight_decay: 0.01
+beta1: 0.9
+beta2: 0.999
 
-num_epochs: 5
+# Optional Muon-specific fields (all have defaults):
+muon_beta: 0.95
+muon_ns_steps: 5
+muon_ns_coeffs: [3.4445, -4.7750, 2.0315]
+muon_nesterov: true
+muon_adaptive: false
 
-exp_name: "fashionmnist_test"
-out_dir: "./exp"
-over_write: True
-print_progress: True
+schedule_free: False
+schedule_free_lr: 0.01
+schedule_free_b1: 0.9
+schedule_free_weight_lr_power: 2.0
 
-use_wandb: False

@@ -85,7 +85,7 @@ def make_ggn_matvec_fn(
             variables, 
             images, 
             train=True,
-            mutable=False,
+            mutable=['batch_stats'],
         )  # (B, C)
         return logits 
 
