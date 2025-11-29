@@ -2,6 +2,9 @@ batch_size: 64
 beta1: 0.9
 beta2: 0.999
 dataset: fashion_mnist
+hf_cg_max_iters: 15
+hf_cg_tol: 1e-2
+hf_damping: 1e-2
 image_size: 28
 lr: 0.001
 model: resnet_small
@@ -16,6 +19,10 @@ muon_ns_steps: 5
 num_channels: 1
 num_classes: 10
 num_epochs: 10
-optim: muon
+optim: hessian_free
+schedule_free: false
+schedule_free_b1: 0.9
+schedule_free_lr: 0.01
+schedule_free_weight_lr_power: 2.0
 seed: 0
 weight_decay: 0.01

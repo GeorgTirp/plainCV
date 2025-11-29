@@ -76,18 +76,25 @@ def make_ggn_matvec_fn(
 
     def logits_fn(params: Params) -> Array:
         """Forward pass returning logits only."""
-        # NOTE: no dropout rngs here; you can add rngs={"dropout": rng} later.
         variables = {"params": params}
         if batch_stats is not None:
             variables["batch_stats"] = batch_stats
 
-        logits = model_def.apply(
-            variables, 
-            images, 
-            train=True,
-            mutable=['batch_stats'],
-        )  # (B, C)
-        return logits 
+            # NOTE: apply returns (logits, new_vars) when mutable is not False
+            logits, _ = model_def.apply(
+                variables,
+                images,
+                train=True,
+                mutable=["batch_stats"],
+            )
+        else:
+            logits = model_def.apply(
+                variables,
+                images,
+                train=True,
+            )
+
+        return logits  
 
     # We will use jvp + vjp around logits_fn:
     #   1) jvp(logits_fn, (params,), (vec_pytree,)) -> (logits, J v)

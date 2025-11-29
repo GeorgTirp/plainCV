@@ -2,10 +2,12 @@
 from typing import Any, Optional
 
 import optax
-
+from .soap import soap as soap_opt
 from .pns_eigenadam import pns_eigenadam
 from .ggn_utils import make_ggn_matvec_fn
 from .muon import build_muon_dim_numbers
+from .hessian_free import hessian_free as hf_opt
+
 
 
 def maybe_wrap_schedule_free(base_tx, cfg):
@@ -76,7 +78,7 @@ def get_optimizer(
             curvature_update_every=curvature_update_every,
             max_eigenvectors=max_eigenvectors,
             ggn_matvec_fn=ggn_mv,
-            params=None
+            #params=None
         )
 
     elif name == "muon":
@@ -124,6 +126,50 @@ def get_optimizer(
             # Default: Muon only on 2D params
             muon_weight_dimension_numbers=dim_fn,
             #consistent_rms=consistent_rms,
+        )
+    
+    elif name == "soap":
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        beta1 = getattr(cfg, "beta1", 0.9)
+        beta2 = getattr(cfg, "beta2", 0.95)
+        eps = getattr(cfg, "eps", 1e-8)
+        precond_freq = getattr(cfg, "precondition_frequency", 10)
+        shampoo_beta2 = getattr(cfg, "shampoo_beta2", None)
+
+        tx = soap_opt(
+            learning_rate=lr,
+            b1=beta1,
+            b2=beta2,
+            eps=eps,
+            weight_decay=weight_decay,
+            precondition_frequency=precond_freq,
+            shampoo_beta2=shampoo_beta2,
+        )
+
+
+    elif name in {"hf", "hessian_free"}:
+        # Needs the same ingredients as PN-S EigenAdam:
+        assert model_def is not None, "model_def required for Hessian-free"
+        assert curvature_batch is not None, "curvature_batch required for Hessian-free"
+
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        damping = getattr(cfg, "hf_damping", 1e-3)
+        cg_max_iters = getattr(cfg, "hf_cg_max_iters", 50)
+        cg_tol = getattr(cfg, "hf_cg_tol", 1e-4)
+
+        ggn_mv = make_ggn_matvec_fn(
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+        )
+
+        tx = hf_opt(
+            ggn_matvec_fn=ggn_mv,
+            learning_rate=lr,
+            weight_decay=weight_decay,
+            damping=damping,
+            cg_max_iters=cg_max_iters,
+            cg_tol=cg_tol,
         )
 
     else:

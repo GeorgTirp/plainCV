@@ -130,7 +130,7 @@ def build_muon_dim_numbers(params):
         return None
 
     # If you don't care about using the path, you can just map over leaves.
-    return jtu.tree_map(leaf_fn, params)
+    return jtu.tree_map_with_path(leaf_fn, params)
 
 
 def build_muon_tx(
