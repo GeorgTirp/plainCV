@@ -22,6 +22,7 @@ from utils import (
     init_wandb,
     log_scalar_dict,
     get_exp_dir_path,
+    save_loss_curves,
 )
 
 FLAGS = flags.FLAGS
@@ -72,8 +73,6 @@ def main(_argv):
     curvature_batch = (curv_images, curv_labels)
 
     # Create train state (params + optimizer)
-    # NOTE: create_train_state should accept cfg and curvature_batch even if
-    # it currently ignores curvature_batch for plain AdamW.
     state = create_train_state(
         rng=init_rng,
         model_def=model_def,
@@ -86,6 +85,16 @@ def main(_argv):
 
     train_step = make_train_step()
     eval_step = make_eval_step()
+
+    # For curves: wall-clock vs loss and iteration vs loss
+    wall_times = []
+    iters = []
+    train_losses = []
+    eval_losses = []
+    train_accs = []
+    eval_accs = []
+
+    training_start_time = time.time()
 
     # --------------------
     # Training loop
@@ -123,6 +132,16 @@ def main(_argv):
 
         epoch_time = time.time() - start_time
 
+        # Accumulate data for curves
+        # inside epoch loop, after computing train_summary / eval_summary:
+        elapsed_from_start = time.time() - training_start_time
+        wall_times.append(float(elapsed_from_start))
+        iters.append(int(epoch))
+        train_losses.append(float(train_summary["loss"]))
+        eval_losses.append(float(eval_summary["loss"]))
+        train_accs.append(float(train_summary["accuracy"]))
+        eval_accs.append(float(eval_summary["accuracy"]))
+
         # Console + optional wandb logging
         log_scalar_dict(
             cfg,
@@ -152,9 +171,22 @@ def main(_argv):
             f"time {epoch_time:.2f}s"
         )
 
+    # Save CSVs + plots for wall-clock vs loss and iteration vs loss
+    save_loss_curves(
+        cfg=cfg,
+        optimizer_name=cfg.optim,
+        wall_times=wall_times,
+        iterations=iters,
+        train_losses=train_losses,
+        eval_losses=eval_losses,
+        train_accuracies=train_accs,
+        eval_accuracies=eval_accs,
+    )
+
     writer.flush()
     writer.close()
-
+    
+    
 
 if __name__ == "__main__":
     app.run(main)

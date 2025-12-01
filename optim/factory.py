@@ -1,13 +1,15 @@
 # optim/factory.py
+
 from typing import Any, Optional
 
 import optax
+
+from optim.kronecker import make_kronecker_ggn_matvec_fn
 from .soap import soap as soap_opt
 from .pns_eigenadam import pns_eigenadam
 from .ggn_utils import make_ggn_matvec_fn
 from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
-
 
 
 def maybe_wrap_schedule_free(base_tx, cfg):
@@ -36,10 +38,39 @@ def get_optimizer(
     curvature_batch: Optional[Any] = None,
     batch_stats: Optional[Any] = None,
 ) -> optax.GradientTransformation:
+    # You can leave default "adamw" if you like; config will override anyway.
     name = getattr(cfg, "optim", "adamw").lower()
     lr = float(cfg.lr)
 
-    if name == "adamw":
+    # ------------------------
+    # Standard Adam (NEW)
+    # ------------------------
+    if name == "adam":
+        beta1 = getattr(cfg, "beta1", 0.9)
+        beta2 = getattr(cfg, "beta2", 0.999)
+        eps = getattr(cfg, "eps", 1e-8)
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+
+        adam_tx = optax.adam(
+            learning_rate=lr,
+            b1=beta1,
+            b2=beta2,
+            eps=eps,
+        )
+
+        # "Standard" Adam + optional L2-style weight decay
+        if weight_decay != 0.0:
+            tx = optax.chain(
+                optax.add_decayed_weights(weight_decay),
+                adam_tx,
+            )
+        else:
+            tx = adam_tx
+
+    # ------------------------
+    # AdamW
+    # ------------------------
+    elif name == "adamw":
         weight_decay = getattr(cfg, "weight_decay", 0.0)
         beta1 = getattr(cfg, "beta1", 0.9)
         beta2 = getattr(cfg, "beta2", 0.999)
@@ -52,23 +83,43 @@ def get_optimizer(
             weight_decay=weight_decay,
         )
 
+    # ------------------------
+    # PN-S EigenAdam
+    # ------------------------
     elif name in {"pns_eigenadam", "pns-eigenadam"}:
         assert model_def is not None, "model_def required for PN-S EigenAdam"
         assert curvature_batch is not None, "curvature_batch required for PN-S EigenAdam"
-
+    
+        # Shared Adam-style stuff
         weight_decay = getattr(cfg, "weight_decay", 0.0)
         beta1 = getattr(cfg, "beta1", 0.9)
         beta2 = getattr(cfg, "beta2", 0.999)
         eps = getattr(cfg, "eps", 1e-8)
-        curvature_update_every = getattr(cfg, "curvature_update_every", 1)
-        max_eigenvectors = getattr(cfg, "max_eigenvectors", 16)
-
-        ggn_mv = make_ggn_matvec_fn(
-            model_def=model_def,
-            curvature_batch=curvature_batch,
-            batch_stats=batch_stats,
-        )
-
+    
+        # PN-S specific knobs (only read here)
+        curvature_update_every = getattr(cfg, "pns_curvature_update_every", 10)
+        max_eigenvectors = getattr(cfg, "pns_max_eigenvectors", 16)
+        lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
+        precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
+        backend = getattr(cfg, "pns_curvature_backend", "ggn")
+    
+        # Build curvature matvec
+        if backend == "ggn":
+            ggn_mv = make_ggn_matvec_fn(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
+        elif backend == "kronecker":
+            from .kronecker import make_kronecker_matvec_fn
+            ggn_mv = make_kronecker_ggn_matvec_fn(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
+        else:
+            raise ValueError(f"Unknown pns_curvature_backend: {backend}")
+    
         tx = pns_eigenadam(
             learning_rate=lr,
             beta1=beta1,
@@ -77,10 +128,15 @@ def get_optimizer(
             weight_decay=weight_decay,
             curvature_update_every=curvature_update_every,
             max_eigenvectors=max_eigenvectors,
+            lanczos_iters=lanczos_iters,
             ggn_matvec_fn=ggn_mv,
-            #params=None
+            precond_damping=precond_damping,
         )
 
+
+    # ------------------------
+    # Muon
+    # ------------------------
     elif name == "muon":
         # Shared / legacy config fields
         weight_decay = getattr(cfg, "weight_decay", 0.0)
@@ -103,9 +159,7 @@ def get_optimizer(
 
         def dim_fn(p):
             return build_muon_dim_numbers(p)
-        # optax.contrib.muon:
-        # - applies Muon to all 2D parameters (by default),
-        # - uses AdamW-style updates for everything else. :contentReference[oaicite:0]{index=0}
+
         tx = optax.contrib.muon(
             learning_rate=lr,
             ns_coeffs=ns_coeffs,
@@ -125,9 +179,12 @@ def get_optimizer(
             adam_weight_decay=weight_decay,
             # Default: Muon only on 2D params
             muon_weight_dimension_numbers=dim_fn,
-            #consistent_rms=consistent_rms,
+            # consistent_rms=consistent_rms,
         )
-    
+
+    # ------------------------
+    # SOAP
+    # ------------------------
     elif name == "soap":
         weight_decay = getattr(cfg, "weight_decay", 0.0)
         beta1 = getattr(cfg, "beta1", 0.9)
@@ -146,9 +203,10 @@ def get_optimizer(
             shampoo_beta2=shampoo_beta2,
         )
 
-
+    # ------------------------
+    # Hessian-free
+    # ------------------------
     elif name in {"hf", "hessian_free"}:
-        # Needs the same ingredients as PN-S EigenAdam:
         assert model_def is not None, "model_def required for Hessian-free"
         assert curvature_batch is not None, "curvature_batch required for Hessian-free"
 
@@ -174,6 +232,7 @@ def get_optimizer(
 
     else:
         raise ValueError(f"Unknown optimizer name: {cfg.optim}")
-    
+
+    # Optional schedule-free wrapper
     tx = maybe_wrap_schedule_free(tx, cfg)
     return tx

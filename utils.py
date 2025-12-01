@@ -2,7 +2,12 @@ import os
 import math
 import shutil
 import yaml
-
+import csv
+from typing import Sequence
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 from itertools import product
 from collections import namedtuple
 
@@ -253,3 +258,137 @@ def print_master(msg: str):
 
     if rank_val == 0:
         print(msg)
+
+
+# ---------------------------------------------------------------------------
+# Curve saving helpers (CSV + plots)
+# ---------------------------------------------------------------------------
+
+def _sanitize_name(name: str) -> str:
+    """Make a string safe to use in filenames."""
+    return "".join(
+        c if (c.isalnum() or c in ("-", "_")) else "_"
+        for c in str(name)
+    )
+
+
+def save_loss_curves(
+    cfg,
+    optimizer_name: str,
+    wall_times,
+    iterations,
+    train_losses,
+    eval_losses,
+    train_accuracies,
+    eval_accuracies,
+) -> None:
+    """
+    Save a single CSV and plots for training curves.
+
+    CSV columns:
+      - iteration
+      - wall_time_sec
+      - train_loss
+      - eval_loss
+      - train_accuracy
+      - eval_accuracy
+
+    Plots (still saved separately):
+      - wallclock time vs eval loss
+      - iteration vs eval loss
+
+    All files go into the experiment directory, e.g. ./exp/run or
+    ./exp/run/job_idx_X (the same place as your config + TB logs).
+    """
+    n = len(iterations)
+    if not (
+        len(wall_times) == n
+        and len(train_losses) == n
+        and len(eval_losses) == n
+        and len(train_accuracies) == n
+        and len(eval_accuracies) == n
+    ):
+        raise ValueError(
+            "All metric sequences must have the same length "
+            "(iterations, wall_times, train/eval losses, train/eval accuracies)."
+        )
+
+    # This is typically something like "./exp/run" (or with job_idx suffix)
+    exp_dir = get_exp_dir_path(cfg)
+    os.makedirs(exp_dir, exist_ok=True)
+
+    opt_name_safe = _sanitize_name(optimizer_name)
+
+    # -------- Single CSV with all metrics --------
+    metrics_csv_path = os.path.join(
+        exp_dir, f"{opt_name_safe}_metrics.csv"
+    )
+    with open(metrics_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "iteration",
+                "wall_time_sec",
+                "train_loss",
+                "eval_loss",
+                "train_accuracy",
+                "eval_accuracy",
+            ]
+        )
+        for it, t, tr_l, ev_l, tr_a, ev_a in zip(
+            iterations,
+            wall_times,
+            train_losses,
+            eval_losses,
+            train_accuracies,
+            eval_accuracies,
+        ):
+            writer.writerow(
+                [
+                    int(it),
+                    float(t),
+                    float(tr_l),
+                    float(ev_l),
+                    float(tr_a),
+                    float(ev_a),
+                ]
+            )
+
+    # -------- Plots (if matplotlib is available) --------
+    if plt is None:
+        print(
+            "matplotlib not installed; saved CSV but skipped PNG plots "
+            f"for optimizer {optimizer_name}."
+        )
+        return
+
+    # Time vs eval loss plot
+    time_png_path = os.path.join(
+        exp_dir, f"{opt_name_safe}_time_vs_eval_loss.png"
+    )
+    plt.figure()
+    plt.plot(wall_times, eval_losses)
+    plt.xlabel("Wall-clock time [s]")
+    plt.ylabel("Eval loss")
+    plt.title(f"{optimizer_name} – time vs eval loss")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(time_png_path)
+    plt.close()
+
+    # Iter vs eval loss plot
+    iter_png_path = os.path.join(
+        exp_dir, f"{opt_name_safe}_iter_vs_eval_loss.png"
+    )
+    plt.figure()
+    plt.plot(iterations, eval_losses)
+    plt.xlabel("Iteration (epoch)")
+    plt.ylabel("Eval loss")
+    plt.title(f"{optimizer_name} – iteration vs eval loss")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(iter_png_path)
+    plt.close()
+
+    print(f"Saved metrics CSV + eval-loss plots in {exp_dir}")
+

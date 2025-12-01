@@ -22,8 +22,8 @@ num_epochs: 10
 optim: pns_eigenadam
 pns_curvature_backend: ggn
 pns_curvature_update_every: 2
-pns_lanczos_iters: 15
-pns_max_eigenvectors: 15
+pns_lanczos_iters: 10
+pns_max_eigenvectors: 10
 pns_precond_damping: 0.0001
 schedule_free: false
 schedule_free_b1: 0.9

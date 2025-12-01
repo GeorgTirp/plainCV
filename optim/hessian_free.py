@@ -151,6 +151,7 @@ def hessian_free(
     lr = float(learning_rate)
     wd = float(weight_decay)
     lam = float(damping)
+    cg_tol = float(cg_tol)
 
     def init_fn(params: PyTree) -> HFState:
         return HFState(

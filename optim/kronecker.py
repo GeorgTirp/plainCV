@@ -1,8 +1,8 @@
-# optim/kronecker.py
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
+import jax.nn as jnn
 from jax import tree_util as jtu
 
 Array = jax.Array
@@ -28,11 +28,6 @@ def build_kronecker_matrix(
 
     Returns:
       H ≈ R ⊗ L ∈ R^{(mn) x (mn)}.
-
-    Note:
-      By the identity vec(L X R^T) = (R ⊗ L) vec(X), this H acts on
-      vec(W) by first reshaping to (m, n), then applying L on the left
-      and R on the right.
     """
     if left.ndim != 2 or right.ndim != 2:
         raise ValueError(
@@ -94,11 +89,7 @@ def make_kronecker_matvec_fn(
     left: Array,
     right: Array,
 ) -> MatvecFn:
-    """Return a closure v ↦ (R ⊗ L) v for fixed factors.
-
-    Useful when you want a matvec to feed into Lanczos/CG without
-    materializing the full Kronecker matrix.
-    """
+    """Return a closure v ↦ (R ⊗ L) v for fixed factors."""
     left = jnp.asarray(left)
     right = jnp.asarray(right)
 
@@ -130,3 +121,99 @@ def tree_kronecker_matvec(
         return out.reshape(v.shape)
 
     return jtu.tree_map(_leaf_mv, factors_tree, vec_tree)
+
+
+# ---------------------------------------------------------------------------
+# Kronecker-based curvature from per-example gradients
+# ---------------------------------------------------------------------------
+
+def make_kronecker_factors_fn(
+    model_def,
+    curvature_batch: Tuple[Array, Array],
+    batch_stats: Optional[PyTree] = None,
+    damping: float = 1e-6,
+):
+    """
+    Return a function `factors_fn(params) -> factors_tree` where each leaf is
+    (L, R) giving a Kronecker block H_block ≈ R ⊗ L, constructed from
+    per-example gradients on the curvature batch.
+
+    Muon-style reshape:
+      - scalar:      (1, 1)
+      - bias (1D):   (1, n)
+      - ndim >= 2:   fan_in = prod(shape[:-1]), fan_out = shape[-1]
+    """
+    images, labels = curvature_batch
+
+    def single_loss(params, x, y):
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        logits = model_def.apply(variables, x[None, ...])[0]
+        num_classes = logits.shape[-1]
+        one_hot = jnn.one_hot(y, num_classes)
+        log_probs = jnn.log_softmax(logits)
+        return -jnp.sum(one_hot * log_probs)
+
+    per_example_grad_fn = jax.jit(
+        jax.vmap(jax.grad(single_loss), in_axes=(None, 0, 0))
+    )
+
+    def factors_fn(params: PyTree) -> PyTree:
+        grads = per_example_grad_fn(params, images, labels)
+        # grads: PyTree, each leaf has shape (B, *param_shape)
+
+        def leaf_factors(param_leaf, grad_leaf):
+            B = grad_leaf.shape[0]
+            param_shape = param_leaf.shape
+
+            if param_leaf.ndim == 0:
+                fan_in, fan_out = 1, 1
+                g_mat = grad_leaf.reshape(B, fan_in, fan_out)
+            elif param_leaf.ndim == 1:
+                n = param_shape[0]
+                fan_in, fan_out = 1, n
+                g_mat = grad_leaf.reshape(B, fan_in, fan_out)
+            else:
+                fan_out = param_shape[-1]
+                fan_in = int(jnp.prod(jnp.array(param_shape[:-1])))
+                g_mat = grad_leaf.reshape(B, fan_in, fan_out)
+
+            L = jnp.einsum("bik,bjk->ij", g_mat, g_mat) / B
+            R = jnp.einsum("bki,bkj->ij", g_mat, g_mat) / B
+
+            L = L + damping * jnp.eye(fan_in, dtype=L.dtype)
+            R = R + damping * jnp.eye(fan_out, dtype=R.dtype)
+
+            return (L, R)
+
+        return jtu.tree_map(leaf_factors, params, grads)
+
+    return factors_fn
+
+
+def make_kronecker_ggn_matvec_fn(
+    model_def,
+    curvature_batch: Tuple[Array, Array],
+    batch_stats: Optional[PyTree] = None,
+    damping: float = 1e-6,
+) -> Callable[[PyTree, PyTree, Array], PyTree]:
+    """
+    Build a GGN-style matvec_fn(params, v_pytree, rng) using a Kronecker
+    approximation per parameter leaf.
+
+    Under the hood this just uses make_kronecker_factors_fn + tree_kronecker_matvec.
+    """
+    factors_fn = make_kronecker_factors_fn(
+        model_def=model_def,
+        curvature_batch=curvature_batch,
+        batch_stats=batch_stats,
+        damping=damping,
+    )
+
+    def ggn_matvec_fn(params: PyTree, vec_pytree: PyTree, rng: Array) -> PyTree:
+        factors_tree = factors_fn(params)
+        return tree_kronecker_matvec(factors_tree, vec_pytree)
+
+    return ggn_matvec_fn
