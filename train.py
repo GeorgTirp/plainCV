@@ -2,14 +2,26 @@
 """Train a small CNN or MLP on Fashion-MNIST in JAX/Flax."""
 import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"  # e.g. use at most 60% of GPU
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.8"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import time
 from absl import app, flags
 
 import jax
 import jax.numpy as jnp
+import sys
+
+print("DEBUG sys.executable:", sys.executable)
+print("DEBUG jax version:", jax.__version__)
+import jaxlib
+print("DEBUG jaxlib version:", jaxlib.__version__)
+print("DEBUG devices from train.py:", jax.devices())
+print("DEBUG backend from train.py:", jax.default_backend())
+from absl import app, flags
+
+
 from flax.metrics.tensorboard import SummaryWriter
 
 from data.fashion_mnist import get_datasets
