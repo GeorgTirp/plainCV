@@ -9,7 +9,7 @@ num_classes: 10
 
 model: "resnet_small"  # or "mlp"
 
-optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free"
+optim: muon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -28,10 +28,10 @@ hf_cg_tol: 1e-2      # looser tolerance
 hf_damping: 1e-2
 
 # --- PN-S EigenAdam–specific hyperparameters ---
-pns_curvature_update_every: 2   # recompute eigenbasis every N steps
-pns_max_eigenvectors: 15          # number of eigen-directions to track
-pns_lanczos_iters: 15            # Lanczos iterations (None = use max_eigenvectors)
-pns_precond_damping: 1.0e-4      # δ in (Λ + δI)^{-1}
+pns_curvature_update_every: 1   # recompute eigenbasis every N steps
+pns_max_eigenvectors: 5          # number of eigen-directions to track
+pns_lanczos_iters: 5            # Lanczos iterations (None = use max_eigenvectors)
+pns_precond_damping: 1.0e-5      # δ in (Λ + δI)^{-1}
 pns_curvature_backend: ggn     # or "kronecker" if you implement that
 
 schedule_free: False

@@ -19,12 +19,12 @@ muon_ns_steps: 5
 num_channels: 1
 num_classes: 10
 num_epochs: 10
-optim: pns_eigenadam
+optim: hessian_free
 pns_curvature_backend: ggn
-pns_curvature_update_every: 2
-pns_lanczos_iters: 10
-pns_max_eigenvectors: 10
-pns_precond_damping: 0.0001
+pns_curvature_update_every: 1
+pns_lanczos_iters: 8
+pns_max_eigenvectors: 8
+pns_precond_damping: 1.0e-05
 schedule_free: false
 schedule_free_b1: 0.9
 schedule_free_lr: 0.01

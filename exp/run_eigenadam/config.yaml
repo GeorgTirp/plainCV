@@ -19,7 +19,7 @@ muon_ns_steps: 5
 num_channels: 1
 num_classes: 10
 num_epochs: 10
-optim: muon
+optim: pns_eigenadam
 pns_curvature_backend: ggn
 pns_curvature_update_every: 1
 pns_lanczos_iters: 5

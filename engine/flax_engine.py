@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from flax.training import train_state
 import optax
 from optim.factory import get_optimizer
+from jax import tree_util as jtu
 
 
 def cross_entropy_loss(logits, labels):
@@ -94,7 +95,6 @@ def make_train_step():
         loss2, (metrics, new_batch_stats) = _apply_model(
             state, images, labels, rng, train=True
         )
-
         state = state.apply_gradients(grads=grads)
         state = state.replace(batch_stats=new_batch_stats)
         metrics = {"loss": loss2, **metrics}

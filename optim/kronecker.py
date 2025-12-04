@@ -150,7 +150,13 @@ def make_kronecker_factors_fn(
         if batch_stats is not None:
             variables["batch_stats"] = batch_stats
 
-        logits = model_def.apply(variables, x[None, ...])[0]
+        # For curvature probes we don't want to mutate BatchNorm stats; use eval mode.
+        logits = model_def.apply(
+            variables,
+            x[None, ...],
+            train=False,
+            mutable=False,
+        )[0]
         num_classes = logits.shape[-1]
         one_hot = jnn.one_hot(y, num_classes)
         log_probs = jnn.log_softmax(logits)
