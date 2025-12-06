@@ -1,11 +1,11 @@
 seed: 0
 
-dataset: "fashion_mnist"
+dataset: "fashion_mnist"   # or "tiny_imagenet"
 batch_size: 64
-image_size: 28
+image_size: 28             # TinyImageNet uses 64; override when switching datasets
 num_epochs: 10
-num_channels: 1
-num_classes: 10
+num_channels: 1            # TinyImageNet uses 3 channels
+num_classes: 10            # TinyImageNet uses 200 classes
 
 model: "resnet_small"  # or "mlp", "vit_small"
 
@@ -17,7 +17,7 @@ vit_layers: 4
 vit_heads: 4
 vit_dropout: 0.1
 
-optim: curvature_muon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "pns_eigenmuon", "curvature_muon"
+optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "pns_eigenmuon", "curvature_muon"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9

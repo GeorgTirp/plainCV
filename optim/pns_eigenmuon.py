@@ -451,9 +451,9 @@ def curvature_muon(
 
     def update_fn(
         grads: PyTree,
-        state: PnsEigenMuonState,
+        state: CurvatureMuonState,
         params: Optional[Params] = None,
-    ):  
+    ):
         # 1) Refresh curvature state (step increment happens inside)
         curvature_state = maybe_update_curvature_state(
             state.curvature_state,
@@ -462,71 +462,38 @@ def curvature_muon(
             curvature_update_every=curvature_update_every,
             lanczos_iters=lanczos_iters,
         )
+
+        # 2) Leading eigenvalue as curvature scale (if available)
         eigenvalues = curvature_state.eigenvalues
-        eigenvectors = curvature_state.eigenvectors
 
-        # 2) Flatten grads to work in the global eigenbasis
-        flat_grads, unravel_grads = ravel_pytree(grads)
-
-        V = eigenvectors  # (k, dim)
-        lambdas = eigenvalues  # (k,)
-
-        # Condition: "no usable curvature yet" = all eigenvalues still zero
-        # (V.shape[0] is static; we don't need to check it dynamically)
-        no_curvature = jnp.all(lambdas == 0)
-
-        def _fallback_muon(_):
-            # Pure Muon with constant LR on all leaves
-            lr_tree = jtu.tree_map(lambda _: base_learning_rate, grads)
-            updates = _muon_tree_update(grads, lr_tree, ns_steps=ns_steps)
-            new_state = PnsEigenMuonState(
-                curvature_state=curvature_state,
-                dummy_state=state.dummy_state,
-            )
-            return updates, new_state
-
-        def _use_curvature(_):
-            # 3) Split gradient into top-k subspace and complement
-            g_top_coords = V @ flat_grads          # (k,)
-            g_parallel = V.T @ g_top_coords
-            g_perp_flat = flat_grads - g_parallel
-
-            # 4) Top-k: curvature-aware scaling (partial Newton) in eigen coordinates
-            scaled_coords = g_top_coords / (lambdas + precond_damping)
-            step_top_flat = -base_learning_rate * (V.T @ scaled_coords)  # Δθ∥
-
-            # 5) Complement: reshape g_perp to PyTree shape and apply Muon per leaf
-            grads_perp = unravel_grads(g_perp_flat)
-            lr_tree = jtu.tree_map(lambda _: base_learning_rate, grads_perp)
-            step_perp_tree = _muon_tree_update(
-                grads_perp,
-                lr_tree,
-                ns_steps=ns_steps,
-            )
-
-            # 6) Combine: top-subspace step (flat) + complement Muon step (tree)
-            step_top_tree = unravel_grads(step_top_flat)
-
-            def _combine(top_u, perp_u):
-                return top_u + perp_u
-
-            updates = jtu.tree_map(_combine, step_top_tree, step_perp_tree)
-            new_state = PnsEigenMuonState(
-                curvature_state=curvature_state,
-                dummy_state=state.dummy_state,
-            )
-            return updates, new_state
-
-        # 7) Use JAX control flow instead of Python if
-        updates, new_state = jax.lax.cond(
-            no_curvature,
-            _fallback_muon,
-            _use_curvature,
-            operand=None,
+        # eigenvalues.shape[0] is a static Python int, so this is safe:
+        lam0 = jnp.where(
+            eigenvalues.shape[0] > 0,
+            eigenvalues[0],
+            jnp.array(1.0, dtype=jnp.float32),
         )
 
+        # Conservative effective curvature: λ_eff = kappa * max(lam0, 0)
+        lam_eff = kappa_uncertainty * jnp.maximum(lam0, 0.0) + 1e-6
+
+        # Curvature-based LR scale ≈ 1 / λ_eff (clamped)
+        lr_scale = 1.0 / lam_eff
+        lr_scale = jnp.clip(lr_scale, a_min=min_lr_scale, a_max=max_lr_scale)
+
+        # 3) Apply Muon update with LR = base_lr * lr_scale for all leaves
+        effective_lr = base_learning_rate * lr_scale
+        lr_tree = jtu.tree_map(lambda _: effective_lr, grads)
+        updates = _muon_tree_update(
+            grads,
+            lr_tree,
+            ns_steps=ns_steps,
+        )
+
+        # 4) New state: only curvature_state + lr_scale (no dummy_state!)
+        new_state = CurvatureMuonState(
+            curvature_state=curvature_state,
+            lr_scale=lr_scale,
+        )
         return updates, new_state
-
-
 
     return optax.GradientTransformation(init_fn, update_fn)

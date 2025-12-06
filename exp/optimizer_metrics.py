@@ -44,6 +44,8 @@ def load_metrics(base_dir: Path) -> pd.DataFrame:
         missing = {
             "iteration",
             "wall_time_sec",
+            "train_accuracy",
+            "train_loss",
             "eval_accuracy",
             "eval_loss",
         } - set(df.columns)
@@ -58,104 +60,142 @@ def load_metrics(base_dir: Path) -> pd.DataFrame:
     return metrics_df
 
 
-def plot_accuracy_vs_iteration(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
+def _plot_metric(
+    metrics_df: pd.DataFrame,
+    x_key: str,
+    y_key: str,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    filename: str,
+    output_dir: Path,
+) -> Path:
     fig, ax = plt.subplots(figsize=(8, 5))
 
     for optimizer, group in metrics_df.groupby("optimizer"):
-        sorted_group = group.sort_values("iteration")
+        sorted_group = group.sort_values(x_key)
         ax.plot(
-            sorted_group["iteration"],
-            sorted_group["eval_accuracy"],
+            sorted_group[x_key],
+            sorted_group[y_key],
             marker="o",
             label=optimizer,
         )
 
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Eval accuracy")
-    ax.set_title("Iteration vs eval accuracy")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.legend(title="Optimizer")
     plt.tight_layout()
 
-    output_path = output_dir / "eval_accuracy_vs_iteration.png"
+    output_path = output_dir / filename
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return output_path
+
+
+def plot_accuracy_vs_iteration(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
+    return _plot_metric(
+        metrics_df,
+        x_key="iteration",
+        y_key="eval_accuracy",
+        title="Iteration vs eval accuracy",
+        xlabel="Iteration",
+        ylabel="Eval accuracy",
+        filename="eval_accuracy_vs_iteration.png",
+        output_dir=output_dir,
+    )
 
 
 def plot_accuracy_vs_wall_time(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for optimizer, group in metrics_df.groupby("optimizer"):
-        sorted_group = group.sort_values("wall_time_sec")
-        ax.plot(
-            sorted_group["wall_time_sec"],
-            sorted_group["eval_accuracy"],
-            marker="o",
-            label=optimizer,
-        )
-
-    ax.set_xlabel("Wall clock time (s)")
-    ax.set_ylabel("Eval accuracy")
-    ax.set_title("Wall clock time vs eval accuracy")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    ax.legend(title="Optimizer")
-    plt.tight_layout()
-
-    output_path = output_dir / "eval_accuracy_vs_wall_time.png"
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return output_path
+    return _plot_metric(
+        metrics_df,
+        x_key="wall_time_sec",
+        y_key="eval_accuracy",
+        title="Wall clock time vs eval accuracy",
+        xlabel="Wall clock time (s)",
+        ylabel="Eval accuracy",
+        filename="eval_accuracy_vs_wall_time.png",
+        output_dir=output_dir,
+    )
 
 
 def plot_loss_vs_iteration(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for optimizer, group in metrics_df.groupby("optimizer"):
-        sorted_group = group.sort_values("iteration")
-        ax.plot(
-            sorted_group["iteration"],
-            sorted_group["eval_loss"],
-            marker="o",
-            label=optimizer,
-        )
-
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Eval loss")
-    ax.set_title("Iteration vs eval loss")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    ax.legend(title="Optimizer")
-    plt.tight_layout()
-
-    output_path = output_dir / "eval_loss_vs_iteration.png"
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return output_path
+    return _plot_metric(
+        metrics_df,
+        x_key="iteration",
+        y_key="eval_loss",
+        title="Iteration vs eval loss",
+        xlabel="Iteration",
+        ylabel="Eval loss",
+        filename="eval_loss_vs_iteration.png",
+        output_dir=output_dir,
+    )
 
 
 def plot_loss_vs_wall_time(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
-    fig, ax = plt.subplots(figsize=(8, 5))
+    return _plot_metric(
+        metrics_df,
+        x_key="wall_time_sec",
+        y_key="eval_loss",
+        title="Wall clock time vs eval loss",
+        xlabel="Wall clock time (s)",
+        ylabel="Eval loss",
+        filename="eval_loss_vs_wall_time.png",
+        output_dir=output_dir,
+    )
 
-    for optimizer, group in metrics_df.groupby("optimizer"):
-        sorted_group = group.sort_values("wall_time_sec")
-        ax.plot(
-            sorted_group["wall_time_sec"],
-            sorted_group["eval_loss"],
-            marker="o",
-            label=optimizer,
-        )
 
-    ax.set_xlabel("Wall clock time (s)")
-    ax.set_ylabel("Eval loss")
-    ax.set_title("Wall clock time vs eval loss")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    ax.legend(title="Optimizer")
-    plt.tight_layout()
+def plot_train_accuracy_vs_iteration(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
+    return _plot_metric(
+        metrics_df,
+        x_key="iteration",
+        y_key="train_accuracy",
+        title="Iteration vs train accuracy",
+        xlabel="Iteration",
+        ylabel="Train accuracy",
+        filename="train_accuracy_vs_iteration.png",
+        output_dir=output_dir,
+    )
 
-    output_path = output_dir / "eval_loss_vs_wall_time.png"
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return output_path
+
+def plot_train_accuracy_vs_wall_time(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
+    return _plot_metric(
+        metrics_df,
+        x_key="wall_time_sec",
+        y_key="train_accuracy",
+        title="Wall clock time vs train accuracy",
+        xlabel="Wall clock time (s)",
+        ylabel="Train accuracy",
+        filename="train_accuracy_vs_wall_time.png",
+        output_dir=output_dir,
+    )
+
+
+def plot_train_loss_vs_iteration(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
+    return _plot_metric(
+        metrics_df,
+        x_key="iteration",
+        y_key="train_loss",
+        title="Iteration vs train loss",
+        xlabel="Iteration",
+        ylabel="Train loss",
+        filename="train_loss_vs_iteration.png",
+        output_dir=output_dir,
+    )
+
+
+def plot_train_loss_vs_wall_time(metrics_df: pd.DataFrame, output_dir: Path) -> Path:
+    return _plot_metric(
+        metrics_df,
+        x_key="wall_time_sec",
+        y_key="train_loss",
+        title="Wall clock time vs train loss",
+        xlabel="Wall clock time (s)",
+        ylabel="Train loss",
+        filename="train_loss_vs_wall_time.png",
+        output_dir=output_dir,
+    )
 
 
 def main() -> None:
@@ -168,17 +208,21 @@ def main() -> None:
     combined_csv = output_dir / "optimizer_metrics_combined.csv"
     metrics_df.to_csv(combined_csv, index=False)
 
-    iter_plot = plot_accuracy_vs_iteration(metrics_df, output_dir)
-    wall_time_plot = plot_accuracy_vs_wall_time(metrics_df, output_dir)
-    loss_iter_plot = plot_loss_vs_iteration(metrics_df, output_dir)
-    loss_wall_time_plot = plot_loss_vs_wall_time(metrics_df, output_dir)
+    plots = [
+        plot_accuracy_vs_iteration(metrics_df, output_dir),
+        plot_accuracy_vs_wall_time(metrics_df, output_dir),
+        plot_loss_vs_iteration(metrics_df, output_dir),
+        plot_loss_vs_wall_time(metrics_df, output_dir),
+        plot_train_accuracy_vs_iteration(metrics_df, output_dir),
+        plot_train_accuracy_vs_wall_time(metrics_df, output_dir),
+        plot_train_loss_vs_iteration(metrics_df, output_dir),
+        plot_train_loss_vs_wall_time(metrics_df, output_dir),
+    ]
 
     print(f"Loaded metrics from {base_dir}")
     print(f"Combined CSV written to {combined_csv}")
-    print(f"Saved plot: {iter_plot}")
-    print(f"Saved plot: {wall_time_plot}")
-    print(f"Saved plot: {loss_iter_plot}")
-    print(f"Saved plot: {loss_wall_time_plot}")
+    for path in plots:
+        print(f"Saved plot: {path}")
 
 
 if __name__ == "__main__":

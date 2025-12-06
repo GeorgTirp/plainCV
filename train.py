@@ -1,6 +1,8 @@
 # train.py
 """Train a small CNN or MLP on Fashion-MNIST in JAX/Flax."""
 import os
+
+from optim.pns_eigenadam import profile_pns_eigenadam_curvature
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.8"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
@@ -24,8 +26,10 @@ from absl import app, flags
 
 from flax.metrics.tensorboard import SummaryWriter
 
-from data.fashion_mnist import get_datasets
+from data import get_datasets
 from engine.flax_engine import create_train_state, make_train_step, make_eval_step
+from optim.ggn_utils import make_ggn_matvec_fn
+
 from models.mlp import MLP
 from models.resnet_small import SmallResNet
 from models.vit_small import VisionTransformer
@@ -89,8 +93,10 @@ def main(_argv):
 
     # Curvature batch for GGN / PN-EigenAdam (one deterministic batch)
     curv_train_ds, _ = get_datasets(
+        dataset=cfg.dataset,
         batch_size=cfg.batch_size,
         seed=cfg.seed,  # fixed seed for reproducibility
+        image_size=getattr(cfg, "image_size", None),
     )
     curv_images, curv_labels = next(iter(curv_train_ds))
     curvature_batch = (curv_images, curv_labels)
@@ -105,6 +111,36 @@ def main(_argv):
         cfg=cfg,
         curvature_batch=curvature_batch,
     )
+
+    # --------- OPTIONAL: profile PN-S curvature step once ---------
+    # Only makes sense if you're using a curvature-based optimizer
+    # (pns_eigenadam, pns_eigenmuon, curvature_muon, hf, etc.)
+    #if cfg.optim in {"pns_eigenadam", "pns-eigenadam",
+    #                 "pns_eigenmuon", "pns-eigenmuon",
+    #                 "curvature_muon", "curvature-muon"}:
+    #    # Build the same GGN matvec that the optimizer factory uses
+    #    ggn_mv = make_ggn_matvec_fn(
+    #        model_def=model_def,
+    #        curvature_batch=curvature_batch,
+    #        batch_stats=state.batch_stats,
+    #    )
+#
+    #    # Use config knobs if they exist, else fall back to defaults
+    #    max_eigs = getattr(cfg, "pns_max_eigenvectors", 16)
+    #    lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
+#
+    #    # Use the main rng or split a fresh one
+    #    rng, prof_rng = jax.random.split(rng)
+#
+    #    profile_pns_eigenadam_curvature(
+    #        params=state.params,
+    #        ggn_matvec_fn=ggn_mv,
+    #        max_eigenvectors=max_eigs,
+    #        lanczos_iters=lanczos_iters,
+    #        rng=prof_rng,
+    #        warmup=True,
+    #    )
+    ## --------------------------------------------------------------
 
     train_step = make_train_step()
     eval_step = make_eval_step()
@@ -127,8 +163,10 @@ def main(_argv):
 
         # Fresh dataset iterators each epoch
         train_ds, test_ds = get_datasets(
+            dataset=cfg.dataset,
             batch_size=cfg.batch_size,
             seed=cfg.seed + epoch,  # optional: vary seed per epoch
+            image_size=getattr(cfg, "image_size", None),
         )
 
         # ---- Train ----

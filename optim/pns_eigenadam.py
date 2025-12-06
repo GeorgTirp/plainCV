@@ -1,4 +1,5 @@
 from typing import Any, Callable, NamedTuple, Optional, Tuple
+import time
 
 import jax
 import jax.numpy as jnp
@@ -578,6 +579,78 @@ def pns_eigenadam(
         return updates, new_state
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+# ---------------------------------------------------------------------------
+# Profiling helpers (manual, not used inside the JITted training loop)
+# ---------------------------------------------------------------------------
+
+def profile_pns_eigenadam_curvature(
+    params: Params,
+    ggn_matvec_fn: GGNMatvecFn,
+    max_eigenvectors: int = 16,
+    lanczos_iters: Optional[int] = None,
+    rng: Optional[Array] = None,
+    warmup: bool = True,
+) -> None:
+    """
+    Run a single curvature update with line_profiler + wall-clock timing.
+
+    This is meant for manual debugging outside the JITted training loop.
+    Usage example:
+        from optim.pns_eigenadam import profile_pns_eigenadam_curvature
+        profile_pns_eigenadam_curvature(params, ggn_matvec_fn, max_eigenvectors=8)
+
+    Notes:
+      - Heavy work (GGN matvec + Lanczos) is XLA-compiled; line_profiler will
+        mostly show timings for Python dispatch. We also emit wall-clock timing
+        with block_until_ready() to capture device time.
+      - warmup=True runs one unprofiled call first to exclude compilation time.
+    """
+    try:
+        from line_profiler import LineProfiler
+    except ImportError as exc:
+        raise ImportError(
+            "line_profiler is required for profiling. Install via `pip install line_profiler`."
+        ) from exc
+
+    if lanczos_iters is None:
+        lanczos_iters = max_eigenvectors
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    flat_params, unravel_params = ravel_pytree(params)
+    dim = flat_params.shape[0]
+    rng, lanczos_key = jax.random.split(rng)
+
+    def matvec_flat(v_flat: Array) -> Array:
+        v_pytree = unravel_params(v_flat)
+        Hv_pytree = ggn_matvec_fn(params, v_pytree, rng)
+        Hv_flat, _ = ravel_pytree(Hv_pytree)
+        return Hv_flat
+
+    if warmup:
+        # Trigger compilation so the profiled run focuses on execution time.
+        _ = lanczos(matvec_flat, dim=dim, num_iter=lanczos_iters, key=lanczos_key)
+
+    lp = LineProfiler()
+    profiled_lanczos = lp(lanczos)
+    profiled_matvec = lp(matvec_flat)
+
+    start = time.perf_counter()
+    evals, evecs = profiled_lanczos(
+        profiled_matvec,
+        dim=dim,
+        num_iter=lanczos_iters,
+        key=lanczos_key,
+    )
+    # Wait for device execution so timing reflects the full runtime.
+    jax.block_until_ready((evals, evecs))
+    elapsed = time.perf_counter() - start
+
+    print(f"[PN-S EigenAdam] Curvature step wall-clock: {elapsed:.3f} s")
+    print(f"Top eigenvalues (first 5): {jnp.asarray(evals)[:5]}")
+    lp.print_stats()
 
 
 # ---------------------------------------------------------------------------

@@ -37,7 +37,13 @@ def create_train_state(
     curvature_batch=None,
 ):
     dummy_batch = jnp.zeros(image_shape, dtype=jnp.float32)
-    variables = model_def.init(rng, dummy_batch, train=True, rngs={"dropout": rng})
+    params_key, dropout_key = jax.random.split(rng)
+    variables = model_def.init(
+        {"params": params_key, "dropout": dropout_key},
+        dummy_batch,
+        train=True,
+    )
+    
     params = variables["params"]
     batch_stats = variables.get("batch_stats")
 
