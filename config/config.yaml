@@ -7,9 +7,17 @@ num_epochs: 10
 num_channels: 1
 num_classes: 10
 
-model: "resnet_small"  # or "mlp"
+model: "resnet_small"  # or "mlp", "vit_small"
 
-optim: muon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free"
+# Vision Transformer defaults (only used if model starts with "vit")
+vit_patch_size: 4
+vit_hidden_size: 128
+vit_mlp_dim: 256
+vit_layers: 4
+vit_heads: 4
+vit_dropout: 0.1
+
+optim: curvature_muon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "pns_eigenmuon", "curvature_muon"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -38,4 +46,3 @@ schedule_free: False
 schedule_free_lr: 0.01
 schedule_free_b1: 0.9
 schedule_free_weight_lr_power: 2.0
-

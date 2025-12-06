@@ -37,7 +37,7 @@ def create_train_state(
     curvature_batch=None,
 ):
     dummy_batch = jnp.zeros(image_shape, dtype=jnp.float32)
-    variables = model_def.init(rng, dummy_batch, train=True)
+    variables = model_def.init(rng, dummy_batch, train=True, rngs={"dropout": rng})
     params = variables["params"]
     batch_stats = variables.get("batch_stats")
 
@@ -63,17 +63,23 @@ def create_train_state(
 def _apply_model(state: TrainState, images, labels, rng, train: bool):
     """Forward + loss + metrics, handling mutable batch_stats."""
     variables = {"params": state.params}
+    rngs = {"dropout": rng} if rng is not None else None
+
     if state.batch_stats is not None:
         variables["batch_stats"] = state.batch_stats
-
-    if train and state.batch_stats is not None:
-        (logits, new_vars) = state.apply_fn(
-            variables, images, train=True, mutable=["batch_stats"], rngs={"dropout": rng}
+        mutable = ["batch_stats"] if train else False
+        outputs = state.apply_fn(
+            variables, images, train=train, mutable=mutable, rngs=rngs
         )
-        new_batch_stats = new_vars["batch_stats"]
+        if train:
+            logits, new_vars = outputs
+            new_batch_stats = new_vars["batch_stats"]
+        else:
+            logits = outputs
+            new_batch_stats = state.batch_stats
     else:
-        logits = state.apply_fn(variables, images, train=False, mutable=False)
-        new_batch_stats = state.batch_stats
+        logits = state.apply_fn(variables, images, train=train, mutable=False, rngs=rngs)
+        new_batch_stats = None
 
     loss = cross_entropy_loss(logits, labels)
     metrics = compute_metrics(logits, labels)

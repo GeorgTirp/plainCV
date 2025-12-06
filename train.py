@@ -28,6 +28,7 @@ from data.fashion_mnist import get_datasets
 from engine.flax_engine import create_train_state, make_train_step, make_eval_step
 from models.mlp import MLP
 from models.resnet_small import SmallResNet
+from models.vit_small import VisionTransformer
 from utils import (
     load_config,
     maybe_make_dir,
@@ -47,6 +48,16 @@ def construct_model(cfg):
         return MLP(num_classes=cfg.num_classes)
     elif cfg.model == "resnet_small":
         return SmallResNet(num_classes=cfg.num_classes)
+    elif cfg.model in {"vit", "vit_small", "vision_transformer"}:
+        return VisionTransformer(
+            num_classes=cfg.num_classes,
+            patch_size=getattr(cfg, "vit_patch_size", 4),
+            hidden_size=getattr(cfg, "vit_hidden_size", 128),
+            mlp_dim=getattr(cfg, "vit_mlp_dim", 256),
+            num_layers=getattr(cfg, "vit_layers", 4),
+            num_heads=getattr(cfg, "vit_heads", 4),
+            dropout_rate=getattr(cfg, "vit_dropout", 0.1),
+        )
     else:
         raise ValueError(f"Unknown model: {cfg.model}")
 
