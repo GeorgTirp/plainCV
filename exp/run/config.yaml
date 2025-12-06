@@ -21,7 +21,7 @@ num_classes: 10
 num_epochs: 10
 optim: pns_eigenadam
 pns_curvature_backend: ggn
-pns_curvature_update_every: 1
+pns_curvature_update_every: 3
 pns_lanczos_iters: 5
 pns_max_eigenvectors: 5
 pns_precond_damping: 1.0e-05
