@@ -164,12 +164,16 @@ def get_exp_dir_path(cfg) -> str:
 
     Uses:
       - cfg.out_dir (default: "./exp")
-      - cfg.exp_name (default: "run")
+      - cfg.exp_name (default: "run_{optim}_{model}" for clarity)
 
     If FLAGS.job_idx is set, we create a subfolder "job_idx_X".
     """
     out_dir = getattr(cfg, "out_dir", "./exp")
-    exp_name = getattr(cfg, "exp_name", "run")
+    # If user left the generic name, derive a more descriptive default.
+    default_name = f"run_{getattr(cfg, 'optim', 'optim')}_{getattr(cfg, 'model', 'model')}"
+    exp_name = getattr(cfg, "exp_name", None) or default_name
+    if exp_name == "run":
+        exp_name = default_name
     exp_dir = os.path.join(out_dir, exp_name)
 
     if FLAGS.job_idx is not None:
@@ -391,4 +395,3 @@ def save_loss_curves(
     plt.close()
 
     print(f"Saved metrics CSV + eval-loss plots in {exp_dir}")
-

@@ -80,18 +80,17 @@ def make_ggn_matvec_fn(
         if batch_stats is not None:
             variables["batch_stats"] = batch_stats
 
-            # NOTE: apply returns (logits, new_vars) when mutable is not False
             logits, _ = model_def.apply(
                 variables,
                 images,
-                train=True,
+                train=False,
                 mutable=["batch_stats"],
             )
         else:
             logits = model_def.apply(
                 variables,
                 images,
-                train=True,
+                train=False,
             )
 
         return logits  

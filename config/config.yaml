@@ -1,9 +1,10 @@
 seed: 0
+print_progress: false
 
 dataset: "tiny_imagenet"   # or "tiny_imagenet"
 batch_size: 64
 image_size: 64             # TinyImageNet uses 64; override when switching datasets
-num_epochs: 10
+num_epochs: 100
 num_channels: 3            # TinyImageNet uses 3 channels
 num_classes: 200            # TinyImageNet uses 200 classes
 
@@ -24,7 +25,7 @@ vit_layers: 4
 vit_heads: 4
 vit_dropout: 0.1
 
-optim: muon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", 
+optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", 
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -43,11 +44,11 @@ hf_cg_tol: 1e-2      # looser tolerance
 hf_damping: 1e-2
 
 # --- PN-S EigenAdam–specific hyperparameters ---
-pns_curvature_update_every: 3   # recompute eigenbasis every N steps
-pns_max_eigenvectors: 5          # number of eigen-directions to track
-pns_lanczos_iters: 5            # Lanczos iterations (None = use max_eigenvectors)
-pns_precond_damping: 1.0e-5      # δ in (Λ + δI)^{-1}
-pns_curvature_backend: ggn     # or "kronecker" if you implement that
+pns_curvature_update_every: 10     
+pns_max_eigenvectors: 10           
+pns_lanczos_iters: 10              
+pns_precond_damping: 1.0e-5       
+pns_curvature_backend: ggn        
 
 schedule_free: False
 schedule_free_lr: 0.01
