@@ -1,13 +1,20 @@
 seed: 0
 
-dataset: "fashion_mnist"   # or "tiny_imagenet"
+dataset: "tiny_imagenet"   # or "tiny_imagenet"
 batch_size: 64
-image_size: 28             # TinyImageNet uses 64; override when switching datasets
+image_size: 64             # TinyImageNet uses 64; override when switching datasets
 num_epochs: 10
-num_channels: 1            # TinyImageNet uses 3 channels
-num_classes: 10            # TinyImageNet uses 200 classes
+num_channels: 3            # TinyImageNet uses 3 channels
+num_classes: 200            # TinyImageNet uses 200 classes
 
-model: "resnet_small"  # or "mlp", "vit_small"
+#dataset: "fashion_mnist"   # or "tiny_imagenet"
+#batch_size: 64
+#image_size: 28            
+#num_epochs: 10
+#num_channels: 1            
+#num_classes: 10           
+
+model: "vit_small"  # or "mlp", "vit_small", "small_resnet", "resnet18"
 
 # Vision Transformer defaults (only used if model starts with "vit")
 vit_patch_size: 4
@@ -17,7 +24,7 @@ vit_layers: 4
 vit_heads: 4
 vit_dropout: 0.1
 
-optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "pns_eigenmuon", "curvature_muon"
+optim: muon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", 
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
