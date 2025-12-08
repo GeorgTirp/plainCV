@@ -11,6 +11,8 @@ from .pns_eigenadam import pns_eigenadam
 from .ggn_utils import make_ggn_matvec_fn
 from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
+from .shampoo import shampoo as shampoo_opt
+
 
 
 def maybe_wrap_schedule_free(base_tx, cfg):
@@ -103,6 +105,8 @@ def get_optimizer(
         lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
         precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
         backend = getattr(cfg, "pns_curvature_backend", "ggn")
+        sketch_dim = getattr(cfg, "pns_sketch_dim", None)
+
     
         # Build curvature matvec
         if backend == "ggn":
@@ -132,6 +136,7 @@ def get_optimizer(
             lanczos_iters=lanczos_iters,
             ggn_matvec_fn=ggn_mv,
             precond_damping=precond_damping,
+            sketch_dim=sketch_dim,
         )
 
 
@@ -183,90 +188,6 @@ def get_optimizer(
             # consistent_rms=consistent_rms,
         )
 
-        # ------------------------
-    # PN-S EigenMuon
-    # ------------------------
-    elif name in {"pns_eigenmuon", "pns-eigenmuon"}:
-        assert model_def is not None, "model_def required for PN-S EigenMuon"
-        assert curvature_batch is not None, "curvature_batch required for PN-S EigenMuon"
-
-        # Shared knobs
-        curvature_update_every = getattr(cfg, "pns_curvature_update_every", 10)
-        max_eigenvectors = getattr(cfg, "pns_max_eigenvectors", 16)
-        lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
-        precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
-        backend = getattr(cfg, "pns_curvature_backend", "ggn")
-        ns_steps = getattr(cfg, "muon_ns_steps", 2)
-
-        # Build curvature matvec (same backend logic as PN-S EigenAdam)
-        if backend == "ggn":
-            ggn_mv = make_ggn_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-            )
-        elif backend == "kronecker":
-            ggn_mv = make_kronecker_ggn_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-            )
-        else:
-            raise ValueError(f"Unknown pns_curvature_backend: {backend}")
-
-        tx = pns_eigenmuon(
-            base_learning_rate=lr,
-            curvature_update_every=curvature_update_every,
-            max_eigenvectors=max_eigenvectors,
-            lanczos_iters=lanczos_iters,
-            ggn_matvec_fn=ggn_mv,
-            precond_damping=precond_damping,
-            ns_steps=ns_steps,
-        )
-
-    # ------------------------
-    # Curvature-aware Muon (global LR scaled by top eigenvalue)
-    # ------------------------
-    elif name in {"curvature_muon", "curvature-muon"}:
-        assert model_def is not None, "model_def required for curvature_muon"
-        assert curvature_batch is not None, "curvature_batch required for curvature_muon"
-
-        curvature_update_every = getattr(cfg, "pns_curvature_update_every", 10)
-        max_eigenvectors = getattr(cfg, "pns_max_eigenvectors", 8)
-        lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
-        backend = getattr(cfg, "pns_curvature_backend", "ggn")
-        kappa_uncertainty = getattr(cfg, "curv_muon_kappa_uncertainty", 1.0)
-        min_lr_scale = getattr(cfg, "curv_muon_min_lr_scale", 1e-3)
-        max_lr_scale = getattr(cfg, "curv_muon_max_lr_scale", 10.0)
-        ns_steps = getattr(cfg, "muon_ns_steps", 2)
-
-        # Build curvature matvec
-        if backend == "ggn":
-            ggn_mv = make_ggn_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-            )
-        elif backend == "kronecker":
-            ggn_mv = make_kronecker_ggn_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-            )
-        else:
-            raise ValueError(f"Unknown pns_curvature_backend: {backend}")
-
-        tx = curvature_muon(
-            base_learning_rate=lr,
-            curvature_update_every=curvature_update_every,
-            max_eigenvectors=max_eigenvectors,
-            lanczos_iters=lanczos_iters,
-            ggn_matvec_fn=ggn_mv,
-            kappa_uncertainty=kappa_uncertainty,
-            min_lr_scale=min_lr_scale,
-            max_lr_scale=max_lr_scale,
-            ns_steps=ns_steps,
-        )
 
     # ------------------------
     # SOAP
@@ -291,6 +212,23 @@ def get_optimizer(
             log_skipped=log_skipped,
         )
 
+     # ------------------------
+    # Shampoo
+    # ------------------------
+    elif name == "shampoo":
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        eps = getattr(cfg, "eps", 1e-4)
+        max_dim = getattr(cfg, "shampoo_max_dim", 2048)
+        exponent = getattr(cfg, "shampoo_exponent", 0.25)
+
+        tx = shampoo_opt(
+            learning_rate=lr,
+            eps=eps,
+            max_dim=max_dim,
+            exponent=exponent,
+            weight_decay=weight_decay,
+        )
+        
     # ------------------------
     # Hessian-free
     # ------------------------

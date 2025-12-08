@@ -4,7 +4,7 @@ import os
 
 from optim.pns_eigenadam import profile_pns_eigenadam_curvature
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.8"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -75,6 +75,21 @@ def main(_argv):
     init_wandb(cfg)
     exp_dir = get_exp_dir_path(cfg)
     writer = SummaryWriter(log_dir=exp_dir)
+
+    # --- Optional: curvature spectrum logging ---
+    log_curv = getattr(cfg, "pns_log_curvature", False)
+    use_pns = cfg.optim in {"pns_eigenadam", "pns-eigenadam"}
+    curvature_csv_path = None
+    max_eigs = getattr(cfg, "pns_max_eigenvectors", 16)
+
+    if log_curv and use_pns:
+        curvature_csv_path = os.path.join(exp_dir, "curvature.csv")
+        # Write header: epoch, step, eig_0,...,eig_{k-1}, rotation_diff
+        header = ["epoch", "global_step"] + [
+            f"eig_{i}" for i in range(max_eigs)
+        ] + ["rotation_diff"]
+        with open(curvature_csv_path, "w") as f:
+            f.write(",".join(header) + "\n")
 
     # RNG setup
     rng = jax.random.PRNGKey(cfg.seed)
@@ -215,6 +230,21 @@ def main(_argv):
                 "epoch_time": epoch_time,
             },
         )
+
+        # --- Curvature spectrum logging (once per epoch) ---
+        if log_curv and use_pns and curvature_csv_path is not None:
+            # NOTE: assumes schedule_free=False so opt_state is directly PnsEigenAdamState
+            pns_state = state.opt_state
+            # JAX arrays -> Python scalars
+            ev = jnp.asarray(pns_state.eigenvalues)
+            rot_diff = float(pns_state.rotation_diff)
+            step_opt = int(pns_state.step)
+
+            eig_list = [float(x) for x in ev[:max_eigs]]
+            row = [epoch, step_opt] + eig_list + [rot_diff]
+
+            with open(curvature_csv_path, "a") as f:
+                f.write(",".join(str(x) for x in row) + "\n")
 
         # TensorBoard logging
         writer.scalar("train/loss", float(train_summary["loss"]), step=epoch)

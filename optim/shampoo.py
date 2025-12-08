@@ -34,7 +34,7 @@ def _reshape_to_2d(x: Array) -> Array:
     """Same convention as SOAP: map arbitrary param shapes to a 2D view.
 
     - 0D: scalar -> 1x1
-    - 1D: vector -> 1 x N (we'll usually NOT Shampoo these)
+    - 1D: vector -> 1 x N
     - 2D: matrix -> as is
     - 4D: conv kernel (Kh, Kw, Cin, Cout) -> Cout x (Kh*Kw*Cin)
     - Fallback: flatten leading dim, pack rest in columns.
@@ -60,7 +60,7 @@ def scale_by_shampoo(
 
     This implements Algorithm 1 (matrix case) from:
       *Shampoo: Preconditioned Stochastic Tensor Optimization*,
-      Gupta et al., ICML 2018. 
+      Gupta et al., ICML 2018.
 
     For a 2D weight matrix W (rows x cols) and gradient G:
       - Maintain:
@@ -87,23 +87,24 @@ def scale_by_shampoo(
         p2d = _reshape_to_2d(p)
         rows, cols = p2d.shape
 
-        # Don't even try full Shampoo on very large or degenerate shapes
-        too_big = (rows > max_dim) or (cols > max_dim) or (rows <= 1) or (cols <= 1)
-        if too_big:
-            eye = jnp.eye(1, dtype=p.dtype)
-            return ShampooPerParamState(
-                L=eye,
-                R=eye,
-                use_shampoo=False,
-            )
-
-        # Algorithm 1: L_0 = eps * I_m, R_0 = eps * I_n
+        # Shapes of Kronecker factors always match gradient's 2D view
         L0 = eps * jnp.eye(rows, dtype=p.dtype)
         R0 = eps * jnp.eye(cols, dtype=p.dtype)
+
+        # We may choose not to actually *use* Shampoo on some shapes (too big or degenerate),
+        # but we still keep L,R with consistent shapes so lax.cond tracing is happy.
+        too_big_or_degenerate = (
+            (rows > max_dim)
+            or (cols > max_dim)
+            or (rows <= 1)
+            or (cols <= 1)
+        )
+        use_shampoo = not too_big_or_degenerate
+
         return ShampooPerParamState(
             L=L0,
             R=R0,
-            use_shampoo=True,
+            use_shampoo=use_shampoo,
         )
 
     def init_fn(params: PyTree) -> ShampooState:
@@ -140,22 +141,6 @@ def scale_by_shampoo(
             rows, cols = g2d.shape
 
             L, R, use_shampoo = s
-
-            # If shape changed (e.g. across reinitializations), re-init this leaf.
-            if use_shampoo:
-                shape_ok = (
-                    L.shape == (rows, rows)
-                    and R.shape == (cols, cols)
-                )
-            else:
-                shape_ok = True  # we ignore L,R in the non-Shampoo path
-
-            if not shape_ok:
-                s = init_per_param(g_arr)
-                L, R, use_shampoo = s
-                g2d = _reshape_to_2d(g_arr)
-                rows, cols = g2d.shape
-
             use_shampoo_pred = jnp.asarray(use_shampoo, dtype=bool)
 
             def shampoo_branch(_):
@@ -194,7 +179,7 @@ def scale_by_shampoo(
                 return g_pre, new_s
 
             def identity_branch(_):
-                # Fallback: just pass gradient through unchanged
+                # Fallback: just pass gradient through unchanged; still keep L,R shapes.
                 new_s = ShampooPerParamState(
                     L=L,
                     R=R,

@@ -7,8 +7,6 @@ from jax.flatten_util import ravel_pytree
 from jax import tree_util as jtu
 import optax
 
-from .kronecker import kronecker_matvec
-
 Array = jax.Array
 Params = Any
 PyTree = Any
@@ -18,7 +16,7 @@ GGNMatvecFn = Callable[[Params, PyTree, Array], PyTree]
 
 
 # ---------------------------------------------------------------------------
-# Block-wise SLU / SOAP-style helpers (optional)
+# Block-wise SLU / SOAP-style helpers (used for sketched Lanczos as well)
 # ---------------------------------------------------------------------------
 
 class BlockSLUState(NamedTuple):
@@ -63,7 +61,19 @@ def _sketched_lanczos_block(
     eps: float = 1e-8,
 ) -> tuple[Array, Array]:
     """
-    Run a small HVP-only (sketched) Lanczos on a single block.
+    Run a small HVP-only (sketched) Lanczos on a single block or global vector.
+
+    Args:
+      hvp_fn: v -> H v (H is implicit symmetric PSD matrix, e.g. GGN).
+      dim: dimension of the vector space (flattened).
+      k: number of Lanczos iterations / size of subspace (Ritz vectors).
+      s: sketch dimension (rows of the random sketch S).
+      rng: JAX PRNG key.
+      eps: small numerical guard.
+
+    Returns:
+      evals: (k,) approximate eigenvalues (sorted descending).
+      U: (dim, k) approximate eigenvectors as columns (orthonormal).
     """
     key_v, key_S = jax.random.split(rng)
 
@@ -102,7 +112,7 @@ def _sketched_lanczos_block(
         )
         beta_prev = beta
 
-    # 2) Sketch algebra: Y = S V, Z = S (G V)
+    # 2) Sketch algebra: Y = S V, Z = S (H V)
     # S ~ Rademacher / sqrt(s) as a cheap CountSketch-ish matrix.
     S = jax.random.choice(key_S, jnp.array([-1.0, 1.0]), (s, dim))
     S = S / jnp.sqrt(s)
@@ -202,6 +212,7 @@ def pns_eigenadam_block_step(
 ) -> tuple[Array, BlockSLUState]:
     """
     One PN-S / SOAP-style update for a single parameter block.
+    (Not used by the global pns_eigenadam transform, but kept for reference.)
     """
     dim = grad_block.shape[0]
 
@@ -307,10 +318,11 @@ class PnsEigenAdamState(NamedTuple):
     eigenvalues: Array      # (max_eigenvectors,)
     eigenvectors: Array     # (max_eigenvectors, dim)
     rng_key: Array
+    rotation_diff: Array    # scalar, normalized Frobenius distance between bases
 
 
 # ---------------------------------------------------------------------------
-# Lanczos iterative eigen solver on a matrix-vector product
+# Lanczos iterative eigen solver on a matrix-vector product (un-sketched)
 # ---------------------------------------------------------------------------
 
 def lanczos(
@@ -442,7 +454,7 @@ def apply_eigen_preconditioner(
 
 
 # ---------------------------------------------------------------------------
-# Global PN-S EigenAdam wrapper (single global eigenbasis)
+# Global PN-S EigenAdam wrapper (single global eigenbasis, optional sketching)
 # ---------------------------------------------------------------------------
 
 def pns_eigenadam(
@@ -456,8 +468,17 @@ def pns_eigenadam(
     lanczos_iters: Optional[int] = None,
     ggn_matvec_fn: Optional[GGNMatvecFn] = None,
     precond_damping: float = 1e-4,
+    sketch_dim: Optional[int] = None,
 ) -> optax.GradientTransformation:
-    """PN-S EigenAdam as an Optax gradient transformation (global eigenbasis)."""
+    """
+    PN-S EigenAdam as an Optax gradient transformation (global eigenbasis).
+
+    If `sketch_dim` is None (default), curvature is estimated via standard
+    Lanczos in the full parameter space.
+
+    If `sketch_dim` is not None, curvature is estimated via a sketched Lanczos
+    procedure using a random projection S ∈ R^{sketch_dim × dim}.
+    """
     if lanczos_iters is None:
         lanczos_iters = max_eigenvectors
 
@@ -480,6 +501,7 @@ def pns_eigenadam(
         adam_state = base_adam.init(params)
         rng_key = jax.random.PRNGKey(0)
         step = jnp.array(0, dtype=jnp.int32)
+        rotation_diff = jnp.array(0.0, dtype=jnp.float32)
 
         return PnsEigenAdamState(
             adam_state=adam_state,
@@ -487,6 +509,7 @@ def pns_eigenadam(
             eigenvalues=eigenvalues,
             eigenvectors=eigenvectors,
             rng_key=rng_key,
+            rotation_diff=rotation_diff,
         )
 
     def update_fn(
@@ -498,6 +521,7 @@ def pns_eigenadam(
         rng_key = state.rng_key
         eigenvalues = state.eigenvalues
         eigenvectors = state.eigenvectors
+        rotation_diff = state.rotation_diff
 
         # -------------------------------------------------------------------
         # 1. Optionally update curvature (GGN eigenbasis) every N steps
@@ -506,7 +530,7 @@ def pns_eigenadam(
             should_update = (step % curvature_update_every) == 0
 
             def do_update(carry):
-                eigenvalues, eigenvectors, rng_key, params = carry
+                eigenvalues, eigenvectors, rng_key, params, rotation_diff = carry
 
                 # Flatten params to know the dimension (should be same as init)
                 flat_params, unravel_params = ravel_pytree(params)
@@ -520,31 +544,68 @@ def pns_eigenadam(
 
                 rng_key, lanczos_key = jax.random.split(rng_key)
 
-                evals, evecs = lanczos(
-                    matvec=matvec_flat,
-                    dim=dim,
-                    num_iter=lanczos_iters,
-                    key=lanczos_key,
-                )
+                # Either full Lanczos, or sketched Lanczos if sketch_dim is set.
+                if sketch_dim is None:
+                    evals, evecs = lanczos(
+                        matvec=matvec_flat,
+                        dim=dim,
+                        num_iter=lanczos_iters,
+                        key=lanczos_key,
+                    )  # evecs: (k, dim) rows are eigenvectors
+                else:
+                    # Sketched variant: use random projection S ∈ R^{sketch_dim × dim}
+                    evals, U = _sketched_lanczos_block(
+                        hvp_fn=matvec_flat,  # v_flat -> H v_flat
+                        dim=dim,
+                        k=lanczos_iters,
+                        s=sketch_dim,
+                        rng=lanczos_key,
+                    )
+                    # _sketched_lanczos_block returns eigenvectors as columns (dim, k)
+                    evecs = U.T  # shape (k, dim) to match apply_eigen_preconditioner
 
                 # Use a static number of eigenvectors (<= max_eigenvectors)
                 k = min(max_eigenvectors, evals.shape[0])
-                eigenvalues = jnp.zeros_like(eigenvalues)
-                eigenvalues = eigenvalues.at[:k].set(evals[:k])
 
-                eigenvectors = jnp.zeros_like(eigenvectors)
-                eigenvectors = eigenvectors.at[:k, :].set(evecs[:k, :])
+                # ---------- rotation matrix change (normalized Frobenius) ----------
+                # Compare first k rows of the old and new eigenvector matrices.
+                prev_vecs_k = eigenvectors[:k, :]  # (k, dim)
+                new_vecs_k = evecs[:k, :]          # (k, dim)
 
-                return (eigenvalues, eigenvectors, rng_key, params)
+                diff = new_vecs_k - prev_vecs_k
+                frob_num = jnp.linalg.norm(diff)  # ||ΔV||_F
+                frob_den = jnp.linalg.norm(prev_vecs_k)
+                frob_den_safe = jnp.where(frob_den > 1e-8, frob_den, 1.0)
+                rotation_diff_new = jnp.where(
+                    frob_den > 1e-8,
+                    frob_num / frob_den_safe,
+                    jnp.array(0.0, dtype=jnp.float32),
+                )
+
+                # Store eigenvalues/eigenvectors in fixed-size arrays
+                eigenvalues_new = jnp.zeros_like(eigenvalues)
+                eigenvalues_new = eigenvalues_new.at[:k].set(evals[:k])
+
+                eigenvectors_new = jnp.zeros_like(eigenvectors)
+                eigenvectors_new = eigenvectors_new.at[:k, :].set(evecs[:k, :])
+
+                return (
+                    eigenvalues_new,
+                    eigenvectors_new,
+                    rng_key,
+                    params,
+                    rotation_diff_new,
+                )
 
             def dont_update(carry):
+                # No change to eigenvalues/eigenvectors/rotation_diff/rng_key
                 return carry
 
-            eigenvalues, eigenvectors, rng_key, _ = jax.lax.cond(
+            eigenvalues, eigenvectors, rng_key, _, rotation_diff = jax.lax.cond(
                 should_update,
                 do_update,
                 dont_update,
-                operand=(eigenvalues, eigenvectors, rng_key, params),
+                operand=(eigenvalues, eigenvectors, rng_key, params, rotation_diff),
             )
 
         # -------------------------------------------------------------------
@@ -574,6 +635,7 @@ def pns_eigenadam(
             eigenvalues=eigenvalues,
             eigenvectors=eigenvectors,
             rng_key=rng_key,
+            rotation_diff=rotation_diff,
         )
 
         return updates, new_state
@@ -600,12 +662,6 @@ def profile_pns_eigenadam_curvature(
     Usage example:
         from optim.pns_eigenadam import profile_pns_eigenadam_curvature
         profile_pns_eigenadam_curvature(params, ggn_matvec_fn, max_eigenvectors=8)
-
-    Notes:
-      - Heavy work (GGN matvec + Lanczos) is XLA-compiled; line_profiler will
-        mostly show timings for Python dispatch. We also emit wall-clock timing
-        with block_until_ready() to capture device time.
-      - warmup=True runs one unprofiled call first to exclude compilation time.
     """
     try:
         from line_profiler import LineProfiler
@@ -651,220 +707,3 @@ def profile_pns_eigenadam_curvature(
     print(f"[PN-S EigenAdam] Curvature step wall-clock: {elapsed:.3f} s")
     print(f"Top eigenvalues (first 5): {jnp.asarray(evals)[:5]}")
     lp.print_stats()
-
-
-# ---------------------------------------------------------------------------
-# Blockwise PN-S EigenAdam state and helpers (Kronecker blocks)
-# ---------------------------------------------------------------------------
-
-class BlockPnsEigenAdamState(NamedTuple):
-    """State for blockwise PN-S EigenAdam with Kronecker curvature."""
-    adam_state: optax.OptState
-    step: Array
-    eigenvalues: PyTree     # PyTree of leaves (k_b,)
-    eigenvectors: PyTree    # PyTree of leaves (k_b, d_b)
-    rng_key: Array
-
-
-def apply_block_eigen_preconditioner(
-    grads: PyTree,
-    eigenvalues_tree: PyTree,
-    eigenvectors_tree: PyTree,
-    damping: float,
-) -> PyTree:
-    """
-    Blockwise version of apply_eigen_preconditioner.
-
-    Each leaf has:
-      - grad g_block with arbitrary shape
-      - eigenvalues lam_block: (k_b,)
-      - eigenvectors V_block: (k_b, d_b) acting on flattened g_block
-
-    M_block = V (Λ + δI)^{-1} V^T + (I - V V^T)
-    """
-    def _precond_block(g_block, lam_block, V_block):
-        # Flatten gradient
-        flat_g = g_block.reshape(-1)             # (d_b,)
-        if lam_block.shape[0] == 0:
-            return g_block  # no curvature info for this block
-
-        proj = V_block @ flat_g                 # (k_b,)
-        proj_vec = V_block.T @ proj             # (d_b,)
-
-        scaled = proj / (lam_block + damping)   # (k_b,)
-        new_subspace = V_block.T @ scaled       # (d_b,)
-
-        g_perp = flat_g - proj_vec             # (d_b,)
-        new_flat = new_subspace + g_perp       # (d_b,)
-        return new_flat.reshape(g_block.shape)
-
-    return jtu.tree_map(
-        _precond_block,
-        grads,
-        eigenvalues_tree,
-        eigenvectors_tree,
-    )
-
-
-def pns_eigenadam_kronecker_block(
-    learning_rate: float,
-    kronecker_factors_fn: Callable[[Params], PyTree],
-    beta1: float = 0.9,
-    beta2: float = 0.999,
-    eps: float = 1e-8,
-    weight_decay: float = 0.0,
-    curvature_update_every: int = 100,
-    max_eigenvectors_per_block: int = 8,
-    precond_damping: float = 1e-4,
-) -> optax.GradientTransformation:
-    """
-    PN-S EigenAdam that assumes the curvature is block-diagonal with
-    Kronecker blocks, and runs Lanczos independently on each block.
-
-    Args:
-      learning_rate: base LR for AdamW.
-      kronecker_factors_fn: callable(params) -> factors_tree,
-        where each leaf is (L, R) giving a Kronecker block:
-          H_block ≈ R ⊗ L.
-      beta1, beta2, eps, weight_decay: AdamW hyperparameters.
-      curvature_update_every: update the eigenbasis every N steps.
-      max_eigenvectors_per_block: k_b, number of Ritz vectors per block.
-      precond_damping: δ in (Λ + δI)^{-1} for numerical stability.
-
-    Returns:
-      optax.GradientTransformation with state BlockPnsEigenAdamState.
-    """
-
-    base_adam = optax.adamw(
-        learning_rate=learning_rate,
-        b1=beta1,
-        b2=beta2,
-        eps=eps,
-        weight_decay=weight_decay,
-    )
-
-    def init_fn(params: Params) -> BlockPnsEigenAdamState:
-        # For each parameter leaf, allocate its own eigenvalues/eigenvectors.
-        def _init_leaf(p_leaf):
-            d_b = p_leaf.size
-            k_b = min(max_eigenvectors_per_block, d_b)
-            lam0 = jnp.zeros((k_b,), dtype=jnp.float32)
-            V0 = jnp.zeros((k_b, d_b), dtype=jnp.float32)
-            return (lam0, V0)
-
-        eig_tree = jtu.tree_map(_init_leaf, params)
-        eigenvalues_tree = jtu.tree_map(lambda t: t[0], eig_tree)
-        eigenvectors_tree = jtu.tree_map(lambda t: t[1], eig_tree)
-
-        adam_state = base_adam.init(params)
-        rng_key = jax.random.PRNGKey(0)
-        step = jnp.array(0, dtype=jnp.int32)
-
-        return BlockPnsEigenAdamState(
-            adam_state=adam_state,
-            step=step,
-            eigenvalues=eigenvalues_tree,
-            eigenvectors=eigenvectors_tree,
-            rng_key=rng_key,
-        )
-
-    def update_fn(
-        grads: PyTree,
-        state: BlockPnsEigenAdamState,
-        params: Optional[Params] = None,
-    ):
-        step = state.step + 1
-        rng_key = state.rng_key
-        eigenvalues_tree = state.eigenvalues
-        eigenvectors_tree = state.eigenvectors
-
-        # --------------------------------------------------------------
-        # 1) Blockwise curvature update via per-block Lanczos on H_b
-        #    where H_b ≈ R_b ⊗ L_b from kronecker_factors_fn(params).
-        # --------------------------------------------------------------
-        if params is not None:
-            should_update = (step % curvature_update_every) == 0
-
-            def do_update(carry):
-                eigenvalues_tree, eigenvectors_tree, rng_key, params = carry
-
-                # factors_tree: same structure as params, leaves are (L, R)
-                factors_tree = kronecker_factors_fn(params)
-
-                # Build a tree of RNG keys with one key per leaf
-                leaves, treedef = jtu.tree_flatten(factors_tree)
-                n_leaves = len(leaves)
-                rng_key, subkey = jax.random.split(rng_key)
-                subkeys = jax.random.split(subkey, n_leaves)
-                keys_tree = jtu.tree_unflatten(treedef, list(subkeys))
-
-                def _lanczos_leaf(factors, lam_leaf, V_leaf, key_leaf):
-                    L, R = factors
-                    d_b = L.shape[0] * R.shape[0]
-                    k_b = lam_leaf.shape[0]
-                    if k_b == 0 or d_b == 0:
-                        return (lam_leaf, V_leaf)
-
-                    def mv(v):
-                        return kronecker_matvec(L, R, v)
-
-                    evals_b, evecs_b = lanczos(
-                        matvec=mv,
-                        dim=d_b,
-                        num_iter=k_b,
-                        key=key_leaf,
-                    )
-                    return (evals_b, evecs_b)
-
-                eig_tree_new = jtu.tree_map(
-                    _lanczos_leaf,
-                    factors_tree,
-                    eigenvalues_tree,
-                    eigenvectors_tree,
-                    keys_tree,
-                )
-                eigenvalues_tree_new = jtu.tree_map(lambda t: t[0], eig_tree_new)
-                eigenvectors_tree_new = jtu.tree_map(lambda t: t[1], eig_tree_new)
-
-                return (eigenvalues_tree_new, eigenvectors_tree_new, rng_key, params)
-
-            def dont_update(carry):
-                return carry
-
-            eigenvalues_tree, eigenvectors_tree, rng_key, _ = jax.lax.cond(
-                should_update,
-                do_update,
-                dont_update,
-                operand=(eigenvalues_tree, eigenvectors_tree, rng_key, params),
-            )
-
-        # --------------------------------------------------------------
-        # 2) Blockwise eigen-preconditioner on the gradient PyTree
-        # --------------------------------------------------------------
-        precond_grads = apply_block_eigen_preconditioner(
-            grads,
-            eigenvalues_tree,
-            eigenvectors_tree,
-            precond_damping,
-        )
-
-        # --------------------------------------------------------------
-        # 3) Forward to AdamW on preconditioned gradients
-        # --------------------------------------------------------------
-        updates, new_adam_state = base_adam.update(
-            precond_grads,
-            state.adam_state,
-            params=params,
-        )
-
-        new_state = BlockPnsEigenAdamState(
-            adam_state=new_adam_state,
-            step=step,
-            eigenvalues=eigenvalues_tree,
-            eigenvectors=eigenvectors_tree,
-            rng_key=rng_key,
-        )
-
-        return updates, new_state
-
-    return optax.GradientTransformation(init_fn, update_fn)

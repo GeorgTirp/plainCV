@@ -2,7 +2,6 @@ batch_size: 64
 beta1: 0.9
 beta2: 0.999
 dataset: tiny_imagenet
-
 hf_cg_max_iters: 15
 hf_cg_tol: 1e-2
 hf_damping: 1e-2
@@ -19,13 +18,15 @@ muon_ns_coeffs:
 muon_ns_steps: 5
 num_channels: 3
 num_classes: 200
-num_epochs: 100
-optim: muon
+num_epochs: 20
+optim: pns_eigenadam
 pns_curvature_backend: ggn
-pns_curvature_update_every: 3
-pns_lanczos_iters: 5
-pns_max_eigenvectors: 5
+pns_curvature_update_every: 64
+pns_lanczos_iters: 8
+pns_log_curvature: true
+pns_max_eigenvectors: 8
 pns_precond_damping: 1.0e-05
+print_progress: false
 schedule_free: false
 schedule_free_b1: 0.9
 schedule_free_lr: 0.01
