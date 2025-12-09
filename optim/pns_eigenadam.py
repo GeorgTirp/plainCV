@@ -1,3 +1,5 @@
+# optim/pns_eigenadam.py
+
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 import time
 
@@ -64,7 +66,7 @@ def _sketched_lanczos_block(
     Run a small HVP-only (sketched) Lanczos on a single block or global vector.
 
     Args:
-      hvp_fn: v -> H v (H is implicit symmetric PSD matrix, e.g. GGN).
+      hvp_fn: v -> H v (H is implicit symmetric PSD / symmetric matrix).
       dim: dimension of the vector space (flattened).
       k: number of Lanczos iterations / size of subspace (Ritz vectors).
       s: sketch dimension (rows of the random sketch S).
@@ -335,7 +337,7 @@ def lanczos(
     """Run Lanczos to approximate top eigenvalues/eigenvectors.
 
     Args:
-      matvec: function v -> A @ v (A is implicit symmetric PSD matrix, e.g. GGN).
+      matvec: function v -> A @ v (A is implicit symmetric matrix, e.g. GGN or Hessian).
       dim: dimension of the flattened parameter vector.
       num_iter: number of Lanczos iterations (also size of Krylov subspace).
       key: RNG key for initial vector.
@@ -409,7 +411,7 @@ def lanczos(
 
 
 # ---------------------------------------------------------------------------
-# Preconditioner in eigenbasis: M = V (Λ + δI)^{-1} V^T + I - V V^T
+# Preconditioners in eigenbasis
 # ---------------------------------------------------------------------------
 
 def apply_eigen_preconditioner(
@@ -417,25 +419,32 @@ def apply_eigen_preconditioner(
     eigenvalues: Array,
     eigenvectors: Array,
     damping: float = 1e-4,
+    saddle_free: bool = False,
 ) -> Array:
     """Apply partial Newton-like preconditioner in eigenbasis.
 
-    M = V (Λ + δI)^{-1} V^T + (I - V V^T)
+    M = V (Λ_eff + δI)^{-1} V^T + (I - V V^T)
 
-    - Along each eigenvector v_i, scale gradient by 1 / (λ_i + δ).
+    - Along each eigenvector v_i, scale gradient by 1 / (λ_eff_i + δ).
     - In directions orthogonal to span(V), leave gradient unchanged.
 
-    Args:
-      grad_flat: (dim,) flattened gradient.
-      eigenvalues: (k,) eigenvalues.
-      eigenvectors: (k, dim) eigenvectors (rows).
-      damping: δ, numerical damping.
-
-    Returns:
-      preconditioned_grad_flat: (dim,)
+    If saddle_free=True (Hessian backend), we set
+        λ_eff_i = λ_i            if λ_i >= 0
+        λ_eff_i = |λ_i|          if λ_i < 0
+    which corresponds to a saddle-free treatment for the negative directions.
     """
+    if eigenvalues.size == 0:
+        return grad_flat  # nothing to do
+
     V = eigenvectors  # (k, dim)
     lambdas = eigenvalues  # (k,)
+
+    if saddle_free:
+        # Positive λ: standard EigenAdam, λ_eff = λ
+        # Negative λ: saddle-free, λ_eff = |λ|
+        lambdas_eff = jnp.where(lambdas < 0.0, jnp.abs(lambdas), lambdas)
+    else:
+        lambdas_eff = lambdas
 
     # Project gradient into eigenbasis: g_i = v_i^T g
     proj = V @ grad_flat  # (k,)
@@ -444,7 +453,7 @@ def apply_eigen_preconditioner(
     proj_vec = V.T @ proj  # (dim,)
 
     # Scale along eigenvectors
-    scaled = proj / (lambdas + damping)  # (k,)
+    scaled = proj / (lambdas_eff + damping)  # (k,)
     new_subspace = V.T @ scaled  # (dim,)
 
     # Orthogonal component left untouched: g_perp = g - proj_vec
@@ -454,7 +463,8 @@ def apply_eigen_preconditioner(
 
 
 # ---------------------------------------------------------------------------
-# Global PN-S EigenAdam wrapper (single global eigenbasis, optional sketching)
+# Global PN-S EigenAdam wrapper (single global eigenbasis, optional sketching,
+# and optional saddle-free treatment when curvature_is_hessian=True)
 # ---------------------------------------------------------------------------
 
 def pns_eigenadam(
@@ -469,15 +479,27 @@ def pns_eigenadam(
     ggn_matvec_fn: Optional[GGNMatvecFn] = None,
     precond_damping: float = 1e-4,
     sketch_dim: Optional[int] = None,
+    *,
+    curvature_is_hessian: bool = False,
 ) -> optax.GradientTransformation:
     """
     PN-S EigenAdam as an Optax gradient transformation (global eigenbasis).
 
-    If `sketch_dim` is None (default), curvature is estimated via standard
-    Lanczos in the full parameter space.
+    - If `sketch_dim` is None (default), curvature is estimated via standard
+      Lanczos in the full parameter space.
 
-    If `sketch_dim` is not None, curvature is estimated via a sketched Lanczos
-    procedure using a random projection S ∈ R^{sketch_dim × dim}.
+    - If `sketch_dim` is not None, curvature is estimated via a sketched Lanczos
+      procedure using a random projection S ∈ R^{sketch_dim × dim}.
+
+    - If `curvature_is_hessian=True`, we interpret the curvature operator as the
+      (possibly indefinite) Hessian. We then:
+        * sort the Ritz pairs by |λ| descending (largest magnitude first),
+        * apply a saddle-free treatment to negative eigenvalues:
+              λ_eff = λ          if λ >= 0
+              λ_eff = |λ|        if λ < 0
+          in the preconditioner.
+      This matches the "saddle-free Newton" idea along the directions we
+      explicitly track, while keeping the rest of the space as in standard Adam.
     """
     if lanczos_iters is None:
         lanczos_iters = max_eigenvectors
@@ -491,7 +513,6 @@ def pns_eigenadam(
     )
 
     def init_fn(params: Params) -> PnsEigenAdamState:
-        # Flatten params once to get global dimension for eigenvectors
         flat_params, _ = ravel_pytree(params)
         dim = flat_params.shape[0]
 
@@ -524,7 +545,7 @@ def pns_eigenadam(
         rotation_diff = state.rotation_diff
 
         # -------------------------------------------------------------------
-        # 1. Optionally update curvature (GGN eigenbasis) every N steps
+        # 1. Optionally update curvature (GGN or Hessian eigenbasis) every N steps
         # -------------------------------------------------------------------
         if ggn_matvec_fn is not None and params is not None:
             should_update = (step % curvature_update_every) == 0
@@ -532,7 +553,6 @@ def pns_eigenadam(
             def do_update(carry):
                 eigenvalues, eigenvectors, rng_key, params, rotation_diff = carry
 
-                # Flatten params to know the dimension (should be same as init)
                 flat_params, unravel_params = ravel_pytree(params)
                 dim = flat_params.shape[0]
 
@@ -553,7 +573,6 @@ def pns_eigenadam(
                         key=lanczos_key,
                     )  # evecs: (k, dim) rows are eigenvectors
                 else:
-                    # Sketched variant: use random projection S ∈ R^{sketch_dim × dim}
                     evals, U = _sketched_lanczos_block(
                         hvp_fn=matvec_flat,  # v_flat -> H v_flat
                         dim=dim,
@@ -564,11 +583,16 @@ def pns_eigenadam(
                     # _sketched_lanczos_block returns eigenvectors as columns (dim, k)
                     evecs = U.T  # shape (k, dim) to match apply_eigen_preconditioner
 
+                # For a Hessian backend, reorder by |λ| to get largest magnitude modes
+                if curvature_is_hessian:
+                    order = jnp.argsort(jnp.abs(evals))[::-1]
+                    evals = evals[order]
+                    evecs = evecs[order, :]
+
                 # Use a static number of eigenvectors (<= max_eigenvectors)
-                k = min(max_eigenvectors, evals.shape[0])
+                k = min(eigenvalues.shape[0], evals.shape[0])
 
                 # ---------- rotation matrix change (normalized Frobenius) ----------
-                # Compare first k rows of the old and new eigenvector matrices.
                 prev_vecs_k = eigenvectors[:k, :]  # (k, dim)
                 new_vecs_k = evecs[:k, :]          # (k, dim)
 
@@ -610,6 +634,8 @@ def pns_eigenadam(
 
         # -------------------------------------------------------------------
         # 2. Precondition gradients in eigenbasis
+        #    - PSD / GGN: standard PN-S EigenAdam (λ in denominator)
+        #    - Hessian: saddle-free treatment on negative eigenvalues
         # -------------------------------------------------------------------
         flat_grads, unravel_grads = ravel_pytree(grads)
         precond_flat_grads = apply_eigen_preconditioner(
@@ -617,6 +643,7 @@ def pns_eigenadam(
             eigenvalues=eigenvalues,
             eigenvectors=eigenvectors,
             damping=precond_damping,
+            saddle_free=curvature_is_hessian,
         )
         precond_grads = unravel_grads(precond_flat_grads)
 

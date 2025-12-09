@@ -49,8 +49,8 @@ pns_curvature_update_every: 64
 pns_max_eigenvectors: 8         
 pns_lanczos_iters: 8              
 pns_precond_damping: 1.0e-5       
-pns_curvature_backend: ggn    
-pns_log_curvature: true     
+pns_curvature_backend: hessian    
+
 
 schedule_free: False
 schedule_free_lr: 0.01

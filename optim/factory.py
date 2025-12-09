@@ -4,11 +4,11 @@ from typing import Any, Optional
 
 import optax
 
-from optim.kronecker import make_kronecker_ggn_matvec_fn
+
 from .pns_eigenmuon import pns_eigenmuon, curvature_muon
 from .soap import soap as soap_opt
 from .pns_eigenadam import pns_eigenadam
-from .ggn_utils import make_ggn_matvec_fn
+from .ggn_utils import make_ggn_matvec_fn, make_hessian_matvec_fn
 from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
 from .shampoo import shampoo as shampoo_opt
@@ -90,40 +90,41 @@ def get_optimizer(
     # PN-S EigenAdam
     # ------------------------
     elif name in {"pns_eigenadam", "pns-eigenadam"}:
-        assert model_def is not None, "model_def required for PN-S EigenAdam"
-        assert curvature_batch is not None, "curvature_batch required for PN-S EigenAdam"
+        assert model_def is not None
+        assert curvature_batch is not None
     
-        # Shared Adam-style stuff
         weight_decay = getattr(cfg, "weight_decay", 0.0)
         beta1 = getattr(cfg, "beta1", 0.9)
         beta2 = getattr(cfg, "beta2", 0.999)
         eps = getattr(cfg, "eps", 1e-8)
     
-        # PN-S specific knobs (only read here)
         curvature_update_every = getattr(cfg, "pns_curvature_update_every", 10)
         max_eigenvectors = getattr(cfg, "pns_max_eigenvectors", 16)
         lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
         precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
         backend = getattr(cfg, "pns_curvature_backend", "ggn")
         sketch_dim = getattr(cfg, "pns_sketch_dim", None)
-
     
-        # Build curvature matvec
         if backend == "ggn":
-            ggn_mv = make_ggn_matvec_fn(
+            from optim.ggn_utils import make_ggn_matvec_fn
+            curv_mv = make_ggn_matvec_fn(
                 model_def=model_def,
                 curvature_batch=curvature_batch,
                 batch_stats=batch_stats,
             )
-        elif backend == "kronecker":
-            from .kronecker import make_kronecker_matvec_fn
-            ggn_mv = make_kronecker_ggn_matvec_fn(
+            curvature_is_hessian = False
+        elif backend == "hessian":
+            from optim.ggn_utils import make_hessian_matvec_fn
+            curv_mv = make_hessian_matvec_fn(
                 model_def=model_def,
                 curvature_batch=curvature_batch,
                 batch_stats=batch_stats,
             )
+            curvature_is_hessian = True
         else:
             raise ValueError(f"Unknown pns_curvature_backend: {backend}")
+    
+        from optim.pns_eigenadam import pns_eigenadam
     
         tx = pns_eigenadam(
             learning_rate=lr,
@@ -134,10 +135,12 @@ def get_optimizer(
             curvature_update_every=curvature_update_every,
             max_eigenvectors=max_eigenvectors,
             lanczos_iters=lanczos_iters,
-            ggn_matvec_fn=ggn_mv,
+            ggn_matvec_fn=curv_mv,
             precond_damping=precond_damping,
             sketch_dim=sketch_dim,
+            curvature_is_hessian=curvature_is_hessian,
         )
+
 
 
     # ------------------------

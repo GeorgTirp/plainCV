@@ -81,15 +81,20 @@ def main(_argv):
     use_pns = cfg.optim in {"pns_eigenadam", "pns-eigenadam"}
     curvature_csv_path = None
     max_eigs = getattr(cfg, "pns_max_eigenvectors", 16)
+    max_neg_eigs = getattr(cfg, "pns_negcurv_iters", 0) or 0 
 
     if log_curv and use_pns:
         curvature_csv_path = os.path.join(exp_dir, "curvature.csv")
-        # Write header: epoch, step, eig_0,...,eig_{k-1}, rotation_diff
-        header = ["epoch", "global_step"] + [
-            f"eig_{i}" for i in range(max_eigs)
-        ] + ["rotation_diff"]
+        header = (
+            ["epoch", "global_step"]
+            + [f"eig_pos_{i}" for i in range(max_eigs)]
+            + ["rotation_diff_pos"]
+            + [f"eig_neg_{i}" for i in range(max_neg_eigs)]
+            + ["rotation_diff_neg"]
+        )
         with open(curvature_csv_path, "w") as f:
             f.write(",".join(header) + "\n")
+
 
     # RNG setup
     rng = jax.random.PRNGKey(cfg.seed)
@@ -231,20 +236,29 @@ def main(_argv):
             },
         )
 
-        # --- Curvature spectrum logging (once per epoch) ---
         if log_curv and use_pns and curvature_csv_path is not None:
-            # NOTE: assumes schedule_free=False so opt_state is directly PnsEigenAdamState
-            pns_state = state.opt_state
-            # JAX arrays -> Python scalars
-            ev = jnp.asarray(pns_state.eigenvalues)
-            rot_diff = float(pns_state.rotation_diff)
-            step_opt = int(pns_state.step)
+            pns_state = state.opt_state 
 
-            eig_list = [float(x) for x in ev[:max_eigs]]
-            row = [epoch, step_opt] + eig_list + [rot_diff]
+            # Positive spectrum
+            ev_pos = jnp.asarray(pns_state.eigenvalues)
+            rot_pos = float(pns_state.rotation_diff)
+            step_opt = int(pns_state.step)
+            eig_pos_list = [float(x) for x in ev_pos[:max_eigs]]
+
+            # Negative spectrum (if present)
+            if max_neg_eigs > 0:
+                ev_neg = jnp.asarray(pns_state.neg_eigenvalues)
+                rot_neg = float(pns_state.neg_rotation_diff)
+                eig_neg_list = [float(x) for x in ev_neg[:max_neg_eigs]]
+            else:
+                rot_neg = 0.0
+                eig_neg_list = []
+
+            row = [epoch, step_opt] + eig_pos_list + [rot_pos] + eig_neg_list + [rot_neg]
 
             with open(curvature_csv_path, "a") as f:
                 f.write(",".join(str(x) for x in row) + "\n")
+
 
         # TensorBoard logging
         writer.scalar("train/loss", float(train_summary["loss"]), step=epoch)
