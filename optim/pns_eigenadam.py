@@ -1,5 +1,6 @@
 # optim/pns_eigenadam.py
 
+from readline import backend
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 import time
 
@@ -333,6 +334,7 @@ def lanczos(
     num_iter: int,
     key: Array,
     eps: float = 1e-6,
+    sort_by_abs: bool = False,   # <-- NEW
 ) -> Tuple[Array, Array]:
     """Run Lanczos to approximate top eigenvalues/eigenvectors.
 
@@ -342,9 +344,10 @@ def lanczos(
       num_iter: number of Lanczos iterations (also size of Krylov subspace).
       key: RNG key for initial vector.
       eps: small value to guard against breakdown.
+      sort_by_abs: if True, sort eigenvalues by |λ| descending instead of λ descending.
 
     Returns:
-      eigenvalues: (num_iter,) approximated eigenvalues (sorted descending).
+      eigenvalues: (num_iter,) approximated eigenvalues (sorted).
       eigenvectors: (num_iter, dim) corresponding eigenvectors (in flattened space).
     """
     # Random normalized starting vector v0
@@ -364,7 +367,7 @@ def lanczos(
             proj = jnp.vdot(prev_v, _w)
             return _w - proj * prev_v
 
-        # (Optional) reorthogonalization against all previous v_j (cheap for small num_iter)
+        # reorthogonalize against previous basis vectors
         w = jax.lax.fori_loop(0, i, lambda j, ww: ortho_against_prev(ww, j), w)
 
         beta = jnp.linalg.norm(w)
@@ -377,7 +380,6 @@ def lanczos(
 
         return (V, alphas, betas), None
 
-    # Allocate basis + tridiagonal coefficients
     V = jnp.zeros((num_iter + 1, dim))
     V = V.at[0].set(v0)
     alphas = jnp.zeros((num_iter,))
@@ -389,25 +391,29 @@ def lanczos(
         jnp.arange(num_iter),
     )
 
-    # Build symmetric tridiagonal matrix T
     k = num_iter
     T = jnp.diag(alphas)
     if k > 1:
         T = T.at[jnp.arange(k - 1), jnp.arange(1, k)].set(betas[: k - 1])
         T = T.at[jnp.arange(1, k), jnp.arange(k - 1)].set(betas[: k - 1])
 
-    # Eigen-decomposition of small T (k x k)
     evals, evecs_T = jnp.linalg.eigh(T)  # ascending
-    # Sort descending to get largest eigenvalues first
-    idx = jnp.argsort(evals)[::-1]
-    evals = evals[idx]
-    evecs_T = evecs_T[:, idx]  # columns are eigenvectors
 
-    # Map eigenvectors of T back to R^dim
+    if sort_by_abs:
+        # Largest |λ| first (so we also capture big negatives)
+        idx = jnp.argsort(jnp.abs(evals))[::-1]
+    else:
+        # Largest λ first (standard GGN case)
+        idx = jnp.argsort(evals)[::-1]
+
+    evals = evals[idx]
+    evecs_T = evecs_T[:, idx]
+
     V_k = V[:-1]  # (k, dim)
     eigenvectors_flat = (evecs_T.T @ V_k).reshape(k, dim)
 
     return evals, eigenvectors_flat
+
 
 
 # ---------------------------------------------------------------------------
@@ -419,32 +425,33 @@ def apply_eigen_preconditioner(
     eigenvalues: Array,
     eigenvectors: Array,
     damping: float = 1e-4,
-    saddle_free: bool = False,
+    saddle_free_neg: bool = False,  # <-- NEW FLAG
 ) -> Array:
     """Apply partial Newton-like preconditioner in eigenbasis.
 
-    M = V (Λ_eff + δI)^{-1} V^T + (I - V V^T)
+    M ≈ V diag(m_i) V^T + (I - V V^T), where:
 
-    - Along each eigenvector v_i, scale gradient by 1 / (λ_eff_i + δ).
-    - In directions orthogonal to span(V), leave gradient unchanged.
+      - If saddle_free_neg == False:
+           m_i = 1 / (λ_i + δ)
+      - If saddle_free_neg == True (Hessian backend):
+           m_i = 1 / (|λ_i| + δ)  for all i
+           (this automatically becomes "saddle-free" on negative λ_i).
 
-    If saddle_free=True (Hessian backend), we set
-        λ_eff_i = λ_i            if λ_i >= 0
-        λ_eff_i = |λ_i|          if λ_i < 0
-    which corresponds to a saddle-free treatment for the negative directions.
+    Args:
+      grad_flat: (dim,) flattened gradient.
+      eigenvalues: (k,) eigenvalues (can be positive or negative).
+      eigenvectors: (k, dim) eigenvectors (rows).
+      damping: δ, numerical damping.
+      saddle_free_neg: if True, use |λ| in the denominator (saddle-free Newton).
+
+    Returns:
+      preconditioned_grad_flat: (dim,)
     """
     if eigenvalues.size == 0:
-        return grad_flat  # nothing to do
+        return grad_flat
 
     V = eigenvectors  # (k, dim)
     lambdas = eigenvalues  # (k,)
-
-    if saddle_free:
-        # Positive λ: standard EigenAdam, λ_eff = λ
-        # Negative λ: saddle-free, λ_eff = |λ|
-        lambdas_eff = jnp.where(lambdas < 0.0, jnp.abs(lambdas), lambdas)
-    else:
-        lambdas_eff = lambdas
 
     # Project gradient into eigenbasis: g_i = v_i^T g
     proj = V @ grad_flat  # (k,)
@@ -452,14 +459,22 @@ def apply_eigen_preconditioner(
     # Component of g in span(V)
     proj_vec = V.T @ proj  # (dim,)
 
-    # Scale along eigenvectors
-    scaled = proj / (lambdas_eff + damping)  # (k,)
-    new_subspace = V.T @ scaled  # (dim,)
+    if saddle_free_neg:
+        # Saddle-free: use |λ| + δ (this equals standard scaling on λ>=0)
+        lam_abs = jnp.abs(lambdas)
+        scale = 1.0 / (lam_abs + damping)
+    else:
+        # Standard PN-S / Newton-like scaling
+        scale = 1.0 / (lambdas + damping)
 
-    # Orthogonal component left untouched: g_perp = g - proj_vec
+    scaled = proj * scale           # (k,)
+    new_subspace = V.T @ scaled     # (dim,)
+
+    # Orthogonal component left untouched
     g_perp = grad_flat - proj_vec
 
     return new_subspace + g_perp
+
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +562,9 @@ def pns_eigenadam(
         # -------------------------------------------------------------------
         # 1. Optionally update curvature (GGN or Hessian eigenbasis) every N steps
         # -------------------------------------------------------------------
+        use_saddle_free = (backend == "hessian")
+        sort_by_abs = (backend == "hessian")
+
         if ggn_matvec_fn is not None and params is not None:
             should_update = (step % curvature_update_every) == 0
 
@@ -571,6 +589,7 @@ def pns_eigenadam(
                         dim=dim,
                         num_iter=lanczos_iters,
                         key=lanczos_key,
+                        sort_by_abs=sort_by_abs,
                     )  # evecs: (k, dim) rows are eigenvectors
                 else:
                     evals, U = _sketched_lanczos_block(
@@ -643,7 +662,7 @@ def pns_eigenadam(
             eigenvalues=eigenvalues,
             eigenvectors=eigenvectors,
             damping=precond_damping,
-            saddle_free=curvature_is_hessian,
+            saddle_free_neg=use_saddle_free,
         )
         precond_grads = unravel_grads(precond_flat_grads)
 

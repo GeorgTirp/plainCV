@@ -25,7 +25,7 @@ vit_layers: 4
 vit_heads: 4
 vit_dropout: 0.1
 
-optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", 
+optim: sophia_shampoo  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -51,6 +51,11 @@ pns_lanczos_iters: 8
 pns_precond_damping: 1.0e-5       
 pns_curvature_backend: hessian    
 
+# --- Sophia-specific hyperparameters ---
+rho: 0.01
+clip_threshold: 1
+hessian_update_every: 10
+hutchinson_samples: 1
 
 schedule_free: False
 schedule_free_lr: 0.01

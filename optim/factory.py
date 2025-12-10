@@ -12,6 +12,8 @@ from .ggn_utils import make_ggn_matvec_fn, make_hessian_matvec_fn
 from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
 from .shampoo import shampoo as shampoo_opt
+from .sophia import sophia as sophia_opt
+from .sophia import sophia_shampoo as sophia_shampoo_opt
 
 
 
@@ -106,7 +108,6 @@ def get_optimizer(
         sketch_dim = getattr(cfg, "pns_sketch_dim", None)
     
         if backend == "ggn":
-            from optim.ggn_utils import make_ggn_matvec_fn
             curv_mv = make_ggn_matvec_fn(
                 model_def=model_def,
                 curvature_batch=curvature_batch,
@@ -114,7 +115,6 @@ def get_optimizer(
             )
             curvature_is_hessian = False
         elif backend == "hessian":
-            from optim.ggn_utils import make_hessian_matvec_fn
             curv_mv = make_hessian_matvec_fn(
                 model_def=model_def,
                 curvature_batch=curvature_batch,
@@ -231,7 +231,104 @@ def get_optimizer(
             exponent=exponent,
             weight_decay=weight_decay,
         )
-        
+    
+        # ------------------------
+    # Sophia (diagonal Hessian, clipped) 
+    # ------------------------
+    elif name == "sophia":
+        assert model_def is not None, "model_def required for Sophia"
+        assert curvature_batch is not None, "curvature_batch required for Sophia"
+
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        beta1 = getattr(cfg, "beta1", 0.9)
+        beta2 = getattr(cfg, "beta2", 0.99)
+        rho = getattr(cfg, "sophia_rho", 0.01)
+        clip_threshold = getattr(cfg, "sophia_clip_threshold", 1.0)
+        hessian_update_every = getattr(cfg, "sophia_hessian_update_every", 10)
+        hutchinson_samples = getattr(cfg, "sophia_hutchinson_samples", 1)
+        backend = getattr(cfg, "sophia_curvature_backend", "ggn")
+
+        # Build curvature matvec (same style as PN-S / HF)
+        if backend == "ggn":
+            ggn_mv = make_ggn_matvec_fn(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
+        elif backend == "kronecker":
+            ggn_mv = make_hessian_matvec_fn(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
+        else:
+            raise ValueError(f"Unknown sophia_curvature_backend: {backend}")
+
+        tx = sophia_opt(
+            learning_rate=lr,
+            ggn_matvec_fn=ggn_mv,
+            beta1=beta1,
+            beta2=beta2,
+            rho=rho,
+            clip_threshold=clip_threshold,
+            hessian_update_every=hessian_update_every,
+            hutchinson_samples=hutchinson_samples,
+            weight_decay=weight_decay,
+        )
+
+        # ------------------------
+    # Sophia & Sophia+Shampoo
+    # ------------------------
+    elif name in {"sophia", "sophia_shampoo"}:
+        assert model_def is not None, "model_def required for Sophia"
+        assert curvature_batch is not None, "curvature_batch required for Sophia"
+
+        # Build Hessian-vector-product for the *training loss* on curvature_batch
+        hvp_fn = make_hessian_matvec_fn(
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+        )
+
+        # Shared Sophia hyperparams
+        beta1 = getattr(cfg, "beta1", 0.9)
+        beta2 = getattr(cfg, "beta2", 0.99)
+        rho = getattr(cfg, "sophia_rho", 0.01)
+        h_max = getattr(cfg, "sophia_h_max", 1e6)
+        eps = getattr(cfg, "eps", 1e-8)
+        hessian_update_every = getattr(cfg, "sophia_hessian_update_every", 10)
+
+        if name == "sophia":
+            tx = sophia_opt(
+                learning_rate=lr,
+                hessian_matvec_fn=hvp_fn,
+                beta1=beta1,
+                beta2=beta2,
+                rho=rho,
+                h_max=h_max,
+                eps=eps,
+                hessian_update_every=hessian_update_every,
+            )
+        else:  # "sophia_shampoo"
+            shampoo_eps = getattr(cfg, "shampoo_eps", 1e-4)
+            shampoo_max_dim = getattr(cfg, "shampoo_max_dim", 2048)
+            shampoo_exponent = getattr(cfg, "shampoo_exponent", 0.25)
+
+            tx = sophia_shampoo_opt(
+                learning_rate=lr,
+                hessian_matvec_fn=hvp_fn,
+                beta1=beta1,
+                beta2=beta2,
+                rho=rho,
+                h_max=h_max,
+                eps=eps,
+                hessian_update_every=hessian_update_every,
+                shampoo_eps=shampoo_eps,
+                shampoo_max_dim=shampoo_max_dim,
+                shampoo_exponent=shampoo_exponent,
+            )
+
+
     # ------------------------
     # Hessian-free
     # ------------------------
