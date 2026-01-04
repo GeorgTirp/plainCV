@@ -1,4 +1,5 @@
 # optim/ggn_utils.py
+import functools
 from typing import Any, Callable, Tuple, Optional
 
 import jax
@@ -201,3 +202,101 @@ def make_hessian_matvec_fn(
         return hvp
 
     return hvp_fn
+
+
+def make_fisher_matvec_fn(
+    model_def: Any,
+    curvature_batch: Tuple[Array, Array],
+    batch_stats: Optional[PyTree] = None,
+) -> GGNMatvecFn:
+    """
+    Build an empirical Fisher-information matvec F v for the training loss
+    on a fixed curvature_batch (images, labels).
+
+    Empirical Fisher:
+        F(θ) ≈ (1/B) Σ_i g_i g_i^T
+    where g_i = ∇_θ ℓ_i(θ) is the per-example gradient of the
+    softmax cross-entropy.
+
+    Returns:
+      fisher_matvec(params, vec_pytree, rng) -> PyTree with same structure as params.
+    """
+    images, labels = curvature_batch
+    batch_size = images.shape[0]
+
+    # ---- 1. Per-example loss (scalar) ----
+    def loss_single(params: Params, image: Array, label: Array, rng: Array) -> Array:
+        """Negative log-likelihood for a single (image, label)."""
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        out = model_def.apply(
+            variables,
+            image[None, ...],      # add batch dimension
+            mutable=False,
+            train=False,           # eval mode for curvature
+            rngs={"dropout": rng}, # safe even if model has no dropout
+        )
+
+        # Extract logits robustly if model returns a tuple
+        if isinstance(out, tuple):
+            logits = out[0]  # (1, C)
+        else:
+            logits = out     # (1, C)
+
+        logits = logits[0]   # (C,)
+        num_classes = logits.shape[-1]
+        one_hot = jax.nn.one_hot(label, num_classes=num_classes)  # (C,)
+
+        # optax expects (..., C), so wrap back into batch dim
+        xent = optax.softmax_cross_entropy(
+            logits[None, :],
+            one_hot[None, :],
+        ).mean()
+        return xent
+
+    # ---- 2. Per-example gradients g_i(θ) ----
+    def per_example_grads(params: Params, rng: Array) -> PyTree:
+        grad_single = jax.grad(loss_single)
+        # One RNG per example (if dropout etc. is present)
+        rngs = jax.random.split(rng, batch_size)
+        # vmap over (image, label, rng); params is shared
+        grads = jax.vmap(
+            grad_single,
+            in_axes=(None, 0, 0, 0),
+        )(params, images, labels, rngs)
+        # grads: PyTree whose leaves have shape (B, ...)
+        return grads
+
+    # ---- 3. Empirical Fisher matvec: F v = (1/B) Σ_i g_i (g_i^T v) ----
+    def fisher_matvec(params: Params, vec_pytree: PyTree, rng: Array) -> PyTree:
+        grads = per_example_grads(params, rng)  # PyTree with leading batch dim
+
+        # a) Compute per-example inner products alpha_i = <g_i, v>
+        def per_leaf_dot(g_leaf: Array, v_leaf: Array) -> Array:
+            # g_leaf: (B, ...), v_leaf: (...)
+            # result: (B,)
+            return jnp.einsum("i..., ...->i", g_leaf, v_leaf)
+
+        per_leaf_dots = jax.tree_util.tree_map(per_leaf_dot, grads, vec_pytree)
+        # Sum contributions across all leaves to get final alpha_i
+        alphas = functools.reduce(
+            lambda acc, x: acc + x,
+            jax.tree_util.tree_leaves(per_leaf_dots),
+            jnp.zeros((batch_size,), dtype=images.dtype),
+        )  # shape (B,)
+
+        # b) Weighted sum of per-example grads:
+        #    F v = (1/B) Σ_i alpha_i g_i
+        def combine_leaf(g_leaf: Array) -> Array:
+            # g_leaf: (B, ...)
+            # result: (...)
+            return jnp.einsum("i, i...->...", alphas, g_leaf) / batch_size
+
+        fisher_v = jax.tree_util.tree_map(combine_leaf, grads)
+        return fisher_v
+
+    # Optionally JIT, since Lanczos will call this many times
+    fisher_matvec_jit = jax.jit(fisher_matvec)
+    return fisher_matvec_jit

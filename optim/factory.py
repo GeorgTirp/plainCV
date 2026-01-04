@@ -5,10 +5,10 @@ from typing import Any, Optional
 import optax
 
 
-from .pns_eigenmuon import pns_eigenmuon, curvature_muon
+from .pns_eigenmuon import pns_eigenmuon
 from .soap import soap as soap_opt
 from .pns_eigenadam import pns_eigenadam
-from .ggn_utils import make_ggn_matvec_fn, make_hessian_matvec_fn
+from .ggn_utils import make_ggn_matvec_fn, make_hessian_matvec_fn, make_fisher_matvec_fn
 from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
 from .shampoo import shampoo as shampoo_opt
@@ -105,7 +105,7 @@ def get_optimizer(
         lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
         precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
         backend = getattr(cfg, "pns_curvature_backend", "ggn")
-        sketch_dim = getattr(cfg, "pns_sketch_dim", None)
+        split_spaces = getattr(cfg, "pns_split_spaces", False)
     
         if backend == "ggn":
             curv_mv = make_ggn_matvec_fn(
@@ -113,14 +113,20 @@ def get_optimizer(
                 curvature_batch=curvature_batch,
                 batch_stats=batch_stats,
             )
-            curvature_is_hessian = False
+
         elif backend == "hessian":
             curv_mv = make_hessian_matvec_fn(
                 model_def=model_def,
                 curvature_batch=curvature_batch,
                 batch_stats=batch_stats,
             )
-            curvature_is_hessian = True
+        elif backend == "fisher":
+            curv_mv = make_fisher_matvec_fn(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
+
         else:
             raise ValueError(f"Unknown pns_curvature_backend: {backend}")
     
@@ -137,8 +143,10 @@ def get_optimizer(
             lanczos_iters=lanczos_iters,
             ggn_matvec_fn=curv_mv,
             precond_damping=precond_damping,
-            sketch_dim=sketch_dim,
-            curvature_is_hessian=curvature_is_hessian,
+            backend=backend,
+            split_spaces=split_spaces,
+            lr_top = 0.1,
+            lr_perp= 0.0001,
         )
 
 
@@ -191,6 +199,35 @@ def get_optimizer(
             # consistent_rms=consistent_rms,
         )
 
+        # ------------------------
+    # PN-S EigenMuon
+    # ------------------------
+    elif name in {"pns_eigenmuon", "pns-eigenmuon"}:
+        # Hyperparams (with sensible defaults)
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        beta1 = getattr(cfg, "beta1", 0.9)
+        beta2 = getattr(cfg, "beta2", 0.999)
+        eps = getattr(cfg, "eps", 1e-8)
+
+        max_eigenvectors = getattr(cfg, "pns_max_eigenvectors", 8)
+        lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
+        precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
+        sqrt_scaling = getattr(cfg, "pns_sqrt_scaling", False)
+
+        if lanczos_iters is None:
+            lanczos_iters = max_eigenvectors
+
+        tx = pns_eigenmuon(
+            learning_rate=lr,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_eigenvectors=max_eigenvectors,
+            lanczos_iters=lanczos_iters,
+            precond_damping=precond_damping,
+            sqrt_scaling=sqrt_scaling,
+        )
 
     # ------------------------
     # SOAP

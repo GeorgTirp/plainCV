@@ -1,6 +1,6 @@
 batch_size: 64
 beta1: 0.9
-beta2: 0.999
+beta2: 0.9
 clip_threshold: 1
 dataset: tiny_imagenet
 hessian_update_every: 10
@@ -22,7 +22,7 @@ muon_ns_steps: 5
 num_channels: 3
 num_classes: 200
 num_epochs: 100
-optim: pns_eigenadam
+optim: adam
 pns_curvature_backend: ggn
 pns_curvature_update_every: 28
 pns_lanczos_iters: 8
@@ -30,9 +30,9 @@ pns_log_curvature: false
 pns_lr_perp: 5e-3
 pns_lr_top: 1e-3
 pns_max_eigenvectors: 8
-pns_precond_damping: 1.0e-05
+pns_precond_damping: 0.0001
 pns_split_spaces: false
-pns_sqrt_scaling: true
+pns_sqrt_scaling: false
 print_progress: false
 rho: 0.01
 schedule_free: false

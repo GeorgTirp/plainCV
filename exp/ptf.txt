@@ -1,0 +1,5 @@
+run_ti_pns_eigenadam_neg
+run_ti_pns_eigenadam_pos
+run_ti_pns_eigenadam_fim_sqrt
+
+

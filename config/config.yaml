@@ -25,11 +25,11 @@ vit_layers: 4
 vit_heads: 4
 vit_dropout: 0.1
 
-optim: sophia_shampoo  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
+optim: adam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
-beta2: 0.999
+beta2: 0.9
 
 # Optional Muon-specific fields (all have defaults):
 muon_beta: 0.95
@@ -45,11 +45,16 @@ hf_damping: 1e-2
 
 # --- PN-S EigenAdam–specific hyperparameters ---
 #pns_sketch_dim: 128
-pns_curvature_update_every: 64  
+pns_curvature_update_every: 28  
 pns_max_eigenvectors: 8         
 pns_lanczos_iters: 8              
-pns_precond_damping: 1.0e-5       
-pns_curvature_backend: hessian    
+pns_precond_damping: 1.0e-4
+pns_sqrt_scaling: false       
+pns_curvature_backend: ggn  # or "hessian", "ggn", "fisher"
+pns_log_curvature: false
+pns_split_spaces: false
+pns_lr_top: 1e-3
+pns_lr_perp: 5e-3
 
 # --- Sophia-specific hyperparameters ---
 rho: 0.01

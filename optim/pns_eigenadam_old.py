@@ -1,4 +1,6 @@
 # optim/pns_eigenadam.py
+
+from readline import backend
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 import time
 
@@ -316,17 +318,10 @@ class PnsEigenAdamState(NamedTuple):
     """State for PN-S EigenAdam (global eigenbasis)."""
     adam_state: optax.OptState
     step: Array
-    eigenvalues: Array      
-    eigenvectors: Array     
+    eigenvalues: Array      # (max_eigenvectors,)
+    eigenvectors: Array     # (max_eigenvectors, dim)
     rng_key: Array
-    rotation_diff: Array    
-
-    # Extra state for split_spaces=True; harmless when split_spaces=False.
-    m_top: Array            
-    v_top: Array            
-    m_perp: Array           
-    v_perp: Array           
-
+    rotation_diff: Array    # scalar, normalized Frobenius distance between bases
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +467,6 @@ def apply_eigen_preconditioner(
         # Standard PN-S / Newton-like scaling
         scale = 1.0 / (lambdas + damping)
 
-    scale = jnp.sqrt(scale)  
     scaled = proj * scale           # (k,)
     new_subspace = V.T @ scaled     # (dim,)
 
@@ -481,112 +475,6 @@ def apply_eigen_preconditioner(
 
     return new_subspace + g_perp
 
-
-def _apply_eigenadam_whole(
-    grads: PyTree,
-    params: Params,
-    eigenvalues: Array,
-    eigenvectors: Array,
-    precond_damping: float,
-    use_saddle_free: bool,
-    base_adam: optax.GradientTransformation,
-    adam_state: optax.OptState,
-) -> Tuple[PyTree, optax.OptState]:
-    """Old behaviour: precondition full gradient in eigenbasis, then AdamW."""
-    flat_grads, unravel_grads = ravel_pytree(grads)
-    precond_flat_grads = apply_eigen_preconditioner(
-        grad_flat=flat_grads,
-        eigenvalues=eigenvalues,
-        eigenvectors=eigenvectors,
-        damping=precond_damping,
-        saddle_free_neg=use_saddle_free,
-    )
-    precond_grads = unravel_grads(precond_flat_grads)
-
-    updates, new_adam_state = base_adam.update(
-        precond_grads,
-        adam_state,
-        params=params,
-    )
-    return updates, new_adam_state
-
-
-def _apply_eigenadam_split_spaces(
-    grads: PyTree,
-    params: Params,
-    eigenvalues: Array,
-    eigenvectors: Array,
-    m_top: Array,    # unused for pure Newton, but kept for state compatibility
-    v_top: Array,    # unused
-    m_perp: Array,
-    v_perp: Array,
-    step: Array,
-    lr_top: float,
-    lr_perp: float,
-    beta1: float,
-    beta2: float,
-    eps: float,
-    precond_damping: float,
-    use_saddle_free: bool,
-    weight_decay: float,
-) -> Tuple[PyTree, Array, Array, Array, Array]:
-    """
-    Split-space behaviour:
-
-      - Top-k eigen-subspace: damped truncated Newton step with lr_top.
-      - Orthogonal complement: standard Adam with lr_perp.
-
-    m_top, v_top are currently not used (pure Newton), but kept for future
-    extensions and for state shape compatibility.
-    """
-    flat_grads, unravel_grads = ravel_pytree(grads)
-    flat_params, _ = ravel_pytree(params)
-
-    V = eigenvectors           # (k_max, dim)
-    lambdas = eigenvalues      # (k_max,)
-
-    # 1) Split gradient into top-k and complement
-    proj = V @ flat_grads          # α (k_max,)
-    g_par = V.T @ proj             # (dim,)
-    g_perp = flat_grads - g_par    # (dim,)
-
-    # 2) Adam bias correction factors
-    t = step.astype(jnp.float32) + 1.0
-    bc1 = 1.0 - beta1 ** t
-    bc2 = 1.0 - beta2 ** t
-
-    # 3) Complement Adam on g_perp
-    m_perp = beta1 * m_perp + (1.0 - beta1) * g_perp
-    v_perp = beta2 * v_perp + (1.0 - beta2) * (g_perp * g_perp)
-
-    m_perp_hat = m_perp / bc1
-    v_perp_hat = v_perp / bc2
-
-    step_perp_flat = -lr_perp * m_perp_hat / (jnp.sqrt(v_perp_hat) + eps)
-
-    # 4) Top-k Newton-style step (no Adam, just H^{-1} g)
-    if use_saddle_free:
-        lam_eff = jnp.abs(lambdas)
-    else:
-        # Clamp negatives to zero for GGN safety
-        lam_eff = jnp.maximum(lambdas, 0.0)
-
-    lam_eff = lam_eff + precond_damping
-    newton_coeffs = proj / (lam_eff + 1e-12)     # α_i / (λ_eff_i + δ)
-
-    step_top_flat = -lr_top * (V.T @ newton_coeffs)   # (dim,)
-
-    # 5) Combine
-    step_flat = step_top_flat + step_perp_flat
-
-    # 6) Decoupled weight decay (tied to lr_perp)
-    if weight_decay != 0.0:
-        step_flat = step_flat - lr_perp * weight_decay * flat_params
-
-    updates = unravel_grads(step_flat)
-
-    # m_top, v_top passed through unchanged (pure Newton on top-k)
-    return updates, m_top, v_top, m_perp, v_perp
 
 
 # ---------------------------------------------------------------------------
@@ -605,35 +493,32 @@ def pns_eigenadam(
     lanczos_iters: Optional[int] = None,
     ggn_matvec_fn: Optional[GGNMatvecFn] = None,
     precond_damping: float = 1e-4,
+    sketch_dim: Optional[int] = None,
     *,
-    backend: str = "ggn",        
-    split_spaces: bool = False,  
-    lr_top: Optional[float] = None,   
-    lr_perp: Optional[float] = None,  
+    curvature_is_hessian: bool = False,
 ) -> optax.GradientTransformation:
-
     """
     PN-S EigenAdam as an Optax gradient transformation (global eigenbasis).
 
-    - split_spaces == False:
-        * EXACTLY your old behaviour:
-            - estimate top-k curvature eigenpairs via Lanczos,
-            - apply eigenbasis square-root preconditioner,
-            - run AdamW on the preconditioned gradient.
+    - If `sketch_dim` is None (default), curvature is estimated via standard
+      Lanczos in the full parameter space.
 
-    - split_spaces == True:
-        * Same eigenbasis, but:
-            - perform Adam in the top-k subspace in eigen coordinates,
-              with curvature-based scaling,
-            - perform standard diagonal Adam in the orthogonal complement,
-            - combine both steps + decoupled weight decay.
+    - If `sketch_dim` is not None, curvature is estimated via a sketched Lanczos
+      procedure using a random projection S ∈ R^{sketch_dim × dim}.
+
+    - If `curvature_is_hessian=True`, we interpret the curvature operator as the
+      (possibly indefinite) Hessian. We then:
+        * sort the Ritz pairs by |λ| descending (largest magnitude first),
+        * apply a saddle-free treatment to negative eigenvalues:
+              λ_eff = λ          if λ >= 0
+              λ_eff = |λ|        if λ < 0
+          in the preconditioner.
+      This matches the "saddle-free Newton" idea along the directions we
+      explicitly track, while keeping the rest of the space as in standard Adam.
     """
     if lanczos_iters is None:
         lanczos_iters = max_eigenvectors
-    # Static number of tracked modes (no JAX tracing here).
-    k_top = min(max_eigenvectors, lanczos_iters)
 
-    # Old base optimizer (unchanged) for the non-split mode.
     base_adam = optax.adamw(
         learning_rate=learning_rate,
         b1=beta1,
@@ -645,21 +530,14 @@ def pns_eigenadam(
     def init_fn(params: Params) -> PnsEigenAdamState:
         flat_params, _ = ravel_pytree(params)
         dim = flat_params.shape[0]
-        dtype = flat_params.dtype
 
-        eigenvalues = jnp.zeros((max_eigenvectors,), dtype=dtype)
-        eigenvectors = jnp.zeros((max_eigenvectors, dim), dtype=dtype)
+        eigenvalues = jnp.zeros((max_eigenvectors,), dtype=jnp.float32)
+        eigenvectors = jnp.zeros((max_eigenvectors, dim), dtype=jnp.float32)
 
         adam_state = base_adam.init(params)
         rng_key = jax.random.PRNGKey(0)
         step = jnp.array(0, dtype=jnp.int32)
-        rotation_diff = jnp.array(0.0, dtype=dtype)
-
-        # Extra state for split_spaces mode (harmless otherwise).
-        m_top = jnp.zeros((max_eigenvectors,), dtype=dtype)
-        v_top = jnp.zeros((max_eigenvectors,), dtype=dtype)
-        m_perp = jnp.zeros((dim,), dtype=dtype)
-        v_perp = jnp.zeros((dim,), dtype=dtype)
+        rotation_diff = jnp.array(0.0, dtype=jnp.float32)
 
         return PnsEigenAdamState(
             adam_state=adam_state,
@@ -668,10 +546,6 @@ def pns_eigenadam(
             eigenvectors=eigenvectors,
             rng_key=rng_key,
             rotation_diff=rotation_diff,
-            m_top=m_top,
-            v_top=v_top,
-            m_perp=m_perp,
-            v_perp=v_perp,
         )
 
     def update_fn(
@@ -679,44 +553,26 @@ def pns_eigenadam(
         state: PnsEigenAdamState,
         params: Optional[Params] = None,
     ):
-        assert params is not None, "PN-S EigenAdam requires `params` in update_fn."
-
         step = state.step + 1
         rng_key = state.rng_key
         eigenvalues = state.eigenvalues
         eigenvectors = state.eigenvectors
         rotation_diff = state.rotation_diff
-        m_top = state.m_top
-        v_top = state.v_top
-        m_perp = state.m_perp
-        v_perp = state.v_perp
-        lr_top_eff = learning_rate if lr_top is None else lr_top
-        lr_perp_eff = learning_rate if lr_perp is None else lr_perp
 
-        use_saddle_free = ((backend == "hessian") or (backend == "fisher"))
-        sort_by_abs = ((backend == "hessian") or (backend == "fisher"))
+        # -------------------------------------------------------------------
+        # 1. Optionally update curvature (GGN or Hessian eigenbasis) every N steps
+        # -------------------------------------------------------------------
+        use_saddle_free = (backend == "hessian")
+        sort_by_abs = (backend == "hessian")
 
-        # ---------------------------------------------------------------
-        # 1. Curvature update (top-k eigenpairs) every curvature_update_every.
-        #    All sizes are STATIC: no dynamic slicing.
-        # ---------------------------------------------------------------
-        if ggn_matvec_fn is not None and curvature_update_every > 0:
+        if ggn_matvec_fn is not None and params is not None:
             should_update = (step % curvature_update_every) == 0
 
             def do_update(carry):
-                (
-                    eigenvalues,
-                    eigenvectors,
-                    rng_key,
-                    params,
-                    rotation_diff,
-                    m_top,
-                    v_top,
-                ) = carry
+                eigenvalues, eigenvectors, rng_key, params, rotation_diff = carry
 
                 flat_params, unravel_params = ravel_pytree(params)
                 dim = flat_params.shape[0]
-                dtype = flat_params.dtype
 
                 def matvec_flat(v_flat: Array) -> Array:
                     v_pytree = unravel_params(v_flat)
@@ -725,59 +581,56 @@ def pns_eigenadam(
                     return Hv_flat
 
                 rng_key, lanczos_key = jax.random.split(rng_key)
-                evals, evecs = lanczos(
-                    matvec=matvec_flat,
-                    dim=dim,
-                    num_iter=lanczos_iters,  # STATIC int
-                    key=lanczos_key,
-                    sort_by_abs=sort_by_abs,
-                )  # evecs: (lanczos_iters, dim)
 
-                # For Hessian backend, reorder by |λ|.
-                if (backend == "hessian") or (backend == "fisher"):
+                # Either full Lanczos, or sketched Lanczos if sketch_dim is set.
+                if sketch_dim is None:
+                    evals, evecs = lanczos(
+                        matvec=matvec_flat,
+                        dim=dim,
+                        num_iter=lanczos_iters,
+                        key=lanczos_key,
+                        sort_by_abs=sort_by_abs,
+                    )  # evecs: (k, dim) rows are eigenvectors
+                else:
+                    evals, U = _sketched_lanczos_block(
+                        hvp_fn=matvec_flat,  # v_flat -> H v_flat
+                        dim=dim,
+                        k=lanczos_iters,
+                        s=sketch_dim,
+                        rng=lanczos_key,
+                    )
+                    # _sketched_lanczos_block returns eigenvectors as columns (dim, k)
+                    evecs = U.T  # shape (k, dim) to match apply_eigen_preconditioner
+
+                # For a Hessian backend, reorder by |λ| to get largest magnitude modes
+                if curvature_is_hessian:
                     order = jnp.argsort(jnp.abs(evals))[::-1]
                     evals = evals[order]
                     evecs = evecs[order, :]
 
-                # Use a STATIC number of modes: k_top.
-                prev_vecs_k = eigenvectors[:k_top, :]  # (k_top, dim)
-                new_vecs_k = evecs[:k_top, :]          # (k_top, dim)
+                # Use a static number of eigenvectors (<= max_eigenvectors)
+                k = min(eigenvalues.shape[0], evals.shape[0])
 
-                # Rotation distance (normalized Frobenius)
+                # ---------- rotation matrix change (normalized Frobenius) ----------
+                prev_vecs_k = eigenvectors[:k, :]  # (k, dim)
+                new_vecs_k = evecs[:k, :]          # (k, dim)
+
                 diff = new_vecs_k - prev_vecs_k
-                frob_num = jnp.linalg.norm(diff)
+                frob_num = jnp.linalg.norm(diff)  # ||ΔV||_F
                 frob_den = jnp.linalg.norm(prev_vecs_k)
                 frob_den_safe = jnp.where(frob_den > 1e-8, frob_den, 1.0)
                 rotation_diff_new = jnp.where(
                     frob_den > 1e-8,
                     frob_num / frob_den_safe,
-                    jnp.array(0.0, dtype=dtype),
+                    jnp.array(0.0, dtype=jnp.float32),
                 )
 
                 # Store eigenvalues/eigenvectors in fixed-size arrays
                 eigenvalues_new = jnp.zeros_like(eigenvalues)
-                eigenvalues_new = eigenvalues_new.at[:k_top].set(evals[:k_top])
+                eigenvalues_new = eigenvalues_new.at[:k].set(evals[:k])
 
                 eigenvectors_new = jnp.zeros_like(eigenvectors)
-                eigenvectors_new = eigenvectors_new.at[:k_top, :].set(new_vecs_k)
-
-                # Optional moment transport for top-subspace moments
-                if split_spaces and k_top > 0:
-                    R = new_vecs_k @ prev_vecs_k.T  # (k_top, k_top)
-
-                    m_top_small = m_top[:k_top]
-                    v_top_small = v_top[:k_top]
-
-                    m_top_new_small = R @ m_top_small
-                    v_top_new_small = R @ v_top_small  # heuristic
-
-                    m_top_new = jnp.zeros_like(m_top)
-                    v_top_new = jnp.zeros_like(v_top)
-                    m_top_new = m_top_new.at[:k_top].set(m_top_new_small)
-                    v_top_new = v_top_new.at[:k_top].set(v_top_new_small)
-                else:
-                    m_top_new = m_top
-                    v_top_new = v_top
+                eigenvectors_new = eigenvectors_new.at[:k, :].set(evecs[:k, :])
 
                 return (
                     eigenvalues_new,
@@ -785,82 +638,42 @@ def pns_eigenadam(
                     rng_key,
                     params,
                     rotation_diff_new,
-                    m_top_new,
-                    v_top_new,
                 )
 
             def dont_update(carry):
+                # No change to eigenvalues/eigenvectors/rotation_diff/rng_key
                 return carry
 
-            (
-                eigenvalues,
-                eigenvectors,
-                rng_key,
-                _,
-                rotation_diff,
-                m_top,
-                v_top,
-            ) = jax.lax.cond(
+            eigenvalues, eigenvectors, rng_key, _, rotation_diff = jax.lax.cond(
                 should_update,
                 do_update,
                 dont_update,
-                operand=(
-                    eigenvalues,
-                    eigenvectors,
-                    rng_key,
-                    params,
-                    rotation_diff,
-                    m_top,
-                    v_top,
-                ),
+                operand=(eigenvalues, eigenvectors, rng_key, params, rotation_diff),
             )
 
-        # ---------------------------------------------------------------
-        # 2. Apply update: either old behaviour or split-spaces version.
-        #    The choice is a PURE Python flag → compile-time for JAX.
-        # ---------------------------------------------------------------
-        if not split_spaces:
-            # Old behaviour (exactly your previous code path)
-            updates, new_adam_state = _apply_eigenadam_whole(
-                grads=grads,
-                params=params,
-                eigenvalues=eigenvalues,
-                eigenvectors=eigenvectors,
-                precond_damping=precond_damping,
-                use_saddle_free=use_saddle_free,
-                base_adam=base_adam,
-                adam_state=state.adam_state,
-            )
-            # Moments unchanged in this mode
-            new_m_top = m_top
-            new_v_top = v_top
-            new_m_perp = m_perp
-            new_v_perp = v_perp
+        # -------------------------------------------------------------------
+        # 2. Precondition gradients in eigenbasis
+        #    - PSD / GGN: standard PN-S EigenAdam (λ in denominator)
+        #    - Hessian: saddle-free treatment on negative eigenvalues
+        # -------------------------------------------------------------------
+        flat_grads, unravel_grads = ravel_pytree(grads)
+        precond_flat_grads = apply_eigen_preconditioner(
+            grad_flat=flat_grads,
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+            damping=precond_damping,
+            saddle_free_neg=use_saddle_free,
+        )
+        precond_grads = unravel_grads(precond_flat_grads)
 
-        else:
-            # New two-space behaviour: Newton on top-k, Adam on complement
-            updates, new_m_top, new_v_top, new_m_perp, new_v_perp = (
-                _apply_eigenadam_split_spaces(
-                    grads=grads,
-                    params=params,
-                    eigenvalues=eigenvalues,
-                    eigenvectors=eigenvectors,
-                    m_top=m_top,
-                    v_top=v_top,
-                    m_perp=m_perp,
-                    v_perp=v_perp,
-                    step=step,
-                    lr_top=lr_top_eff,
-                    lr_perp=lr_perp_eff,
-                    beta1=beta1,
-                    beta2=beta2,
-                    eps=eps,
-                    precond_damping=precond_damping,
-                    use_saddle_free=use_saddle_free,
-                    weight_decay=weight_decay,
-                )
-            )
-            new_adam_state = state.adam_state
+        # -------------------------------------------------------------------
+        # 3. Forward to underlying AdamW on preconditioned gradients
+        # -------------------------------------------------------------------
+        updates, new_adam_state = base_adam.update(
+            precond_grads,
+            state.adam_state,
+            params=params,
+        )
 
         new_state = PnsEigenAdamState(
             adam_state=new_adam_state,
@@ -869,17 +682,11 @@ def pns_eigenadam(
             eigenvectors=eigenvectors,
             rng_key=rng_key,
             rotation_diff=rotation_diff,
-            m_top=new_m_top,
-            v_top=new_v_top,
-            m_perp=new_m_perp,
-            v_perp=new_v_perp,
         )
 
         return updates, new_state
 
     return optax.GradientTransformation(init_fn, update_fn)
-
-
 
 
 # ---------------------------------------------------------------------------

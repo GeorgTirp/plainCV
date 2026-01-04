@@ -22,10 +22,11 @@ muon_ns_steps: 5
 num_channels: 3
 num_classes: 200
 num_epochs: 100
-optim: sophia_shampoo
+optim: pns_eigenadam
 pns_curvature_backend: hessian
 pns_curvature_update_every: 64
 pns_lanczos_iters: 8
+pns_log_curvature: true
 pns_max_eigenvectors: 8
 pns_precond_damping: 1.0e-05
 print_progress: false
