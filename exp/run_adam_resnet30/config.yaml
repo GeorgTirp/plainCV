@@ -14,7 +14,7 @@ hf_damping: 1e-2
 hutchinson_samples: 1
 image_size: 64
 lr: 0.001
-model: vit_small
+model: resnet30
 muon_adaptive: false
 muon_beta: 0.95
 muon_nesterov: true
@@ -26,7 +26,7 @@ muon_ns_steps: 5
 num_channels: 3
 num_classes: 200
 num_epochs: 100
-optim: pns_eigenadam
+optim: adam
 pns_curvature_backend: ggn
 pns_curvature_update_every: 64
 pns_log_curvature: true

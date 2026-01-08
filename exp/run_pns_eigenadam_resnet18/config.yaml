@@ -14,7 +14,7 @@ hf_damping: 1e-2
 hutchinson_samples: 1
 image_size: 64
 lr: 0.001
-model: vit_small
+model: resnet18
 muon_adaptive: false
 muon_beta: 0.95
 muon_nesterov: true

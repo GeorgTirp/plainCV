@@ -140,7 +140,7 @@ def _precondition_matrix_grad(
     key: Array,
     eps: float = 1e-6,
     sqrt_scaling: bool = False,
-) -> Array:
+) -> tuple[Array, Array | None]:
     """
     Precondition a single 2D gradient matrix G using a PN-S-style operator
     built from the Gram matrix.
@@ -184,20 +184,21 @@ def _precondition_matrix_grad(
 
     Returns:
       precond_grad_mat: (m, n) preconditioned gradient matrix.
+      eigenvalues: (k,) eigenvalues used for the preconditioner, or None.
     """
     if grad_mat.ndim != 2:
         # Only operate on true matrices.
-        return grad_mat
+        return grad_mat, None
 
     m, n = grad_mat.shape
     if m == 0 or n == 0:
-        return grad_mat
+        return grad_mat, jnp.zeros((max_eigenvectors,), dtype=grad_mat.dtype)
 
     # Work in the smaller dimension.
     d = min(m, n)
     k = int(min(max_eigenvectors, lanczos_iters, d))
     if k <= 0:
-        return grad_mat
+        return grad_mat, jnp.zeros((max_eigenvectors,), dtype=grad_mat.dtype)
 
     # -------------------------------
     # Column Gram: A = G^T G (n <= m)
@@ -272,7 +273,12 @@ def _precondition_matrix_grad(
 
         precond_grad = G_top_pre + G_perp              # (m, n)
 
-    return precond_grad
+    if k < max_eigenvectors:
+        eigvals = jnp.zeros((max_eigenvectors,), dtype=lambdas.dtype)
+        eigvals = eigvals.at[:k].set(lambdas)
+    else:
+        eigvals = lambdas
+    return precond_grad, eigvals
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +289,7 @@ class OnsEigenAdamState(NamedTuple):
     """State for matrix-view EigenAdam (OnsEigenAdam)."""
     adam_state: optax.OptState
     step: Array
+    eigenvalues: PyTree
 
 
 def pns_eigenmuon(
@@ -341,9 +348,17 @@ def pns_eigenmuon(
     def init_fn(params: Params) -> OnsEigenAdamState:
         adam_state = base_adam.init(params)
         step = jnp.array(0, dtype=jnp.int32)
+
+        def init_leaf(p: Array) -> Array | None:
+            if isinstance(p, jax.Array) and p.ndim == 2:
+                return jnp.zeros((max_eigenvectors,), dtype=p.dtype)
+            return None
+
+        eigenvalues = jtu.tree_map(init_leaf, params)
         return OnsEigenAdamState(
             adam_state=adam_state,
             step=step,
+            eigenvalues=eigenvalues,
         )
 
     def update_fn(
@@ -360,10 +375,10 @@ def pns_eigenmuon(
         # This is fine: each matrix has different G, so Lanczos outputs differ.
         key = jax.random.PRNGKey(step)
 
-        def map_leaf(g: Array) -> Array:
+        def map_leaf(g: Array) -> tuple[Array, Array | None]:
             # Only touch true matrices; everything else is passed through.
             if not isinstance(g, jax.Array) or g.ndim != 2:
-                return g
+                return g, None
 
             return _precondition_matrix_grad(
                 grad_mat=g,
@@ -374,7 +389,14 @@ def pns_eigenmuon(
                 sqrt_scaling=sqrt_scaling,
             )
 
-        precond_grads = jtu.tree_map(map_leaf, grads)
+        precond_with_eigs = jtu.tree_map(map_leaf, grads)
+        is_pair = lambda x: isinstance(x, tuple)
+        precond_grads = jtu.tree_map(
+            lambda pair: pair[0], precond_with_eigs, is_leaf=is_pair
+        )
+        eigenvalues = jtu.tree_map(
+            lambda pair: pair[1], precond_with_eigs, is_leaf=is_pair
+        )
 
         updates, new_adam_state = base_adam.update(
             precond_grads,
@@ -385,6 +407,7 @@ def pns_eigenmuon(
         new_state = OnsEigenAdamState(
             adam_state=new_adam_state,
             step=step,
+            eigenvalues=eigenvalues,
         )
         return updates, new_state
 

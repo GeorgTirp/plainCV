@@ -23,11 +23,21 @@ class EncoderBlock(nn.Module):
     num_heads: int
     mlp_dim: int
     dropout_rate: float = 0.1
+    use_layernorm: bool = True
+    use_batchnorm: bool = False
 
     @nn.compact
     def __call__(self, x, train: bool):
+        if self.use_batchnorm and self.use_layernorm:
+            raise ValueError("use_batchnorm and use_layernorm cannot both be True.")
+
         # Multi-head self-attention
-        y = nn.LayerNorm()(x)
+        if self.use_batchnorm:
+            y = nn.BatchNorm(use_running_average=not train)(x)
+        elif self.use_layernorm:
+            y = nn.LayerNorm()(x)
+        else:
+            y = x
         y = nn.SelfAttention(
             num_heads=self.num_heads,
             deterministic=not train,
@@ -36,7 +46,12 @@ class EncoderBlock(nn.Module):
         x = x + y
 
         # MLP
-        y = nn.LayerNorm()(x)
+        if self.use_batchnorm:
+            y = nn.BatchNorm(use_running_average=not train)(x)
+        elif self.use_layernorm:
+            y = nn.LayerNorm()(x)
+        else:
+            y = x
         y = MlpBlock(mlp_dim=self.mlp_dim, dropout_rate=self.dropout_rate)(y, train=train)
         return x + y
 
@@ -50,6 +65,8 @@ class VisionTransformer(nn.Module):
     num_layers: int = 4
     num_heads: int = 4
     dropout_rate: float = 0.1
+    use_layernorm: bool = True
+    use_batchnorm: bool = False
 
     def setup(self):
         self.cls_token = self.param(
@@ -94,12 +111,17 @@ class VisionTransformer(nn.Module):
         # Transformer encoder
         for _ in range(self.num_layers):
             x = EncoderBlock(
-                num_heads=self.num_heads,
-                mlp_dim=self.mlp_dim,
-                dropout_rate=self.dropout_rate,
-            )(x, train=train)
+            num_heads=self.num_heads,
+            mlp_dim=self.mlp_dim,
+            dropout_rate=self.dropout_rate,
+            use_layernorm=self.use_layernorm,
+            use_batchnorm=self.use_batchnorm,
+        )(x, train=train)
 
-        x = nn.LayerNorm()(x)
+        if self.use_batchnorm:
+            x = nn.BatchNorm(use_running_average=not train)(x)
+        elif self.use_layernorm:
+            x = nn.LayerNorm()(x)
         cls_repr = x[:, 0]
         logits = nn.Dense(self.num_classes)(cls_repr)
         return logits

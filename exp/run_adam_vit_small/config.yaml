@@ -34,6 +34,7 @@ pns_precond_damping: 0.0001
 pns_split_spaces: false
 pns_sqrt_scaling: false
 print_progress: false
+resnet_use_batchnorm: true
 rho: 0.01
 schedule_free: false
 schedule_free_b1: 0.9
@@ -46,4 +47,6 @@ vit_hidden_size: 128
 vit_layers: 4
 vit_mlp_dim: 256
 vit_patch_size: 4
+vit_use_batchnorm: false
+vit_use_layernorm: false
 weight_decay: 0.01

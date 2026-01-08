@@ -3,7 +3,10 @@ set -euo pipefail
 
 CONFIGS=(
   "config/config.yaml"
-  "config/config_soap.yaml"
+  "config/config_shampoo.yaml"
+  "config/config copy.yaml"
+  "config/config copy 2.yaml"
+  "config/config copy 3.yaml"
   #"config/config_shampoo.yaml"
 )
 

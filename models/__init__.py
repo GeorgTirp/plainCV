@@ -1,5 +1,5 @@
 from .mlp import MLP
-from .resnet_small import SmallResNet
+from .resnet import SmallResNet, ResNet30, ResNet18
 from .vit_small import VisionTransformer
 
-__all__ = ['MLP', 'SmallResNet', 'VisionTransformer']
+__all__ = ['MLP', 'SmallResNet', 'VisionTransformer', 'ResNet30', 'ResNet18']

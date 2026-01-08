@@ -14,6 +14,7 @@ from absl import app, flags
 import jax
 import jax.numpy as jnp
 import sys
+from jax import tree_util as jtu
 
 print("DEBUG sys.executable:", sys.executable)
 print("DEBUG jax version:", jax.__version__)
@@ -31,7 +32,7 @@ from engine.flax_engine import create_train_state, make_train_step, make_eval_st
 from optim.ggn_utils import make_ggn_matvec_fn
 
 from models.mlp import MLP
-from models.resnet_small import SmallResNet
+from models.resnet import SmallResNet, ResNet30, ResNet18
 from models.vit_small import VisionTransformer
 from utils import (
     load_config,
@@ -40,6 +41,7 @@ from utils import (
     log_scalar_dict,
     get_exp_dir_path,
     save_loss_curves,
+    _sanitize_name,
 )
 
 FLAGS = flags.FLAGS
@@ -51,7 +53,20 @@ def construct_model(cfg):
     if cfg.model == "mlp":
         return MLP(num_classes=cfg.num_classes)
     elif cfg.model == "resnet_small":
-        return SmallResNet(num_classes=cfg.num_classes)
+        return SmallResNet(
+            num_classes=cfg.num_classes,
+            use_bn=getattr(cfg, "resnet_use_batchnorm", True),
+        )
+    elif cfg.model == "resnet30":
+        return ResNet30(
+            num_classes=cfg.num_classes,
+            use_bn=getattr(cfg, "resnet_use_batchnorm", True),
+        )
+    elif cfg.model == "resnet18":
+        return ResNet18(
+            num_classes=cfg.num_classes,
+            use_bn=getattr(cfg, "resnet_use_batchnorm", True),
+        )
     elif cfg.model in {"vit", "vit_small", "vision_transformer"}:
         return VisionTransformer(
             num_classes=cfg.num_classes,
@@ -61,6 +76,8 @@ def construct_model(cfg):
             num_layers=getattr(cfg, "vit_layers", 4),
             num_heads=getattr(cfg, "vit_heads", 4),
             dropout_rate=getattr(cfg, "vit_dropout", 0.1),
+            use_layernorm=getattr(cfg, "vit_use_layernorm", True),
+            use_batchnorm=getattr(cfg, "vit_use_batchnorm", False),
         )
     else:
         raise ValueError(f"Unknown model: {cfg.model}")
@@ -79,15 +96,17 @@ def main(_argv):
     # --- Optional: curvature spectrum logging ---
     log_curv = getattr(cfg, "pns_log_curvature", False)
     use_pns = cfg.optim in {"pns_eigenadam", "pns-eigenadam"}
+    use_muon = cfg.optim in {"pns_eigenmuon", "pns-eigenmuon"}
     curvature_csv_path = None
     max_eigs = getattr(cfg, "pns_max_eigenvectors", 16)
     max_neg_eigs = getattr(cfg, "pns_negcurv_iters", 0) or 0 
+    muon_max_eigs = getattr(cfg, "gradient_eigenvectors", max_eigs)
 
     if log_curv and use_pns:
         curvature_csv_path = os.path.join(exp_dir, "curvature.csv")
         header = (
             ["epoch", "global_step"]
-            + [f"eig_pos_{i}" for i in range(max_eigs)]
+            + [f"eig_{i}" for i in range(max_eigs)]
             + ["rotation_diff_pos"]
             + [f"eig_neg_{i}" for i in range(max_neg_eigs)]
             + ["rotation_diff_neg"]
@@ -131,6 +150,31 @@ def main(_argv):
         cfg=cfg,
         curvature_batch=curvature_batch,
     )
+
+    muon_log_files = {}
+    if log_curv and use_muon:
+        muon_curv_dir = os.path.join(exp_dir, "gradient_eigenvalues")
+        os.makedirs(muon_curv_dir, exist_ok=True)
+        muon_state = state.opt_state
+        eig_leaves = [
+            leaf for leaf in jtu.tree_leaves(muon_state.eigenvalues)
+            if isinstance(leaf, jax.Array)
+        ]
+        if eig_leaves:
+            muon_max_eigs = int(eig_leaves[0].shape[0])
+        header = ["epoch", "global_step"] + [f"eig_{i}" for i in range(muon_max_eigs)]
+
+        def register_layer(path, leaf):
+            if hasattr(leaf, "ndim") and leaf.ndim == 2:
+                layer_name = "/".join(str(k) for k in path)
+                file_name = f"{_sanitize_name(layer_name)}.csv"
+                file_path = os.path.join(muon_curv_dir, file_name)
+                muon_log_files[layer_name] = file_path
+                with open(file_path, "w") as f:
+                    f.write(",".join(header) + "\n")
+            return None
+
+        jtu.tree_map_with_path(register_layer, state.params)
 
     # --------- OPTIONAL: profile PN-S curvature step once ---------
     # Only makes sense if you're using a curvature-based optimizer
@@ -258,6 +302,25 @@ def main(_argv):
 
             with open(curvature_csv_path, "a") as f:
                 f.write(",".join(str(x) for x in row) + "\n")
+
+        if log_curv and use_muon and muon_log_files:
+            muon_state = state.opt_state
+            step_opt = int(muon_state.step)
+
+            def write_muon_row(path, eigs):
+                if eigs is None:
+                    return None
+                layer_name = "/".join(str(k) for k in path)
+                file_path = muon_log_files.get(layer_name)
+                if file_path is None:
+                    return None
+                eig_vals = [float(x) for x in jnp.asarray(eigs)[:muon_max_eigs]]
+                row = [epoch, step_opt] + eig_vals
+                with open(file_path, "a") as f:
+                    f.write(",".join(str(x) for x in row) + "\n")
+                return None
+
+            jtu.tree_map_with_path(write_muon_row, muon_state.eigenvalues)
 
 
         # TensorBoard logging

@@ -14,7 +14,7 @@ from .hessian_free import hessian_free as hf_opt
 from .shampoo import shampoo as shampoo_opt
 from .sophia import sophia as sophia_opt
 from .sophia import sophia_shampoo as sophia_shampoo_opt
-
+from .lanzos_hybrid import pns_eigen_hybrid
 
 
 def maybe_wrap_schedule_free(base_tx, cfg):
@@ -101,8 +101,8 @@ def get_optimizer(
         eps = getattr(cfg, "eps", 1e-8)
     
         curvature_update_every = getattr(cfg, "pns_curvature_update_every", 10)
-        max_eigenvectors = getattr(cfg, "pns_max_eigenvectors", 16)
-        lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
+        max_eigenvectors = getattr(cfg, "curvature_eigenvectors", 16)
+        lanczos_iters = getattr(cfg, "curvature_iters", None)
         precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
         backend = getattr(cfg, "pns_curvature_backend", "ggn")
         split_spaces = getattr(cfg, "pns_split_spaces", False)
@@ -209,8 +209,8 @@ def get_optimizer(
         beta2 = getattr(cfg, "beta2", 0.999)
         eps = getattr(cfg, "eps", 1e-8)
 
-        max_eigenvectors = getattr(cfg, "pns_max_eigenvectors", 8)
-        lanczos_iters = getattr(cfg, "pns_lanczos_iters", None)
+        max_eigenvectors = getattr(cfg, "gradient_eigenvectors", 8)
+        lanczos_iters = getattr(cfg, "gradient_iters", None)
         precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
         sqrt_scaling = getattr(cfg, "pns_sqrt_scaling", False)
 
@@ -228,6 +228,101 @@ def get_optimizer(
             precond_damping=precond_damping,
             sqrt_scaling=sqrt_scaling,
         )
+
+
+        # ------------------------
+    # Hybrid PN-S EigenAdam + EigenMuon
+    #   - HVP-based global curvature (GGN / Hessian / Fisher)
+    #   - per-layer Gram-based matrix preconditioner on 2D grads
+    elif name in {"pns_eigen_hybrid", "pns-eigen-hybrid"}:
+        assert model_def is not None
+        assert curvature_batch is not None
+
+        # Shared Adam-style hyperparams
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        beta1 = getattr(cfg, "beta1", 0.9)
+        beta2 = getattr(cfg, "beta2", 0.999)
+        eps = getattr(cfg, "eps", 1e-8)
+
+        # -------- global PN-S (Hessian/GGN/Fisher) part --------
+        curvature_update_every = getattr(cfg, "pns_curvature_update_every", 10)
+        global_max_eigenvectors = getattr(cfg, "curvature_eigenvectors", 16)
+        global_lanczos_iters = getattr(cfg, "curvature_iters", None)
+        global_precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
+        backend = getattr(cfg, "pns_curvature_backend", "ggn")
+
+        # If user didn't set curvature_iters explicitly, default to k.
+        if global_lanczos_iters is None:
+            global_lanczos_iters = global_max_eigenvectors
+
+        # Decide whether to actually build a curvature matvec
+        use_global_curv = (
+            (global_max_eigenvectors > 0)
+            and (global_lanczos_iters != 0)
+            and (curvature_update_every > 0)
+        )
+
+        if use_global_curv:
+            if backend == "ggn":
+                curv_mv = make_ggn_matvec_fn(
+                    model_def=model_def,
+                    curvature_batch=curvature_batch,
+                    batch_stats=batch_stats,
+                )
+            elif backend == "hessian":
+                curv_mv = make_hessian_matvec_fn(
+                    model_def=model_def,
+                    curvature_batch=curvature_batch,
+                    batch_stats=batch_stats,
+                )
+            elif backend == "fisher":
+                curv_mv = make_fisher_matvec_fn(
+                    model_def=model_def,
+                    curvature_batch=curvature_batch,
+                    batch_stats=batch_stats,
+                )
+            else:
+                raise ValueError(f"Unknown pns_curvature_backend: {backend}")
+        else:
+            # Let the hybrid optimizer detect ggn_matvec_fn=None
+            # and effectively disable the global curvature part.
+            curv_mv = None
+
+        # -------- per-matrix (muon-style) Gram part --------
+        muon_max_eigenvectors = getattr(cfg, "gradient_eigenvectors", 8)
+        muon_lanczos_iters = getattr(cfg, "gradient_iters", None)
+        muon_precond_damping = getattr(
+            cfg, "pns_grad_precond_damping", global_precond_damping
+        )
+        muon_sqrt_scaling = getattr(cfg, "pns_grad_sqrt_scaling", False)
+
+        if muon_lanczos_iters is None:
+            muon_lanczos_iters = muon_max_eigenvectors
+
+        # NOTE: if user sets gradient_eigenvectors=0 or gradient_iters=0,
+        # the hybrid optimizer should see k<=0 and effectively skip the
+        # muon part on each matrix.
+
+        tx = pns_eigen_hybrid(
+            learning_rate=lr,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            weight_decay=weight_decay,
+            # global / Hessian part
+            ggn_matvec_fn=curv_mv,
+            global_max_eigenvectors=global_max_eigenvectors,
+            global_lanczos_iters=global_lanczos_iters,
+            global_precond_damping=global_precond_damping,
+            curvature_update_every=curvature_update_every,
+            backend=backend,
+            # per-matrix muon part
+            muon_max_eigenvectors=muon_max_eigenvectors,
+            muon_lanczos_iters=muon_lanczos_iters,
+            muon_precond_damping=muon_precond_damping,
+            muon_sqrt_scaling=muon_sqrt_scaling,
+        )
+
 
     # ------------------------
     # SOAP

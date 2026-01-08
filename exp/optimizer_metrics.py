@@ -18,10 +18,10 @@ def _friendly_run_label(run_folder: str) -> str | None:
     """Map run folder names to human-friendly labels; return None to skip plotting."""
     name = run_folder.lower()
     explicit_labels = {
-        "run_adam_ti": "AdamW",
-        "run_ti_muon_vit_small": "Muon",
-        "runt_ti_muon_vit_small": "Muon",
-        "run_ti_soap_vit_small": "SOAP",
+        "run_adam_vit_small": "AdamW",
+        "run_muon_vit_small": "Muon",
+        "run_pns_eigenadam_vit_small": "LanEiADAM",
+        "run_soap_vit_small": "SOAP",
         "run_pns_eigenmuon_vit_small": "LanEiMuonLike",
     }
     if name in explicit_labels:
@@ -57,6 +57,16 @@ def parse_args() -> argparse.Namespace:
         help="Where to write plots (default: same as --base-dir).",
     )
     parser.add_argument(
+        "--folders-list",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a text file containing one run folder per line. "
+            "Used for both optimizer metrics and curvature plotting unless "
+            "--curvature-folders-list is provided."
+        ),
+    )
+    parser.add_argument(
         "--curvature-folders-list",
         type=Path,
         default=None,
@@ -67,11 +77,70 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+def _read_run_folders_list(folders_list_path: Path) -> list[Path]:
+    if not folders_list_path.exists():
+        raise FileNotFoundError(f"Run folders list not found: {folders_list_path}")
 
-def load_metrics(base_dir: Path) -> pd.DataFrame:
-    metrics_files = sorted(base_dir.glob("run_*/*_metrics.csv"))
-    if not metrics_files:
-        raise FileNotFoundError(f"No metrics CSV files found under {base_dir}/run_*/")
+    run_folders: list[Path] = []
+    for raw_line in folders_list_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        folder = Path(line)
+        if not folder.is_absolute():
+            folder = (folders_list_path.parent / folder).resolve()
+
+        if not folder.is_dir():
+            raise FileNotFoundError(f"Listed run folder does not exist: {folder}")
+        run_folders.append(folder)
+
+    if not run_folders:
+        raise ValueError(f"No run folders found in {folders_list_path}")
+
+    return run_folders
+
+
+def _normalize_run_folders(
+    run_folders: list[str | Path], base_dir: Path
+) -> list[Path]:
+    normalized: list[Path] = []
+    for folder in run_folders:
+        path = Path(folder)
+        if not path.is_absolute():
+            path = (base_dir / path).resolve()
+        if not path.is_dir():
+            raise FileNotFoundError(f"Listed run folder does not exist: {path}")
+        normalized.append(path)
+    if not normalized:
+        raise ValueError("Run folders list is empty.")
+    return normalized
+
+
+def load_metrics(
+    base_dir: Path,
+    folders_list_path: Path | None = None,
+    run_folders: list[Path] | None = None,
+) -> pd.DataFrame:
+    if run_folders is not None:
+        metrics_files: list[Path] = []
+        for folder in run_folders:
+            metrics_files.extend(sorted(folder.glob("*_metrics.csv")))
+        if not metrics_files:
+            raise FileNotFoundError("No metrics CSV files found in the listed run folders.")
+    elif folders_list_path is not None:
+        run_folders = _read_run_folders_list(folders_list_path)
+        metrics_files: list[Path] = []
+        for folder in run_folders:
+            metrics_files.extend(sorted(folder.glob("*_metrics.csv")))
+        if not metrics_files:
+            raise FileNotFoundError(
+                f"No metrics CSV files found in listed folders from {folders_list_path}"
+            )
+    else:
+        metrics_files = sorted(base_dir.glob("run_*/*_metrics.csv"))
+        if not metrics_files:
+            raise FileNotFoundError(f"No metrics CSV files found under {base_dir}/run_*/")
 
     frames = []
     skipped_runs = []
@@ -283,6 +352,22 @@ def plot_train_eval_accuracy(metrics_df: pd.DataFrame, output_dir: Path) -> Path
     return output_path
 
 
+def load_curvature_runs_from_folders(
+    run_folders: list[Path],
+) -> list[tuple[str, pd.DataFrame]]:
+    runs: list[tuple[str, pd.DataFrame]] = []
+    for folder in run_folders:
+        maybe_run = _maybe_load_curvature_run(folder)
+        if maybe_run is None:
+            print(
+                f"Warning: no curvature CSV found in {folder} "
+                "(expected curvature_metrics.csv or curvature.csv). Skipping."
+            )
+            continue
+        runs.append(maybe_run)
+    return runs
+
+
 def load_curvature_runs(folders_list_path: Path) -> list[tuple[str, pd.DataFrame]]:
     """Read curvature CSVs for the runs listed in ``folders_list_path``.
 
@@ -291,33 +376,8 @@ def load_curvature_runs(folders_list_path: Path) -> list[tuple[str, pd.DataFrame
     are resolved relative to the list file location.
     """
 
-    if not folders_list_path.exists():
-        raise FileNotFoundError(f"Curvature folders list not found: {folders_list_path}")
-
-    runs: list[tuple[str, pd.DataFrame]] = []
-    for raw_line in folders_list_path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        folder = Path(line)
-        if not folder.is_absolute():
-            folder = (folders_list_path.parent / folder).resolve()
-
-        if not folder.is_dir():
-            raise FileNotFoundError(f"Listed run folder does not exist: {folder}")
-
-        maybe_run = _maybe_load_curvature_run(folder)
-        if maybe_run is None:
-            raise FileNotFoundError(
-                f"No curvature CSV found in {folder} (expected curvature_metrics.csv or curvature.csv)"
-            )
-        runs.append(maybe_run)
-
-    if not runs:
-        raise ValueError(f"No run folders found in {folders_list_path}")
-
-    return runs
+    run_folders = _read_run_folders_list(folders_list_path)
+    return load_curvature_runs_from_folders(run_folders)
 
 
 def _extract_eigenvalue_columns(df: pd.DataFrame) -> list[str]:
@@ -494,7 +554,23 @@ def main() -> None:
     output_dir = args.output_dir or base_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics_df = load_metrics(base_dir)
+    # Optional in-code override for both metrics + curvature selection.
+    run_folders_override: list[str] | None = None
+    # Example:
+    run_folders_override = [
+        "run_adam_vit_small",
+        "run_muon_vit_small",
+        "run_pns_eigenadam_vit_small",
+        "run_soap_vit_small",
+        "run_pns_eigenmuon_vit_small",
+    ]
+    run_folders = (
+        _normalize_run_folders(run_folders_override, base_dir)
+        if run_folders_override is not None
+        else None
+    )
+
+    metrics_df = load_metrics(base_dir, args.folders_list, run_folders)
     combined_csv = output_dir / "optimizer_metrics_combined.csv"
     metrics_df.to_csv(combined_csv, index=False)
 
@@ -512,8 +588,11 @@ def main() -> None:
 
     curvature_plot = None
     curvature_runs: list[tuple[str, pd.DataFrame]] = []
-    if args.curvature_folders_list is not None:
-        curvature_runs = load_curvature_runs(args.curvature_folders_list)
+    curvature_list = args.curvature_folders_list or args.folders_list
+    if run_folders is not None:
+        curvature_runs = load_curvature_runs_from_folders(run_folders)
+    elif curvature_list is not None:
+        curvature_runs = load_curvature_runs(curvature_list)
     else:
         curvature_runs = discover_curvature_runs(base_dir)
 
