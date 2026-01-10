@@ -300,3 +300,179 @@ def make_fisher_matvec_fn(
     # Optionally JIT, since Lanczos will call this many times
     fisher_matvec_jit = jax.jit(fisher_matvec)
     return fisher_matvec_jit
+
+
+# Add to optim/ggn_utils.py
+
+def _build_weighted_laplacian_from_probs(
+    p: Array,
+    adjacency: Array,
+    eps: float = 1e-8,
+) -> Array:
+    """
+    Build a probability-dependent weighted Laplacian L(p) on the class simplex.
+
+    We use a simple (common) choice:
+      w_ij(p) = a_ij * (p_i + p_j)/2
+      L_ij = -w_ij for i != j
+      L_ii = sum_{j != i} w_ij
+
+    Args:
+      p: (C,) probability vector, p_i >= 0, sum p_i = 1
+      adjacency: (C, C) symmetric nonnegative weights a_ij, diag assumed 0
+      eps: small stabilizer
+
+    Returns:
+      L: (C, C) Laplacian matrix (singular; nullspace is constants).
+    """
+    # Symmetrize and clear diagonal for safety
+    a = 0.5 * (adjacency + adjacency.T)
+    a = a * (1.0 - jnp.eye(a.shape[0], dtype=a.dtype))
+
+    # w_ij = a_ij * (p_i + p_j)/2
+    w = a * 0.5 * (p[:, None] + p[None, :])
+
+    # Laplacian: L = diag(sum_j w_ij) - w
+    d = jnp.sum(w, axis=-1)
+    L = jnp.diag(d) - w
+
+    # Small eps on diagonal (doesn't remove nullspace, just numerical safety)
+    L = L + eps * jnp.eye(L.shape[0], dtype=L.dtype)
+    return L
+
+
+def _solve_laplacian_gauge_fixed(
+    L: Array,
+    b: Array,
+) -> Array:
+    """
+    Solve L x = b with a gauge-fixing constraint to handle Laplacian singularity.
+
+    We fix the additive constant by enforcing sum(x)=0:
+      Replace last row with ones: 1^T x = 0
+      Replace last rhs entry with 0
+
+    Args:
+      L: (C, C) Laplacian-like matrix (near-singular).
+      b: (C,) right-hand side with sum(b)=0 (tangent to simplex).
+
+    Returns:
+      x: (C,) solution with approximately zero mean.
+    """
+    C = L.shape[0]
+    A = L
+    rhs = b
+
+    # Gauge-fix: last row becomes all-ones; rhs last entry = 0
+    A = A.at[-1, :].set(jnp.ones((C,), dtype=L.dtype))
+    rhs = rhs.at[-1].set(jnp.array(0.0, dtype=rhs.dtype))
+
+    x = jnp.linalg.solve(A, rhs)
+    # Enforce zero-mean numerically
+    x = x - jnp.mean(x)
+    return x
+
+
+def make_wasserstein_metric_matvec_fn(
+    model_def: Any,
+    curvature_batch: Tuple[Array, Array],
+    batch_stats: Optional[PyTree] = None,
+    *,
+    # Provide either adjacency directly, or a cost/distance matrix to convert.
+    class_adjacency: Optional[Array] = None,
+    class_cost: Optional[Array] = None,
+    cost_to_adj_eps: float = 1e-6,
+    laplacian_eps: float = 1e-8,
+) -> GGNMatvecFn:
+    """
+    Build a Wasserstein-metric-tensor matvec (GW) for a Flax classifier.
+
+    GW is a PSD operator on parameter space induced by a discrete Wasserstein
+    geometry on the output simplex:
+        GW(θ) v = J_p(θ)^T  L(p)^{-1}  J_p(θ) v
+    where p = softmax(logits), and L(p) is a probability-weighted graph Laplacian
+    built from a ground geometry across classes.
+
+    This matches the same calling convention as the other curvature matvecs:
+        gw_matvec(params, vec_pytree, rng_key) -> vec_pytree
+
+    Args:
+      model_def: Flax Linen Module.
+      curvature_batch: (images, labels) used for curvature estimation. Labels
+        are unused here but kept for a consistent signature.
+      batch_stats: BatchNorm stats or None.
+      class_adjacency: (C, C) nonnegative symmetric weights a_ij encoding
+        class geometry. diag should be 0.
+      class_cost: (C, C) symmetric nonnegative costs/distances. If provided and
+        class_adjacency is None, we set adjacency = 1 / (cost^2 + eps).
+      cost_to_adj_eps: epsilon for converting cost->adjacency.
+      laplacian_eps: epsilon added to L(p) diagonal for numerical stability.
+
+    Returns:
+      gw_matvec(params, vec_pytree, rng_key) -> PyTree like params
+    """
+    images, _labels = curvature_batch  # labels not needed for the metric tensor
+
+    def probs_fn(params: Params, rng: Array) -> Array:
+        """Forward pass returning class probabilities p = softmax(logits)."""
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        out = model_def.apply(
+            variables,
+            images,
+            mutable=False,
+            train=False,
+            rngs={"dropout": rng},  # safe if model has no dropout
+        )
+
+        logits = out[0] if isinstance(out, tuple) else out
+        return jax.nn.softmax(logits, axis=-1)  # (B, C)
+
+    # Determine number of classes and build adjacency
+    # (we do this lazily inside the matvec to keep JIT happy with shapes).
+    def _get_adjacency(num_classes: int, dtype) -> Array:
+        if class_adjacency is not None:
+            A = class_adjacency
+        elif class_cost is not None:
+            # Convert cost/distance matrix to adjacency weights
+            # Larger cost => smaller coupling weight.
+            A = 1.0 / (jnp.square(class_cost) + cost_to_adj_eps)
+        else:
+            # Default: fully-connected unit adjacency (no geometry info)
+            A = jnp.ones((num_classes, num_classes), dtype=dtype)
+
+        A = A.astype(dtype)
+        # Symmetrize & clear diagonal
+        A = 0.5 * (A + A.T)
+        A = A * (1.0 - jnp.eye(num_classes, dtype=dtype))
+        return A
+
+    def gw_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        # Wrap probs_fn so jvp/vjp are wrt params only (rng fixed)
+        f = lambda p: probs_fn(p, rng_key)
+
+        # 1) JVP: compute s = J_p v (tangent in simplex), shape (B, C)
+        p, s = jax.jvp(f, (params,), (vec_pytree,))
+
+        # Ensure tangent numerically: sum_c s_c = 0
+        s = s - jnp.mean(s, axis=-1, keepdims=True)
+
+        B, C = p.shape
+        A = _get_adjacency(C, p.dtype)
+
+        # 2) Solve per example: phi = L(p)^{-1} s  (with gauge fixing)
+        def solve_one(p_i: Array, s_i: Array) -> Array:
+            L = _build_weighted_laplacian_from_probs(p_i, A, eps=laplacian_eps)
+            phi = _solve_laplacian_gauge_fixed(L, s_i)
+            return phi
+
+        phi = jax.vmap(solve_one, in_axes=(0, 0))(p, s)  # (B, C)
+
+        # 3) VJP: map back to parameter space: J_p^T phi
+        _, vjp_fun = jax.vjp(f, params)
+        gw_v, = vjp_fun(phi)
+        return gw_v
+
+    return jax.jit(gw_matvec)
