@@ -4,7 +4,7 @@ print_progress: false
 dataset: "tiny_imagenet"   # or "tiny_imagenet"
 batch_size: 64
 image_size: 64             # TinyImageNet uses 64; override when switching datasets
-num_epochs: 100
+num_epochs: 50
 num_channels: 3            # TinyImageNet uses 3 channels
 num_classes: 200            # TinyImageNet uses 200 classes
 
@@ -50,14 +50,14 @@ hf_damping: 1e-2
 
 # --- PN-S EigenAdam–specific hyperparameters ---
 #pns_sketch_dim: 128
-pns_curvature_update_every: 58  
+pns_curvature_update_every: 60  
 curvature_eigenvectors: 6         
 curvature_iters: 6
 gradient_eigenvectors: 6              
 gradient_iters: 6
 pns_precond_damping: 1.0e-4
 pns_sqrt_scaling: false       
-pns_curvature_backend: ggn  # or "hessian", "ggn", "fisher"
+pns_curvature_backend: wasserstein  # or "hessian", "ggn", "fisher"
 pns_log_curvature: true
 pns_split_spaces: false
 pns_lr_top: 1e-3

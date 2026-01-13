@@ -5,8 +5,8 @@ clip_threshold: 1
 curvature_eigenvectors: 8
 curvature_iters: 8
 dataset: tiny_imagenet
-gradient_eigenvectors: 8
-gradient_iters: 8
+gradient_eigenvectors: 6
+gradient_iters: 6
 hessian_update_every: 10
 hf_cg_max_iters: 15
 hf_cg_tol: 1e-2
@@ -14,7 +14,7 @@ hf_damping: 1e-2
 hutchinson_samples: 1
 image_size: 64
 lr: 0.001
-model: resnet18
+model: vit_small
 muon_adaptive: false
 muon_beta: 0.95
 muon_nesterov: true
@@ -50,5 +50,5 @@ vit_layers: 4
 vit_mlp_dim: 256
 vit_patch_size: 4
 vit_use_batchnorm: false
-vit_use_layernorm: false
+vit_use_layernorm: true
 weight_decay: 0.01

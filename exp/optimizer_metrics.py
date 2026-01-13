@@ -20,19 +20,23 @@ def _friendly_run_label(run_folder: str) -> str | None:
     explicit_labels = {
         "run_adam_vit_small": "AdamW",
         "run_muon_vit_small": "Muon",
-        "run_pns_eigenadam_vit_small": "LanEiADAM",
+        "run_pns_eigenadam_vit_small": "PARSEC-H",
         "run_soap_vit_small": "SOAP",
-        "run_pns_eigenmuon_vit_small": "LanEiMuonLike",
+        "run_pns_eigenmuon_vit_small": "PARSEC-M",
     }
     if name in explicit_labels:
         return explicit_labels[name]
+    if "pns_eigenadam" in name or "leneidam" in name:
+        return "PARSEC-H"
+    if "pns_eigenmuon" in name or "leneimuon" in name:
+        return "PARSEC-M"
     if "fim" in name and "sqrt" in name:
-        return "LanEiDAM FIM sqrt"
+        return "PARSEC-H FIM sqrt"
     if "sqrt" in name:
-        return "LanEiDAM sqrt GGN"
+        return "PARSEC-H sqrt GGN"
     if "neg" in name or "hessian" in name:
-        return "LanEiDAM Hessian"
-    # Filter out LanEiDAM GGN runs from plots.
+        return "PARSEC-H Hessian"
+    # Filter out PARSEC-H GGN runs from plots.
     if "pos" in name or "ggn" in name:
         return None
     return run_folder
@@ -356,15 +360,18 @@ def load_curvature_runs_from_folders(
     run_folders: list[Path],
 ) -> list[tuple[str, pd.DataFrame]]:
     runs: list[tuple[str, pd.DataFrame]] = []
+    skipped: list[str] = []
     for folder in run_folders:
         maybe_run = _maybe_load_curvature_run(folder)
         if maybe_run is None:
-            print(
-                f"Warning: no curvature CSV found in {folder} "
-                "(expected curvature_metrics.csv or curvature.csv). Skipping."
-            )
+            skipped.append(folder.name)
             continue
         runs.append(maybe_run)
+    if skipped:
+        print(
+            "Warning: skipped runs without curvature CSV: "
+            f"{sorted(set(skipped))}"
+        )
     return runs
 
 
@@ -558,11 +565,11 @@ def main() -> None:
     run_folders_override: list[str] | None = None
     # Example:
     run_folders_override = [
-        "run_adam_vit_small",
-        "run_muon_vit_small",
-        "run_pns_eigenadam_vit_small",
-        "run_soap_vit_small",
-        "run_pns_eigenmuon_vit_small",
+        "run_adam_resnet18",
+        "run_muon_resnet18",
+        "run_pns_eigenadam_resnet18",
+        "run_soap_resnet18",
+        "run_pns_eigenmuon_resnet18",
     ]
     run_folders = (
         _normalize_run_folders(run_folders_override, base_dir)

@@ -8,7 +8,13 @@ import optax
 from .pns_eigenmuon import pns_eigenmuon
 from .soap import soap as soap_opt
 from .pns_eigenadam import pns_eigenadam
-from .ggn_utils import make_ggn_matvec_fn, make_hessian_matvec_fn, make_fisher_matvec_fn
+from .ggn_utils import (
+    make_ggn_matvec_fn,
+    make_hessian_matvec_fn,
+    make_fisher_matvec_fn,
+    make_wasserstein_metric_matvec_fn,
+    make_svgd_metric_matvec_fn,
+)
 from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
 from .shampoo import shampoo as shampoo_opt
@@ -125,6 +131,24 @@ def get_optimizer(
                 model_def=model_def,
                 curvature_batch=curvature_batch,
                 batch_stats=batch_stats,
+            )
+        elif backend == "wasserstein":
+            curv_mv = make_wasserstein_metric_matvec_fn(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
+        elif backend == "svgd":
+            kernel_bandwidth = getattr(cfg, "pns_svgd_kernel_bandwidth", 1.0)
+            kernel_scale = getattr(cfg, "pns_svgd_kernel_scale", 1.0)
+            feature = getattr(cfg, "pns_svgd_feature", "logits")
+            curv_mv = make_svgd_metric_matvec_fn(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+                kernel_bandwidth=kernel_bandwidth,
+                kernel_scale=kernel_scale,
+                feature=feature,
             )
 
         else:
@@ -280,6 +304,24 @@ def get_optimizer(
                     model_def=model_def,
                     curvature_batch=curvature_batch,
                     batch_stats=batch_stats,
+                )
+            elif backend == "wasserstein":
+                curv_mv = make_wasserstein_metric_matvec_fn(
+                    model_def=model_def,
+                    curvature_batch=curvature_batch,
+                    batch_stats=batch_stats,
+                )
+            elif backend == "svgd":
+                kernel_bandwidth = getattr(cfg, "pns_svgd_kernel_bandwidth", 1.0)
+                kernel_scale = getattr(cfg, "pns_svgd_kernel_scale", 1.0)
+                feature = getattr(cfg, "pns_svgd_feature", "logits")
+                curv_mv = make_svgd_metric_matvec_fn(
+                    model_def=model_def,
+                    curvature_batch=curvature_batch,
+                    batch_stats=batch_stats,
+                    kernel_bandwidth=kernel_bandwidth,
+                    kernel_scale=kernel_scale,
+                    feature=feature,
                 )
             else:
                 raise ValueError(f"Unknown pns_curvature_backend: {backend}")

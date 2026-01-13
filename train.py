@@ -46,6 +46,11 @@ from utils import (
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string("config", "config/config.yaml", "Path to config.yaml file.")
+flags.DEFINE_string(
+    "exp_name",
+    None,
+    "Override exp_name from the config for the output folder.",
+)
 
 
 def construct_model(cfg):
@@ -98,21 +103,11 @@ def main(_argv):
     use_pns = cfg.optim in {"pns_eigenadam", "pns-eigenadam"}
     use_muon = cfg.optim in {"pns_eigenmuon", "pns-eigenmuon"}
     curvature_csv_path = None
-    max_eigs = getattr(cfg, "pns_max_eigenvectors", 16)
-    max_neg_eigs = getattr(cfg, "pns_negcurv_iters", 0) or 0 
+    max_eigs = getattr(cfg, "curvature_eigenvectors", None)
+    if max_eigs is None:
+        max_eigs = getattr(cfg, "pns_max_eigenvectors", 16)
+    max_neg_eigs = getattr(cfg, "pns_negcurv_iters", 0) or 0
     muon_max_eigs = getattr(cfg, "gradient_eigenvectors", max_eigs)
-
-    if log_curv and use_pns:
-        curvature_csv_path = os.path.join(exp_dir, "curvature.csv")
-        header = (
-            ["epoch", "global_step"]
-            + [f"eig_{i}" for i in range(max_eigs)]
-            + ["rotation_diff_pos"]
-            + [f"eig_neg_{i}" for i in range(max_neg_eigs)]
-            + ["rotation_diff_neg"]
-        )
-        with open(curvature_csv_path, "w") as f:
-            f.write(",".join(header) + "\n")
 
 
     # RNG setup
@@ -175,6 +170,23 @@ def main(_argv):
             return None
 
         jtu.tree_map_with_path(register_layer, state.params)
+
+    if log_curv and use_pns:
+        curvature_csv_path = os.path.join(exp_dir, "curvature.csv")
+        pns_state = state.opt_state
+        if hasattr(pns_state, "eigenvalues"):
+            max_eigs = int(jnp.asarray(pns_state.eigenvalues).shape[0])
+        header = ["epoch", "global_step"] + [f"eig_{i}" for i in range(max_eigs)]
+        if max_neg_eigs > 0:
+            header += (
+                ["rotation_diff_pos"]
+                + [f"eig_neg_{i}" for i in range(max_neg_eigs)]
+                + ["rotation_diff_neg"]
+            )
+        else:
+            header += ["rotation_diff_pos"]
+        with open(curvature_csv_path, "w") as f:
+            f.write(",".join(header) + "\n")
 
     # --------- OPTIONAL: profile PN-S curvature step once ---------
     # Only makes sense if you're using a curvature-based optimizer
@@ -294,11 +306,15 @@ def main(_argv):
                 ev_neg = jnp.asarray(pns_state.neg_eigenvalues)
                 rot_neg = float(pns_state.neg_rotation_diff)
                 eig_neg_list = [float(x) for x in ev_neg[:max_neg_eigs]]
+                row = (
+                    [epoch, step_opt]
+                    + eig_pos_list
+                    + [rot_pos]
+                    + eig_neg_list
+                    + [rot_neg]
+                )
             else:
-                rot_neg = 0.0
-                eig_neg_list = []
-
-            row = [epoch, step_opt] + eig_pos_list + [rot_pos] + eig_neg_list + [rot_neg]
+                row = [epoch, step_opt] + eig_pos_list + [rot_pos]
 
             with open(curvature_csv_path, "a") as f:
                 f.write(",".join(str(x) for x in row) + "\n")

@@ -4,7 +4,7 @@ print_progress: false
 dataset: "tiny_imagenet"   # or "tiny_imagenet"
 batch_size: 64
 image_size: 64             # TinyImageNet uses 64; override when switching datasets
-num_epochs: 100
+num_epochs: 50
 num_channels: 3            # TinyImageNet uses 3 channels
 num_classes: 200            # TinyImageNet uses 200 classes
 

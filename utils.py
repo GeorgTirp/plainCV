@@ -171,7 +171,8 @@ def get_exp_dir_path(cfg) -> str:
     out_dir = getattr(cfg, "out_dir", "./exp")
     # If user left the generic name, derive a more descriptive default.
     default_name = f"run_{getattr(cfg, 'optim', 'optim')}_{getattr(cfg, 'model', 'model')}"
-    exp_name = getattr(cfg, "exp_name", None) or default_name
+    flag_exp_name = getattr(FLAGS, "exp_name", None)
+    exp_name = flag_exp_name or getattr(cfg, "exp_name", None) or default_name
     if exp_name == "run":
         exp_name = default_name
     exp_dir = os.path.join(out_dir, exp_name)

@@ -4,7 +4,7 @@ print_progress: false
 dataset: "tiny_imagenet"   # or "tiny_imagenet"
 batch_size: 64
 image_size: 64             # TinyImageNet uses 64; override when switching datasets
-num_epochs: 100
+num_epochs: 50
 num_channels: 3            # TinyImageNet uses 3 channels
 num_classes: 200            # TinyImageNet uses 200 classes
 
@@ -30,7 +30,7 @@ vit_use_batchnorm: false
 # ResNet defaults
 resnet_use_batchnorm: true
 
-optim: pns_eigenmuon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
+optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -50,7 +50,7 @@ hf_damping: 1e-2
 
 # --- PN-S EigenAdam–specific hyperparameters ---
 #pns_sketch_dim: 128
-pns_curvature_update_every: 58  
+pns_curvature_update_every: 60  
 curvature_eigenvectors: 6         
 curvature_iters: 6
 gradient_eigenvectors: 6              

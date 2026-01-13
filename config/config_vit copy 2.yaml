@@ -4,7 +4,7 @@ print_progress: false
 dataset: "tiny_imagenet"   # or "tiny_imagenet"
 batch_size: 64
 image_size: 64             # TinyImageNet uses 64; override when switching datasets
-num_epochs: 50
+num_epochs: 100
 num_channels: 3            # TinyImageNet uses 3 channels
 num_classes: 200            # TinyImageNet uses 200 classes
 
@@ -15,7 +15,7 @@ num_classes: 200            # TinyImageNet uses 200 classes
 #num_channels: 1            
 #num_classes: 10           
 
-model: "resnet18"  # or "mlp", "vit_small", "small_resnet", "resnet18"
+model: "vit_small"  # or "mlp", "vit_small", "small_resnet", "resnet18"
 
 # Vision Transformer defaults (only used if model starts with "vit")
 vit_patch_size: 4
@@ -24,13 +24,13 @@ vit_mlp_dim: 256
 vit_layers: 4
 vit_heads: 4
 vit_dropout: 0.1
-vit_use_layernorm: false
+vit_use_layernorm: true
 vit_use_batchnorm: false
 
 # ResNet defaults
 resnet_use_batchnorm: true
 
-optim: muon  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
+optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -50,9 +50,9 @@ hf_damping: 1e-2
 
 # --- PN-S EigenAdam–specific hyperparameters ---
 #pns_sketch_dim: 128
-pns_curvature_update_every: 58  
-curvature_eigenvectors: 6         
-curvature_iters: 6
+pns_curvature_update_every: 64 
+curvature_eigenvectors: 8        
+curvature_iters: 8
 gradient_eigenvectors: 6              
 gradient_iters: 6
 pns_precond_damping: 1.0e-4
