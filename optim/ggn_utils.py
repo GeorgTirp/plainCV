@@ -476,3 +476,165 @@ def make_wasserstein_metric_matvec_fn(
         return gw_v
 
     return jax.jit(gw_matvec)
+
+
+def make_svgd_metric_matvec_fn(
+    model_def: Any,
+    curvature_batch: Tuple[Array, Array],
+    batch_stats: Optional[PyTree] = None,
+    *,
+    kernel_bandwidth: float = 1.0,
+    kernel_scale: float = 1.0,
+    feature: str = "logits",  # "logits" or "probs"
+) -> GGNMatvecFn:
+    """
+    Build an SVGD-style kernel metric matvec H v for the training loss
+    on a fixed curvature_batch (images, labels).
+
+    We approximate a PSD operator of the form
+
+        H(θ) v ≈ (1/B^2) Σ_{i,j} k(z_i, z_j) g_j (g_i^T v),
+
+    where:
+      - g_i  = ∇_θ ℓ_i(θ) is the per-example gradient (softmax CE),
+      - z_i  are per-example features (logits or probabilities),
+      - k(·,·) is an RBF kernel in feature space.
+
+    Args:
+      model_def: Flax Linen Module (classifier).
+      curvature_batch: (images, labels) used for the metric estimation.
+      batch_stats: BatchNorm stats PyTree or None.
+      kernel_bandwidth: RBF kernel bandwidth σ (k = exp(-||z_i - z_j||^2 / (2 σ^2))).
+      kernel_scale: extra multiplicative factor on the kernel.
+      feature: "logits" or "probs" (what to use as z_i).
+
+    Returns:
+      svgd_matvec(params, vec_pytree, rng) -> PyTree with same structure as params.
+    """
+    images, labels = curvature_batch
+    batch_size = images.shape[0]
+
+    # ---- 1. Per-example loss + feature ----
+
+    def loss_and_feat_single(
+        params: Params,
+        image: Array,
+        label: Array,
+        rng: Array,
+    ) -> Tuple[Array, Array]:
+        """Single-example NLL + feature vector z_i."""
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        out = model_def.apply(
+            variables,
+            image[None, ...],        # add batch dim
+            mutable=False,
+            train=False,
+            rngs={"dropout": rng},   # safe even if model has no dropout
+        )
+
+        # Extract logits robustly if model returns a tuple
+        if isinstance(out, tuple):
+            logits = out[0]          # (1, C)
+        else:
+            logits = out             # (1, C)
+
+        logits = logits[0]           # (C,)
+        num_classes = logits.shape[-1]
+
+        one_hot = jax.nn.one_hot(label, num_classes=num_classes)  # (C,)
+        # optax expects (..., C) with batch dimension
+        xent = optax.softmax_cross_entropy(
+            logits[None, :],
+            one_hot[None, :],
+        ).mean()  # scalar
+
+        if feature == "probs":
+            z = jax.nn.softmax(logits, axis=-1)     # (C,)
+        elif feature == "logits":
+            z = logits                              # (C,)
+        else:
+            raise ValueError(f"Unknown feature type: {feature}")
+
+        return xent, z
+
+    # value_and_grad: returns ((loss, z), grad)
+    loss_and_feat_grad = jax.value_and_grad(
+        loss_and_feat_single,
+        argnums=0,
+        has_aux=True,
+    )
+
+    def per_example_grads_and_feats(params: Params, rng: Array):
+        """Compute (g_i, z_i) for all examples in curvature_batch."""
+        rngs = jax.random.split(rng, batch_size)
+
+        def one_example(image, label, rng_i):
+            (loss_i, z_i), g_i = loss_and_feat_grad(params, image, label, rng_i)
+            return g_i, z_i
+
+        grads, feats = jax.vmap(
+            one_example,
+            in_axes=(0, 0, 0),
+        )(images, labels, rngs)
+        # grads: PyTree with leading batch dim (B, ...)
+        # feats: (B, D)
+        return grads, feats
+
+    # ---- 2. RBF kernel in feature space ----
+
+    def rbf_kernel(feats: Array) -> Array:
+        """
+        Compute RBF kernel matrix K_ij = scale * exp(-||z_i - z_j||^2 / (2 σ^2)).
+
+        feats: (B, D)
+        returns: (B, B)
+        """
+        # Pairwise squared distances
+        diffs = feats[:, None, :] - feats[None, :, :]   # (B, B, D)
+        sqdist = jnp.sum(diffs * diffs, axis=-1)        # (B, B)
+
+        sigma2 = kernel_bandwidth ** 2 + 1e-12
+        K = jnp.exp(-sqdist / (2.0 * sigma2))
+        return kernel_scale * K
+
+    # ---- 3. SVGD-style matvec: H v ----
+
+    def svgd_matvec(params: Params, vec_pytree: PyTree, rng: Array) -> PyTree:
+        """
+        H(θ) v ≈ (1/B^2) Σ_{i,j} k(z_i,z_j) g_j (g_i^T v).
+        """
+        grads, feats = per_example_grads_and_feats(params, rng)
+        K = rbf_kernel(feats)  # (B, B)
+
+        # a) α_i = <g_i, v>
+        def per_leaf_dot(g_leaf: Array, v_leaf: Array) -> Array:
+            # g_leaf: (B, ...), v_leaf: (...,)
+            # result: (B,)
+            return jnp.einsum("i..., ...->i", g_leaf, v_leaf)
+
+        per_leaf_dots = jax.tree_util.tree_map(per_leaf_dot, grads, vec_pytree)
+        alphas = functools.reduce(
+            lambda acc, x: acc + x,
+            jax.tree_util.tree_leaves(per_leaf_dots),
+            jnp.zeros((batch_size,), dtype=images.dtype),
+        )  # shape (B,)
+
+        # b) β_j = Σ_i K_{ij} α_i  (we use K^T @ α)
+        betas = K.T @ alphas  # (B,)
+
+        # c) H v = (1/B^2) Σ_j β_j g_j   (same pattern as empirical Fisher but with β)
+        scale = 1.0 / (batch_size ** 2)
+
+        def combine_leaf(g_leaf: Array) -> Array:
+            # g_leaf: (B, ...)
+            return scale * jnp.einsum("i, i...->...", betas, g_leaf)
+
+        hv = jax.tree_util.tree_map(combine_leaf, grads)
+        return hv
+
+    # JIT for repeated use in Lanczos, etc.
+    svgd_matvec_jit = jax.jit(svgd_matvec)
+    return svgd_matvec_jit
