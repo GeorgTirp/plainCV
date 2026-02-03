@@ -8,11 +8,11 @@ RUNS=(
   # "config/config_shampoo.yaml|"
   # "config/config copy.yaml|"
   #"config/config_vit copy 2.yaml| run_pns_eigenadam_vit_small_ggn"
-  "config/config_vit.yaml|run_pns_eigenadam_vit_small_svgd"
+  "config/config_vit.yaml|run_pns_eigenadam_vit_block"
   #"config/config_vit copy.yaml|run_pns_eigenadam_vit_small_LN_wasserstein"
   
-  "config/config.yaml|run_pns_eigenadam_resnet18_wasserstein"
-  "config/config copy.yaml|run_pns_eigenadam_resnet18_ggn"
+  #"config/config.yaml|run_pns_eigenadam_resnet18_wasserstein"
+  #"config/config copy.yaml|run_pns_eigenadam_resnet18_ggn"
 )
 
 for entry in "${RUNS[@]}"; do

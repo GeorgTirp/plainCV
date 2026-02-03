@@ -462,7 +462,7 @@ def apply_eigen_preconditioner(
     proj = V @ grad_flat  # (k,)
 
     # Component of g in span(V)
-    proj_vec = V.T @ proj  # (dim,)
+    proj_vec = V.T @ proj  # (dim,)k
 
     if saddle_free_neg:
         # Saddle-free: use |λ| + δ (this equals standard scaling on λ>=0)

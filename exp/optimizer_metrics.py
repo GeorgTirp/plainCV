@@ -18,18 +18,34 @@ def _friendly_run_label(run_folder: str) -> str | None:
     """Map run folder names to human-friendly labels; return None to skip plotting."""
     name = run_folder.lower()
     explicit_labels = {
+        "adam": "AdamW",
+        "adamw": "AdamW",
+        "muon": "Muon",
+        "soap": "SOAP",
         "run_adam_vit_small": "AdamW",
         "run_muon_vit_small": "Muon",
+        "run_pns_eigenadam_svgd_vit_small": "PARSEC-SV",
+        "run_pns_eigenadam_wasserstein_vit_small": "PARSEC-W",
         "run_pns_eigenadam_vit_small": "PARSEC-H",
         "run_soap_vit_small": "SOAP",
         "run_pns_eigenmuon_vit_small": "PARSEC-M",
     }
     if name in explicit_labels:
         return explicit_labels[name]
+    if "pns_eigenadam_wasserstein" in name:
+        return "PARSEC-W"
+    if "pns_eigenadam_svgd" in name:
+        return "PARSEC-SV"
     if "pns_eigenadam" in name or "leneidam" in name:
         return "PARSEC-H"
     if "pns_eigenmuon" in name or "leneimuon" in name:
         return "PARSEC-M"
+    if "muon" in name:
+        return "Muon"
+    if "soap" in name:
+        return "SOAP"
+    if "adam" in name:
+        return "AdamW"
     if "fim" in name and "sqrt" in name:
         return "PARSEC-H FIM sqrt"
     if "sqrt" in name:
@@ -565,11 +581,13 @@ def main() -> None:
     run_folders_override: list[str] | None = None
     # Example:
     run_folders_override = [
-        "run_adam_resnet18",
-        "run_muon_resnet18",
-        "run_pns_eigenadam_resnet18",
-        "run_soap_resnet18",
-        "run_pns_eigenmuon_resnet18",
+        "run_adam_vit_small",
+        "run_muon_vit_small",
+        "run_pns_eigenadam_vit_small",
+        "run_pns_eigenadam_vit_small_svgd",
+        "run_pns_eigenadam_vit_small_wasserstein",
+        "run_soap_vit_small",
+        "run_pns_eigenmuon_vit_small",
     ]
     run_folders = (
         _normalize_run_folders(run_folders_override, base_dir)

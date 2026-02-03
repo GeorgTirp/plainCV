@@ -92,6 +92,10 @@ def main(_argv):
     # Parse config
     cfg, _ = load_config(FLAGS.config)
 
+    if cfg.model == "transformer" or str(cfg.model).startswith("pythia"):
+        from train_lm import run as run_lm
+        return run_lm(cfg)
+
     # Experiment dir + logging
     maybe_make_dir(cfg)
     init_wandb(cfg)

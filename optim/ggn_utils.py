@@ -49,6 +49,77 @@ def softmax_cross_entropy_hessian_vec(
     return hv
 
 
+def _extract_logits(output: Any) -> Array:
+    """Robustly extract logits from a model output."""
+    if isinstance(output, tuple):
+        return output[0]
+    if isinstance(output, dict):
+        if "logits" in output:
+            return output["logits"]
+        # Flax HF models sometimes return a FrozenDict with "logits"
+        if hasattr(output, "get"):
+            return output.get("logits")
+    return output
+
+
+def make_ggn_matvec_fn_lm(
+    model_def: Any,
+    curvature_batch: Tuple[Array, Array, Optional[Array]],
+    batch_stats: Optional[PyTree] = None,
+) -> GGNMatvecFn:
+    """Build a GGN matvec function for a Flax causal LM with softmax CE.
+
+    The LM logits are (B, T, V) and labels are (B, T).
+    We flatten (B, T) into a single batch dimension for the Hessian.
+
+    Args:
+      model_def: Flax Linen Module for LM.
+      curvature_batch: (input_ids, labels, attn_mask).
+        input_ids: (B, T) int32
+        labels: (B, T) int32
+        attn_mask: (B, T, T) bool/additive or None
+      batch_stats: optional BatchNorm state (typically None for LM).
+    """
+    input_ids, labels, attn_mask = curvature_batch
+
+    def logits_fn(params: Params) -> Array:
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        out = model_def.apply(
+            variables,
+            input_ids,
+            attn_mask=attn_mask,
+            deterministic=True,
+        )
+        return _extract_logits(out)
+
+    def ggn_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        logits, jvp_logits = jax.jvp(
+            logits_fn,
+            (params,),
+            (vec_pytree,),
+        )  # (B, T, V)
+
+        b, t, v = logits.shape
+        logits2 = logits.reshape(b * t, v)
+        jvp2 = jvp_logits.reshape(b * t, v)
+
+        hv2 = softmax_cross_entropy_hessian_vec(
+            logits=logits2,
+            labels=labels.reshape(b * t),
+            vec_logits=jvp2,
+        )
+        hv_logits = hv2.reshape(b, t, v)
+
+        _, vjp_fun = jax.vjp(logits_fn, params)
+        hv_params, = vjp_fun(hv_logits)
+        return hv_params
+
+    return jax.jit(ggn_matvec)
+
+
 def make_ggn_matvec_fn(
     model_def: Any,
     batch_stats: Any,

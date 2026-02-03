@@ -10,6 +10,7 @@ from .soap import soap as soap_opt
 from .pns_eigenadam import pns_eigenadam
 from .ggn_utils import (
     make_ggn_matvec_fn,
+    make_ggn_matvec_fn_lm,
     make_hessian_matvec_fn,
     make_fisher_matvec_fn,
     make_wasserstein_metric_matvec_fn,
@@ -21,6 +22,7 @@ from .shampoo import shampoo as shampoo_opt
 from .sophia import sophia as sophia_opt
 from .sophia import sophia_shampoo as sophia_shampoo_opt
 from .lanzos_hybrid import pns_eigen_hybrid
+from .pns_eigenadam_batched import pns_eigenadam_batched 
 
 
 def maybe_wrap_schedule_free(base_tx, cfg):
@@ -97,7 +99,14 @@ def get_optimizer(
     # ------------------------
     # PN-S EigenAdam
     # ------------------------
-    elif name in {"pns_eigenadam", "pns-eigenadam"}:
+    elif name in {
+    "parsecH",
+    "pns_eigenadam",
+    "pns-eigenadam",
+    "pns_eigenadam_batched",
+    "pns-eigenadam-batched",
+    }:
+
         assert model_def is not None
         assert curvature_batch is not None
     
@@ -112,13 +121,41 @@ def get_optimizer(
         precond_damping = getattr(cfg, "pns_precond_damping", 1e-4)
         backend = getattr(cfg, "pns_curvature_backend", "ggn")
         split_spaces = getattr(cfg, "pns_split_spaces", False)
+        use_batched = (
+            name in {"pns_eigenadam_batched", "pns-eigenadam-batched"}
+            or getattr(cfg, "pns_use_batched", False)
+            or getattr(cfg, "pns_batched", False)
+        )
+        eigensolver = getattr(cfg, "pns_eigensolver", "block_oi")  # "block_oi" or "lanczos"
+        block_iters = getattr(cfg, "pns_block_iters", 4)
+        independent_rng_per_vec = getattr(cfg, "pns_independent_rng_per_vec", False)
+
+        lr_top = getattr(cfg, "pns_lr_top", 0.1)
+        lr_perp = getattr(cfg, "pns_lr_perp", 1e-4)
     
-        if backend == "ggn":
-            curv_mv = make_ggn_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
+        is_lm = str(getattr(cfg, "model", "")).lower() in {"transformer"} or str(
+            getattr(cfg, "model", "")
+        ).lower().startswith("pythia")
+
+        if is_lm and backend != "ggn":
+            raise ValueError(
+                f"pns_curvature_backend='{backend}' is not wired for LM yet. "
+                "Use pns_curvature_backend='ggn' for transformer models."
             )
+
+        if backend == "ggn":
+            if is_lm:
+                curv_mv = make_ggn_matvec_fn_lm(
+                    model_def=model_def,
+                    curvature_batch=curvature_batch,
+                    batch_stats=batch_stats,
+                )
+            else:
+                curv_mv = make_ggn_matvec_fn(
+                    model_def=model_def,
+                    curvature_batch=curvature_batch,
+                    batch_stats=batch_stats,
+                )
 
         elif backend == "hessian":
             curv_mv = make_hessian_matvec_fn(
@@ -156,22 +193,44 @@ def get_optimizer(
     
         from optim.pns_eigenadam import pns_eigenadam
     
-        tx = pns_eigenadam(
-            learning_rate=lr,
-            beta1=beta1,
-            beta2=beta2,
-            eps=eps,
-            weight_decay=weight_decay,
-            curvature_update_every=curvature_update_every,
-            max_eigenvectors=max_eigenvectors,
-            lanczos_iters=lanczos_iters,
-            ggn_matvec_fn=curv_mv,
-            precond_damping=precond_damping,
-            backend=backend,
-            split_spaces=split_spaces,
-            lr_top = 0.1,
-            lr_perp= 0.0001,
-        )
+        if use_batched:
+            tx = pns_eigenadam_batched(
+                learning_rate=lr,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=weight_decay,
+                curvature_update_every=curvature_update_every,
+                max_eigenvectors=max_eigenvectors,
+                lanczos_iters=lanczos_iters,
+                ggn_matvec_fn=curv_mv,
+                precond_damping=precond_damping,
+                backend=backend,
+                split_spaces=split_spaces,
+                lr_top=lr_top,
+                lr_perp=lr_perp,
+                eigensolver=eigensolver,
+                block_iters=block_iters,
+                independent_rng_per_vec=independent_rng_per_vec,
+            )
+        else:
+            tx = pns_eigenadam(
+                learning_rate=lr,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=weight_decay,
+                curvature_update_every=curvature_update_every,
+                max_eigenvectors=max_eigenvectors,
+                lanczos_iters=lanczos_iters,
+                ggn_matvec_fn=curv_mv,
+                precond_damping=precond_damping,
+                backend=backend,
+                split_spaces=split_spaces,
+                lr_top=lr_top,
+                lr_perp=lr_perp,
+            )
+
 
 
 

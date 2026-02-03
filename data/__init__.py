@@ -1,5 +1,6 @@
 from .fashion_mnist import get_datasets as _get_fashion_mnist
 from .tiny_imagenet import get_datasets as _get_tiny_imagenet
+from . import datasets as datasets
 
 
 def get_datasets(dataset: str, batch_size: int, seed: int = 0, image_size: int | None = None):
@@ -21,4 +22,4 @@ def get_datasets(dataset: str, batch_size: int, seed: int = 0, image_size: int |
         raise ValueError(f"Unknown dataset '{dataset}'. Supported: fashion_mnist, tiny_imagenet.")
 
 
-__all__ = ['get_datasets']
+__all__ = ["get_datasets", "datasets"]

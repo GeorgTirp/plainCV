@@ -51,7 +51,7 @@ hf_damping: 1e-2
 # --- PN-S EigenAdam–specific hyperparameters ---
 #pns_sketch_dim: 128
 pns_curvature_update_every: 64 
-curvature_eigenvectors: 8        
+curvature_eigenvectors: 8       
 curvature_iters: 8
 gradient_eigenvectors: 6              
 gradient_iters: 6
@@ -62,6 +62,9 @@ pns_log_curvature: true
 pns_split_spaces: false
 pns_lr_top: 1e-3
 pns_lr_perp: 5e-3
+pns_batched: true
+pns_eigensolver: block_oi
+pns_block_iters: 4
 
 # --- Sophia-specific hyperparameters ---
 rho: 0.01
