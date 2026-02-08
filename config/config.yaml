@@ -30,7 +30,7 @@ vit_use_batchnorm: false
 # ResNet defaults
 resnet_use_batchnorm: true
 
-optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "hessian_free", "sophia", "sophia_shampoo"
+optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "pns_eigenadam_exp", "hessian_free", "sophia", "sophia_shampoo"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -62,6 +62,30 @@ pns_log_curvature: true
 pns_split_spaces: false
 pns_lr_top: 1e-3
 pns_lr_perp: 5e-3
+pns_base_optimizer: adamw   # one of: "adam", "adamw", "nadamw", "nesterovw", "sgd", "rmsprop"
+
+# --- Adaptive PN-S EigenAdam (used by optim: pns_eigenadam_adaptiv) ---
+pns_innovation_enabled: true
+pns_innovation_threshold: 0.2
+pns_innovation_check_every: 1
+pns_innovation_num_probes: 1
+pns_innovation_probe: gradient
+pns_innovation_eps: 1.0e-8
+pns_innovation_use_damping: true
+pns_subspace_tracking_enabled: true
+pns_subspace_tracking_every: 1
+pns_subspace_tracking_alpha: 0.1
+pns_subspace_tracking_power_iters: 1
+pns_subspace_tracking_on_probe_steps: true
+pns_eigenvalue_keep_threshold: 5.0
+pns_freeze_subspace_after_threshold: true
+pns_keep_at_least_one_eigenpair: false
+
+# --- Experimental PN-S EigenAdam (used by optim: pns_eigenadam_exp) ---
+pns_lr_gate_ema: 0.1
+pns_lr_gate_clip_min: 0.25
+pns_lr_gate_clip_max: 4.0
+pns_hutchinson_probes: 1
 
 # --- Sophia-specific hyperparameters ---
 rho: 0.01

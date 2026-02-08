@@ -1,6 +1,9 @@
 # optim/factory.py
 
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
+import importlib.util
 
 import optax
 
@@ -23,6 +26,56 @@ from .sophia import sophia as sophia_opt
 from .sophia import sophia_shampoo as sophia_shampoo_opt
 from .lanzos_hybrid import pns_eigen_hybrid
 from .pns_eigenadam_batched import pns_eigenadam_batched 
+
+
+@lru_cache(maxsize=1)
+def _load_pns_eigenadam_adaptiv():
+    """Load the adaptive PN-S EigenAdam implementation from local file."""
+    module_path = Path(__file__).with_name("pns_eigenadam adaptiv.py")
+    if not module_path.exists():
+        raise FileNotFoundError(
+            f"Adaptive optimizer file not found: {module_path}"
+        )
+
+    spec = importlib.util.spec_from_file_location(
+        "optim.pns_eigenadam_adaptiv_runtime",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module spec from: {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "pns_eigenadam"):
+        raise AttributeError(
+            f"'pns_eigenadam' function missing in: {module_path}"
+        )
+    return module.pns_eigenadam
+
+
+@lru_cache(maxsize=1)
+def _load_pns_eigenadam_exp():
+    """Load the experimental PN-S EigenAdam implementation from local file."""
+    module_path = Path(__file__).with_name("pns_eigenadam exp.py")
+    if not module_path.exists():
+        raise FileNotFoundError(
+            f"Experimental optimizer file not found: {module_path}"
+        )
+
+    spec = importlib.util.spec_from_file_location(
+        "optim.pns_eigenadam_exp_runtime",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module spec from: {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "pns_eigenadam"):
+        raise AttributeError(
+            f"'pns_eigenadam' function missing in: {module_path}"
+        )
+    return module.pns_eigenadam
 
 
 def maybe_wrap_schedule_free(base_tx, cfg):
@@ -56,38 +109,14 @@ def get_optimizer(
     lr = float(cfg.lr)
 
     # ------------------------
-    # Standard Adam (NEW)
+    # Adam / AdamW
     # ------------------------
-    if name == "adam":
+    if name in {"adam", "adamw"}:
         beta1 = getattr(cfg, "beta1", 0.9)
         beta2 = getattr(cfg, "beta2", 0.999)
         eps = getattr(cfg, "eps", 1e-8)
         weight_decay = getattr(cfg, "weight_decay", 0.0)
-
-        adam_tx = optax.adam(
-            learning_rate=lr,
-            b1=beta1,
-            b2=beta2,
-            eps=eps,
-        )
-
-        # "Standard" Adam + optional L2-style weight decay
-        if weight_decay != 0.0:
-            tx = optax.chain(
-                optax.add_decayed_weights(weight_decay),
-                adam_tx,
-            )
-        else:
-            tx = adam_tx
-
-    # ------------------------
-    # AdamW
-    # ------------------------
-    elif name == "adamw":
-        weight_decay = getattr(cfg, "weight_decay", 0.0)
-        beta1 = getattr(cfg, "beta1", 0.9)
-        beta2 = getattr(cfg, "beta2", 0.999)
-        eps = getattr(cfg, "eps", 1e-8)
+        # Keep "adam" and "adamw" aligned: both use AdamW semantics.
         tx = optax.adamw(
             learning_rate=lr,
             b1=beta1,
@@ -105,6 +134,10 @@ def get_optimizer(
     "pns-eigenadam",
     "pns_eigenadam_batched",
     "pns-eigenadam-batched",
+    "pns_eigenadam_adaptiv",
+    "pns-eigenadam-adaptiv",
+    "pns_eigenadam_exp",
+    "pns-eigenadam-exp",
     }:
 
         assert model_def is not None
@@ -126,12 +159,47 @@ def get_optimizer(
             or getattr(cfg, "pns_use_batched", False)
             or getattr(cfg, "pns_batched", False)
         )
+        use_adaptiv = name in {"pns_eigenadam_adaptiv", "pns-eigenadam-adaptiv"}
+        use_exp = name in {"pns_eigenadam_exp", "pns-eigenadam-exp"}
         eigensolver = getattr(cfg, "pns_eigensolver", "block_oi")  # "block_oi" or "lanczos"
         block_iters = getattr(cfg, "pns_block_iters", 4)
         independent_rng_per_vec = getattr(cfg, "pns_independent_rng_per_vec", False)
 
         lr_top = getattr(cfg, "pns_lr_top", 0.1)
         lr_perp = getattr(cfg, "pns_lr_perp", 1e-4)
+        base_optimizer = getattr(cfg, "pns_base_optimizer", "adamw")
+        sgd_momentum = getattr(cfg, "pns_sgd_momentum", 0.0)
+        sgd_nesterov = getattr(cfg, "pns_sgd_nesterov", False)
+        rmsprop_decay = getattr(cfg, "pns_rmsprop_decay", None)
+        rmsprop_momentum = getattr(cfg, "pns_rmsprop_momentum", 0.0)
+        rmsprop_centered = getattr(cfg, "pns_rmsprop_centered", False)
+        innovation_enabled = getattr(cfg, "pns_innovation_enabled", True)
+        innovation_threshold = getattr(cfg, "pns_innovation_threshold", 0.2)
+        innovation_check_every = getattr(cfg, "pns_innovation_check_every", 1)
+        innovation_num_probes = getattr(cfg, "pns_innovation_num_probes", 1)
+        innovation_probe = getattr(cfg, "pns_innovation_probe", "gradient")
+        innovation_eps = getattr(cfg, "pns_innovation_eps", 1e-8)
+        innovation_use_damping = getattr(cfg, "pns_innovation_use_damping", True)
+        subspace_tracking_enabled = getattr(cfg, "pns_subspace_tracking_enabled", True)
+        subspace_tracking_every = getattr(cfg, "pns_subspace_tracking_every", 1)
+        subspace_tracking_alpha = getattr(cfg, "pns_subspace_tracking_alpha", 0.1)
+        subspace_tracking_power_iters = getattr(
+            cfg, "pns_subspace_tracking_power_iters", 1
+        )
+        subspace_tracking_on_probe_steps = getattr(
+            cfg, "pns_subspace_tracking_on_probe_steps", True
+        )
+        eigenvalue_keep_threshold = getattr(cfg, "pns_eigenvalue_keep_threshold", 5.0)
+        freeze_subspace_after_threshold = getattr(
+            cfg, "pns_freeze_subspace_after_threshold", True
+        )
+        keep_at_least_one_eigenpair = getattr(
+            cfg, "pns_keep_at_least_one_eigenpair", False
+        )
+        lr_gate_ema = getattr(cfg, "pns_lr_gate_ema", 0.1)
+        lr_gate_clip_min = getattr(cfg, "pns_lr_gate_clip_min", 0.25)
+        lr_gate_clip_max = getattr(cfg, "pns_lr_gate_clip_max", 4.0)
+        hutchinson_probes = getattr(cfg, "pns_hutchinson_probes", 1)
     
         is_lm = str(getattr(cfg, "model", "")).lower() in {"transformer"} or str(
             getattr(cfg, "model", "")
@@ -193,7 +261,74 @@ def get_optimizer(
     
         from optim.pns_eigenadam import pns_eigenadam
     
-        if use_batched:
+        if use_adaptiv:
+            pns_eigenadam_adaptiv = _load_pns_eigenadam_adaptiv()
+            tx = pns_eigenadam_adaptiv(
+                learning_rate=lr,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=weight_decay,
+                curvature_update_every=curvature_update_every,
+                max_eigenvectors=max_eigenvectors,
+                lanczos_iters=lanczos_iters,
+                ggn_matvec_fn=curv_mv,
+                precond_damping=precond_damping,
+                backend=backend,
+                split_spaces=split_spaces,
+                lr_top=lr_top,
+                lr_perp=lr_perp,
+                innovation_enabled=innovation_enabled,
+                innovation_threshold=innovation_threshold,
+                innovation_check_every=innovation_check_every,
+                innovation_num_probes=innovation_num_probes,
+                innovation_probe=innovation_probe,
+                innovation_eps=innovation_eps,
+                innovation_use_damping=innovation_use_damping,
+                subspace_tracking_enabled=subspace_tracking_enabled,
+                subspace_tracking_every=subspace_tracking_every,
+                subspace_tracking_alpha=subspace_tracking_alpha,
+                subspace_tracking_power_iters=subspace_tracking_power_iters,
+                subspace_tracking_on_probe_steps=subspace_tracking_on_probe_steps,
+                eigenvalue_keep_threshold=eigenvalue_keep_threshold,
+                freeze_subspace_after_threshold=freeze_subspace_after_threshold,
+                keep_at_least_one_eigenpair=keep_at_least_one_eigenpair,
+                base_optimizer=base_optimizer,
+                sgd_momentum=sgd_momentum,
+                sgd_nesterov=sgd_nesterov,
+                rmsprop_decay=rmsprop_decay,
+                rmsprop_momentum=rmsprop_momentum,
+                rmsprop_centered=rmsprop_centered,
+            )
+        elif use_exp:
+            pns_eigenadam_exp = _load_pns_eigenadam_exp()
+            tx = pns_eigenadam_exp(
+                learning_rate=lr,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=weight_decay,
+                curvature_update_every=curvature_update_every,
+                max_eigenvectors=max_eigenvectors,
+                lanczos_iters=lanczos_iters,
+                ggn_matvec_fn=curv_mv,
+                precond_damping=precond_damping,
+                backend=backend,
+                split_spaces=split_spaces,
+                lr_top=lr_top,
+                lr_perp=lr_perp,
+                base_optimizer=base_optimizer,
+                sgd_momentum=sgd_momentum,
+                sgd_nesterov=sgd_nesterov,
+                rmsprop_decay=rmsprop_decay,
+                rmsprop_momentum=rmsprop_momentum,
+                rmsprop_centered=rmsprop_centered,
+                lr_gate_ema=lr_gate_ema,
+                lr_gate_clip_min=lr_gate_clip_min,
+                lr_gate_clip_max=lr_gate_clip_max,
+                hutchinson_probes=hutchinson_probes,
+            )
+        elif use_batched:
             tx = pns_eigenadam_batched(
                 learning_rate=lr,
                 beta1=beta1,
@@ -212,6 +347,12 @@ def get_optimizer(
                 eigensolver=eigensolver,
                 block_iters=block_iters,
                 independent_rng_per_vec=independent_rng_per_vec,
+                base_optimizer=base_optimizer,
+                sgd_momentum=sgd_momentum,
+                sgd_nesterov=sgd_nesterov,
+                rmsprop_decay=rmsprop_decay,
+                rmsprop_momentum=rmsprop_momentum,
+                rmsprop_centered=rmsprop_centered,
             )
         else:
             tx = pns_eigenadam(
@@ -229,6 +370,12 @@ def get_optimizer(
                 split_spaces=split_spaces,
                 lr_top=lr_top,
                 lr_perp=lr_perp,
+                base_optimizer=base_optimizer,
+                sgd_momentum=sgd_momentum,
+                sgd_nesterov=sgd_nesterov,
+                rmsprop_decay=rmsprop_decay,
+                rmsprop_momentum=rmsprop_momentum,
+                rmsprop_centered=rmsprop_centered,
             )
 
 

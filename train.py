@@ -104,7 +104,12 @@ def main(_argv):
 
     # --- Optional: curvature spectrum logging ---
     log_curv = getattr(cfg, "pns_log_curvature", False)
-    use_pns = cfg.optim in {"pns_eigenadam", "pns-eigenadam"}
+    use_pns = cfg.optim in {
+        "pns_eigenadam",
+        "pns-eigenadam",
+        "pns_eigenadam_adaptiv",
+        "pns-eigenadam-adaptiv",
+    }
     use_muon = cfg.optim in {"pns_eigenmuon", "pns-eigenmuon"}
     curvature_csv_path = None
     max_eigs = getattr(cfg, "curvature_eigenvectors", None)

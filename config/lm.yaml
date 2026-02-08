@@ -67,6 +67,7 @@ pns_log_curvature: true
 pns_split_spaces: false
 pns_lr_top: 1e-3
 pns_lr_perp: 5e-3
+pns_base_optimizer: adamw   # one of: "adam", "adamw", "nadamw", "nesterovw", "sgd", "rmsprop"
 pns_batched: true
 pns_eigensolver: block_oi
 pns_block_iters: 4
