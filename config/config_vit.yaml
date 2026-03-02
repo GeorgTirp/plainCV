@@ -1,21 +1,21 @@
 seed: 0
 print_progress: false
 
-dataset: "tiny_imagenet"   # or "tiny_imagenet"
-batch_size: 64
-image_size: 64             # TinyImageNet uses 64; override when switching datasets
-num_epochs: 100
-num_channels: 3            # TinyImageNet uses 3 channels
-num_classes: 200            # TinyImageNet uses 200 classes
-
-#dataset: "fashion_mnist"   # or "tiny_imagenet"
+#dataset: "tiny_imagenet"   # or "tiny_imagenet"
 #batch_size: 64
-#image_size: 28            
-#num_epochs: 10
-#num_channels: 1            
-#num_classes: 10           
+#image_size: 64             # TinyImageNet uses 64; override when switching datasets
+#num_epochs: 12
+#num_channels: 3            # TinyImageNet uses 3 channels
+#num_classes: 200            # TinyImageNet uses 200 classes
 
-model: "vit_small"  # or "mlp", "vit_small", "small_resnet", "resnet18"
+dataset: "fashion_mnist"   # or "tiny_imagenet"
+batch_size: 64
+image_size: 28            
+num_epochs: 10
+num_channels: 1            
+num_classes: 10           
+
+model: "resnet_small"  # or "mlp", "vit_small", "small_resnet", "resnet18"
 
 # Vision Transformer defaults (only used if model starts with "vit")
 vit_patch_size: 4
@@ -24,13 +24,13 @@ vit_mlp_dim: 256
 vit_layers: 4
 vit_heads: 4
 vit_dropout: 0.1
-vit_use_layernorm: false
+vit_use_layernorm: true
 vit_use_batchnorm: false
 
 # ResNet defaults
 resnet_use_batchnorm: true
 
-optim: pns_eigenadam_exp  # or "muon", "adam", "soap", "pns_eigenadam", "pns_eigenadam_exp", "hessian_free", "sophia", "sophia_shampoo"
+optim: muon  # or "muon", "adam", "soap", "pns_eigenadam", "pns_eigenadam_exp", "hessian_free", "sophia", "sophia_shampoo"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -57,15 +57,25 @@ gradient_eigenvectors: 6
 gradient_iters: 6
 pns_precond_damping: 1.0e-4
 pns_sqrt_scaling: false       
-pns_curvature_backend: ggn  # or "hessian", "ggn", "fisher"
+pns_curvature_backend: ggn  # or "hessian", "ggn", "fisher", "svgd"
 pns_log_curvature: true
 pns_split_spaces: false
-pns_lr_top: 1e-3
-pns_lr_perp: 1e-3
-pns_base_optimizer: nadamw   # one of: "adam", "adamw", "nadamw", "nesterovw", "sgd", "rmsprop"
+pns_lr_top: 0.001
+pns_lr_perp: 0.001
+pns_base_optimizer: adamw  # one of: "adam", "adamw", "nadamw", "nesterovw", "sgd", "rmsprop"
 pns_batched: False
 pns_eigensolver: block_oi
 pns_block_iters: 4
+
+# --- Generic eigen tracking (works with any optimizer) ---
+eigen_tracking_enabled: true
+eigen_tracking_every: 5
+eigen_tracking_topk: 8
+eigen_tracking_lanczos_iters: null
+eigen_tracking_backend: ggn
+eigen_tracking_sort_by_abs: null
+eigen_tracking_light_ortho: false
+eigen_tracking_light_ortho_every: 4
 
 # --- Adaptive PN-S EigenAdam (used by optim: pns_eigenadam_adaptiv) ---
 pns_innovation_enabled: true
@@ -75,8 +85,8 @@ pns_innovation_num_probes: 1
 pns_innovation_probe: gradient
 pns_innovation_eps: 1.0e-8
 pns_innovation_use_damping: true
-pns_subspace_tracking_enabled: true
-pns_subspace_tracking_every: 1
+pns_subspace_tracking_enabled: False
+pns_subspace_tracking_every: 10
 pns_subspace_tracking_alpha: 0.1
 pns_subspace_tracking_power_iters: 1
 pns_subspace_tracking_on_probe_steps: true
@@ -85,10 +95,17 @@ pns_freeze_subspace_after_threshold: true
 pns_keep_at_least_one_eigenpair: True
 
 # --- Experimental PN-S EigenAdam (used by optim: pns_eigenadam_exp) ---
-pns_lr_gate_ema: 0.1
-pns_lr_gate_clip_min: 0.25
-pns_lr_gate_clip_max: 4.0
-pns_hutchinson_probes: 1
+# Top-(k-1) eigenspace EMA + EOS-based automatic complement LR:
+# EOS-based automatic complement LR from last tracked top-k eigenvalue:
+pns_perp_eos_enabled: true
+pns_perp_eos_gamma: 1.0
+pns_perp_eos_ema: 0.1
+pns_perp_eos_min: 1.0e-6
+pns_perp_eos_max: 1.0
+pns_lanczos_warm_start: true
+pns_lanczos_light_ortho: true
+pns_lanczos_light_ortho_every: 4
+
 
 # --- Sophia-specific hyperparameters ---
 rho: 0.01

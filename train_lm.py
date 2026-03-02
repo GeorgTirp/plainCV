@@ -60,12 +60,15 @@ from jax import tree_util as jtu
 from data.lm_loader import get_dataloaders
 from data.datasets.data_prep_utils import intra_doc_causal_mask
 from models.LM.constructor import construct_model
-from optim.factory import get_optimizer
+from optim.eigentools import init_eigentracking, track_eigenstate
+from optim.factory import get_optimizer, build_curvature_matvec_fn
 from utils import (
     load_config,
     maybe_make_dir,
     init_wandb,
     log_scalar_dict,
+    init_eigen_tracking_csv,
+    append_eigen_tracking_row,
 )
 
 FLAGS = flags.FLAGS
@@ -254,6 +257,77 @@ def run(cfg):
     tx = get_optimizer(cfg, model_def=model, curvature_batch=curvature_batch, batch_stats=None)
     state = LMTrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
+    eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
+    eigen_tracking_state = None
+    eigen_tracking_csv_path = None
+    eigen_tracking_every = int(getattr(cfg, "eigen_tracking_every", 100))
+    if eigen_tracking_enabled:
+        if curvature_batch is None:
+            raise ValueError(
+                "eigen_tracking_enabled=True requires a valid curvature_batch."
+            )
+
+        eigen_tracking_topk = int(
+            getattr(
+                cfg,
+                "eigen_tracking_topk",
+                getattr(cfg, "curvature_eigenvectors", 8),
+            )
+        )
+        if eigen_tracking_topk <= 0:
+            raise ValueError("eigen_tracking_topk must be >= 1 when tracking is enabled.")
+
+        eigen_tracking_backend = getattr(
+            cfg,
+            "eigen_tracking_backend",
+            getattr(cfg, "pns_curvature_backend", "ggn"),
+        )
+        eigen_tracking_iters = getattr(cfg, "eigen_tracking_lanczos_iters", None)
+        if eigen_tracking_iters is None:
+            eigen_tracking_iters = eigen_tracking_topk
+        eigen_tracking_sort_by_abs = getattr(cfg, "eigen_tracking_sort_by_abs", None)
+        if eigen_tracking_sort_by_abs is None:
+            eigen_tracking_sort_by_abs = (
+                str(eigen_tracking_backend).lower() in {"hessian", "fisher"}
+            )
+        eigen_tracking_light_ortho = bool(
+            getattr(cfg, "eigen_tracking_light_ortho", True)
+        )
+        eigen_tracking_light_ortho_every = int(
+            getattr(cfg, "eigen_tracking_light_ortho_every", 4)
+        )
+        eigen_tracking_matvec_fn = build_curvature_matvec_fn(
+            cfg,
+            model_def=model,
+            curvature_batch=curvature_batch,
+            batch_stats=None,
+            backend=eigen_tracking_backend,
+        )
+        eigen_tracking_state = init_eigentracking(
+            state.params,
+            k=eigen_tracking_topk,
+            seed=int(getattr(cfg, "seed", 0)),
+        )
+        eigen_tracking_csv_path = init_eigen_tracking_csv(
+            cfg,
+            eigen_tracking_topk,
+        )
+
+        @jax.jit
+        def run_eigen_tracking(params, grads, updates, step, tracking_state):
+            return track_eigenstate(
+                params=params,
+                grads=grads,
+                updates=updates,
+                step=step,
+                eigen_state=tracking_state,
+                matvec_fn=eigen_tracking_matvec_fn,
+                num_iter=eigen_tracking_iters,
+                sort_by_abs=eigen_tracking_sort_by_abs,
+                use_light_ortho=eigen_tracking_light_ortho,
+                light_ortho_every=eigen_tracking_light_ortho_every,
+            )
+
     compute_grads, eval_step = _make_train_fns(model, cfg.vocab_size, use_doc_mask)
 
     steps_budget = int(getattr(cfg, "steps_budget", 100))
@@ -289,9 +363,33 @@ def run(cfg):
 
         grads_accum = jtu.tree_map(lambda g: g / grad_accum_steps, grads_accum)
         grads_accum = _clip_grads(grads_accum, grad_clip)
-        state = state.apply_gradients(grads=grads_accum)
+        params_before = state.params if eigen_tracking_enabled else None
+        updates, new_opt_state = state.tx.update(
+            grads_accum,
+            state.opt_state,
+            state.params,
+        )
+        new_params = optax.apply_updates(state.params, updates)
+        state = state.replace(
+            step=state.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+        )
 
         global_step += 1
+
+        if eigen_tracking_enabled and global_step % eigen_tracking_every == 0:
+            eigen_tracking_state = run_eigen_tracking(
+                params_before,
+                grads_accum,
+                updates,
+                state.step,
+                eigen_tracking_state,
+            )
+            append_eigen_tracking_row(
+                eigen_tracking_csv_path,
+                eigen_tracking_state,
+            )
 
         if global_step % log_every == 0:
             loss_val = float(jax.device_get(loss_accum / grad_accum_steps))

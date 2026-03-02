@@ -26,7 +26,7 @@ muon_ns_steps: 5
 num_channels: 3
 num_classes: 200
 num_epochs: 100
-optim: adam
+optim: pns_eigenadam_exp
 pns_base_optimizer: nadamw
 pns_batched: false
 pns_block_iters: 4
@@ -43,9 +43,17 @@ pns_innovation_probe: gradient
 pns_innovation_threshold: 0.333
 pns_innovation_use_damping: true
 pns_keep_at_least_one_eigenpair: true
+pns_lanczos_light_ortho: true
+pns_lanczos_light_ortho_every: 4
+pns_lanczos_warm_start: true
 pns_log_curvature: true
 pns_lr_perp: 0.001
 pns_lr_top: 0.001
+pns_perp_eos_ema: 0.1
+pns_perp_eos_enabled: true
+pns_perp_eos_gamma: 1.0
+pns_perp_eos_max: 1.0
+pns_perp_eos_min: 1.0e-06
 pns_precond_damping: 0.0001
 pns_split_spaces: true
 pns_sqrt_scaling: false
@@ -54,12 +62,6 @@ pns_subspace_tracking_enabled: false
 pns_subspace_tracking_every: 10
 pns_subspace_tracking_on_probe_steps: true
 pns_subspace_tracking_power_iters: 1
-pns_top_kf_q_base: 0.0001
-pns_top_kf_q_rho_scale: 2.0
-pns_top_kf_r_base: 0.01
-pns_top_kf_r_lambda_scale: 1.0
-pns_top_kf_rho_ema: 0.1
-pns_top_kf_var_eps: 1.0e-08
 print_progress: false
 resnet_use_batchnorm: true
 rho: 0.01
@@ -75,5 +77,5 @@ vit_layers: 4
 vit_mlp_dim: 256
 vit_patch_size: 4
 vit_use_batchnorm: false
-vit_use_layernorm: false
+vit_use_layernorm: true
 weight_decay: 0.01

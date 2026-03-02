@@ -1,9 +1,11 @@
 import os
 import math
 import shutil
+import re
 import yaml
 import csv
 from typing import Sequence
+import jax
 try:
     import matplotlib.pyplot as plt
 except ImportError:
@@ -20,6 +22,8 @@ except ImportError:
     wandb = None
 
 FLAGS = flags.FLAGS
+
+_NUMERIC_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
 
 # These are used by cluster/slurm scripts in the original plainLM repo.
 # It's harmless to have them here; on local runs they'll just be None.
@@ -40,6 +44,34 @@ flags.DEFINE_string(
 # Configuration loading / hyperparameter sweeps
 # ---------------------------------------------------------------------------
 
+
+def _coerce_yaml_scalar(value):
+    """Convert numeric-like YAML strings (e.g. '1e-3') into numbers."""
+    if not isinstance(value, str):
+        return value
+
+    stripped = value.strip()
+    lowered = stripped.lower()
+
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"none", "null", "~"}:
+        return None
+    if _NUMERIC_RE.fullmatch(stripped):
+        if any(ch in lowered for ch in (".", "e")):
+            return float(stripped)
+        return int(stripped)
+    return value
+
+
+def _coerce_yaml_values(value):
+    """Recursively coerce YAML-loaded values to more useful Python scalars."""
+    if isinstance(value, dict):
+        return {k: _coerce_yaml_values(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_coerce_yaml_values(v) for v in value]
+    return _coerce_yaml_scalar(value)
+
 def load_config(path: str):
     """
     Parse a YAML config file and return the corresponding config as a namedtuple.
@@ -57,7 +89,7 @@ def load_config(path: str):
       This defines 4 configs. job_idx=0..3 selects each one.
     """
     with open(path, "r") as f:
-        config_dict = yaml.safe_load(f)
+        config_dict = _coerce_yaml_values(yaml.safe_load(f))
 
     # We keep the original "flat dict" style from plainLM.
     # If you want nested dicts, just avoid lists and sweeps will be skipped.
@@ -275,6 +307,44 @@ def _sanitize_name(name: str) -> str:
         c if (c.isalnum() or c in ("-", "_")) else "_"
         for c in str(name)
     )
+
+
+def init_eigen_tracking_csv(cfg, top_k: int, filename: str = "eigen_tracking.csv") -> str:
+    exp_dir = get_exp_dir_path(cfg)
+    os.makedirs(exp_dir, exist_ok=True)
+    csv_path = os.path.join(exp_dir, filename)
+
+    header = (
+        ["global_step", "rotation_diff", "eff_cond"]
+        + [f"eig_{i}" for i in range(top_k)]
+        + [f"alpha_{i}" for i in range(top_k)]
+        + [f"alpha_lambda_{i}" for i in range(top_k)]
+    )
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+    return csv_path
+
+
+def append_eigen_tracking_row(csv_path: str, tracking_state) -> None:
+    tracking_state = jax.device_get(tracking_state)
+
+    row = (
+        [
+            int(tracking_state.step),
+            float(tracking_state.rotation_diff),
+            float(tracking_state.eff_cond),
+        ]
+        + [float(x) for x in tracking_state.eigenvalues]
+        + [float(x) for x in tracking_state.alpha]
+        + [float(x) for x in tracking_state.alpha_lambda]
+    )
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
 
 
 def save_loss_curves(

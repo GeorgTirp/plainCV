@@ -98,6 +98,84 @@ def maybe_wrap_schedule_free(base_tx, cfg):
     return sf_tx
 
 
+def _is_lm_model(cfg) -> bool:
+    model_name = str(getattr(cfg, "model", "")).lower()
+    return model_name == "transformer" or model_name.startswith("pythia")
+
+
+def build_curvature_matvec_fn(
+    cfg,
+    *,
+    model_def: Any,
+    curvature_batch: Any,
+    batch_stats: Any = None,
+    backend: Optional[str] = None,
+):
+    if model_def is None:
+        raise ValueError("model_def is required to build a curvature matvec.")
+    if curvature_batch is None:
+        raise ValueError("curvature_batch is required to build a curvature matvec.")
+
+    selected_backend = (backend or getattr(cfg, "pns_curvature_backend", "ggn")).lower()
+    is_lm = _is_lm_model(cfg)
+
+    if is_lm and selected_backend != "ggn":
+        raise ValueError(
+            f"curvature backend '{selected_backend}' is not wired for LM yet. "
+            "Use 'ggn' for transformer models."
+        )
+
+    if selected_backend == "ggn":
+        if is_lm:
+            return make_ggn_matvec_fn_lm(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
+        return make_ggn_matvec_fn(
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+        )
+
+    if selected_backend == "hessian":
+        return make_hessian_matvec_fn(
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+        )
+
+    if selected_backend == "fisher":
+        return make_fisher_matvec_fn(
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+        )
+
+    if selected_backend == "wasserstein":
+        if is_lm:
+            raise ValueError("Wasserstein curvature backend is not wired for LM.")
+        return make_wasserstein_metric_matvec_fn(
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+        )
+
+    if selected_backend == "svgd":
+        if is_lm:
+            raise ValueError("SVGD curvature backend is not wired for LM.")
+        return make_svgd_metric_matvec_fn(
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+            kernel_bandwidth=getattr(cfg, "pns_svgd_kernel_bandwidth", 1.0),
+            kernel_scale=getattr(cfg, "pns_svgd_kernel_scale", 1.0),
+            feature=getattr(cfg, "pns_svgd_feature", "logits"),
+        )
+
+    raise ValueError(f"Unknown curvature backend: {selected_backend}")
+
+
 def get_optimizer(
     cfg,
     model_def: Optional[Any] = None,
@@ -189,6 +267,14 @@ def get_optimizer(
         subspace_tracking_on_probe_steps = getattr(
             cfg, "pns_subspace_tracking_on_probe_steps", True
         )
+        perp_eos_enabled = getattr(cfg, "pns_perp_eos_enabled", True)
+        perp_eos_gamma = getattr(cfg, "pns_perp_eos_gamma", 1.0)
+        perp_eos_ema = getattr(cfg, "pns_perp_eos_ema", 0.1)
+        perp_eos_min = getattr(cfg, "pns_perp_eos_min", 1e-6)
+        perp_eos_max = getattr(cfg, "pns_perp_eos_max", 1.0)
+        lanczos_warm_start = getattr(cfg, "pns_lanczos_warm_start", True)
+        lanczos_light_ortho = getattr(cfg, "pns_lanczos_light_ortho", True)
+        lanczos_light_ortho_every = getattr(cfg, "pns_lanczos_light_ortho_every", 4)
         eigenvalue_keep_threshold = getattr(cfg, "pns_eigenvalue_keep_threshold", 5.0)
         freeze_subspace_after_threshold = getattr(
             cfg, "pns_freeze_subspace_after_threshold", True
@@ -196,68 +282,13 @@ def get_optimizer(
         keep_at_least_one_eigenpair = getattr(
             cfg, "pns_keep_at_least_one_eigenpair", False
         )
-        lr_gate_ema = getattr(cfg, "pns_lr_gate_ema", 0.1)
-        lr_gate_clip_min = getattr(cfg, "pns_lr_gate_clip_min", 0.25)
-        lr_gate_clip_max = getattr(cfg, "pns_lr_gate_clip_max", 4.0)
-        hutchinson_probes = getattr(cfg, "pns_hutchinson_probes", 1)
-    
-        is_lm = str(getattr(cfg, "model", "")).lower() in {"transformer"} or str(
-            getattr(cfg, "model", "")
-        ).lower().startswith("pythia")
-
-        if is_lm and backend != "ggn":
-            raise ValueError(
-                f"pns_curvature_backend='{backend}' is not wired for LM yet. "
-                "Use pns_curvature_backend='ggn' for transformer models."
-            )
-
-        if backend == "ggn":
-            if is_lm:
-                curv_mv = make_ggn_matvec_fn_lm(
-                    model_def=model_def,
-                    curvature_batch=curvature_batch,
-                    batch_stats=batch_stats,
-                )
-            else:
-                curv_mv = make_ggn_matvec_fn(
-                    model_def=model_def,
-                    curvature_batch=curvature_batch,
-                    batch_stats=batch_stats,
-                )
-
-        elif backend == "hessian":
-            curv_mv = make_hessian_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-            )
-        elif backend == "fisher":
-            curv_mv = make_fisher_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-            )
-        elif backend == "wasserstein":
-            curv_mv = make_wasserstein_metric_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-            )
-        elif backend == "svgd":
-            kernel_bandwidth = getattr(cfg, "pns_svgd_kernel_bandwidth", 1.0)
-            kernel_scale = getattr(cfg, "pns_svgd_kernel_scale", 1.0)
-            feature = getattr(cfg, "pns_svgd_feature", "logits")
-            curv_mv = make_svgd_metric_matvec_fn(
-                model_def=model_def,
-                curvature_batch=curvature_batch,
-                batch_stats=batch_stats,
-                kernel_bandwidth=kernel_bandwidth,
-                kernel_scale=kernel_scale,
-                feature=feature,
-            )
-
-        else:
-            raise ValueError(f"Unknown pns_curvature_backend: {backend}")
+        curv_mv = build_curvature_matvec_fn(
+            cfg,
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=batch_stats,
+            backend=backend,
+        )
     
         from optim.pns_eigenadam import pns_eigenadam
     
@@ -323,10 +354,18 @@ def get_optimizer(
                 rmsprop_decay=rmsprop_decay,
                 rmsprop_momentum=rmsprop_momentum,
                 rmsprop_centered=rmsprop_centered,
-                lr_gate_ema=lr_gate_ema,
-                lr_gate_clip_min=lr_gate_clip_min,
-                lr_gate_clip_max=lr_gate_clip_max,
-                hutchinson_probes=hutchinson_probes,
+                subspace_tracking_enabled=subspace_tracking_enabled,
+                subspace_tracking_every=subspace_tracking_every,
+                subspace_tracking_alpha=subspace_tracking_alpha,
+                subspace_tracking_power_iters=subspace_tracking_power_iters,
+                perp_eos_enabled=perp_eos_enabled,
+                perp_eos_gamma=perp_eos_gamma,
+                perp_eos_ema=perp_eos_ema,
+                perp_eos_min=perp_eos_min,
+                perp_eos_max=perp_eos_max,
+                lanczos_warm_start=lanczos_warm_start,
+                lanczos_light_ortho=lanczos_light_ortho,
+                lanczos_light_ortho_every=lanczos_light_ortho_every,
             )
         elif use_batched:
             tx = pns_eigenadam_batched(

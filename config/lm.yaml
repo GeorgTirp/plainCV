@@ -40,14 +40,14 @@ rope_theta: 500000.0
 torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
-steps_budget: 200
+steps_budget: 50
 micro_batch_size: 2
 grad_accumulation_steps: 1
 
 # choose between {float32, float16, bfloat16}
 dtype: "float32"
 
-optim: "muon"
+optim: muon
 fused_optim: False
 lr: 3.e-4
 weight_decay: 0.1
@@ -71,6 +71,16 @@ pns_base_optimizer: adamw   # one of: "adam", "adamw", "nadamw", "nesterovw", "s
 pns_batched: true
 pns_eigensolver: block_oi
 pns_block_iters: 4
+
+# --- Generic eigen tracking (works with any optimizer) ---
+eigen_tracking_enabled: true
+eigen_tracking_every: 20
+eigen_tracking_topk: 5
+eigen_tracking_lanczos_iters: null
+eigen_tracking_backend: ggn
+eigen_tracking_sort_by_abs: null
+eigen_tracking_light_ortho: false
+eigen_tracking_light_ortho_every: 4
 
 scheduler: "warmup_cosine"
 warmup_steps: 0.05

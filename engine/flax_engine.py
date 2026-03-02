@@ -92,7 +92,7 @@ def _apply_model(state: TrainState, images, labels, rng, train: bool):
     return loss, (metrics, new_batch_stats)
 
 
-def make_train_step():
+def make_train_step(return_updates: bool = False):
     @jax.jit
     def train_step(state: TrainState, batch, rng):
         images, labels = batch
@@ -107,9 +107,17 @@ def make_train_step():
         loss2, (metrics, new_batch_stats) = _apply_model(
             state, images, labels, rng, train=True
         )
-        state = state.apply_gradients(grads=grads)
-        state = state.replace(batch_stats=new_batch_stats)
+        updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params)
+        new_params = optax.apply_updates(state.params, updates)
+        state = state.replace(
+            step=state.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+            batch_stats=new_batch_stats,
+        )
         metrics = {"loss": loss2, **metrics}
+        if return_updates:
+            return state, metrics, grads, updates
         return state, metrics
 
     return train_step

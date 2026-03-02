@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from jax import tree_util as jtu
 import optax
 
+from .eigentools import lanczos, EigenTrackingState
 Array = jax.Array
 PyTree = Any
 
@@ -22,12 +23,14 @@ class SoapPerParamState(NamedTuple):
     R: Array      # Kronecker factor, (cols, cols)
     QL: Array     # eigenvectors of L, (rows, rows)
     QR: Array     # eigenvectors of R, (cols, cols)
+    
     use_soap: bool
 
 
 class SoapState(NamedTuple):
     count: Array    # scalar int32
     per_param: PyTree  # PyTree[SoapPerParamState]
+    eigenvalues: Array # top-k eigenvalues
 
 
 def _is_soap_state(x: Any) -> bool:
@@ -93,6 +96,7 @@ def scale_by_soap(
     precondition_frequency: int = 10,
     shampoo_beta2: Optional[float] = None,
     log_skipped: bool = False,
+    k: int = 0
 ) -> optax.GradientTransformation:
     shampoo_beta2 = b2 if shampoo_beta2 is None else shampoo_beta2
 
@@ -112,6 +116,7 @@ def scale_by_soap(
                 f"SOAP: skipped {len(skipped)} params "
                 f"(too large/degenerate): {skipped}"
             )
+            eigenvals = jnp.zeros()
         return SoapState(
             count=jnp.zeros([], dtype=jnp.int32),
             per_param=per_param,

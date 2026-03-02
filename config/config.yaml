@@ -30,7 +30,7 @@ vit_use_batchnorm: false
 # ResNet defaults
 resnet_use_batchnorm: true
 
-optim: pns_eigenadam  # or "muon", "adam", "soap", "pns_eigenadam", "pns_eigenadam_exp", "hessian_free", "sophia", "sophia_shampoo"
+optim: muon  # or "muon", "adam", "soap", "pns_eigenadam", "pns_eigenadam_exp", "hessian_free", "sophia", "sophia_shampoo"
 lr: 0.001
 weight_decay: 0.01
 beta1: 0.9
@@ -63,6 +63,16 @@ pns_split_spaces: false
 pns_lr_top: 1e-3
 pns_lr_perp: 5e-3
 pns_base_optimizer: adamw   # one of: "adam", "adamw", "nadamw", "nesterovw", "sgd", "rmsprop"
+
+# --- Generic eigen tracking (works with any optimizer) ---
+eigen_tracking_enabled: false
+eigen_tracking_every: 100
+eigen_tracking_topk: 8
+eigen_tracking_lanczos_iters: null
+eigen_tracking_backend: ggn
+eigen_tracking_sort_by_abs: null
+eigen_tracking_light_ortho: true
+eigen_tracking_light_ortho_every: 4
 
 # --- Adaptive PN-S EigenAdam (used by optim: pns_eigenadam_adaptiv) ---
 pns_innovation_enabled: true

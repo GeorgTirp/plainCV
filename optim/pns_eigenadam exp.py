@@ -7,6 +7,8 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 import optax
 
+from .eigentools import PnsEigenAdamState, lanczos, apply_eigen_preconditioner
+
 Array = jax.Array
 Params = Any
 PyTree = Any
@@ -14,149 +16,6 @@ PyTree = Any
 # Type: given params, direction (same PyTree structure as params), rng -> matvec(direction)
 GGNMatvecFn = Callable[[Params, PyTree, Array], PyTree]
 
-
-# ---------------------------------------------------------------------------
-# Global PN-S EigenAdam state
-# ---------------------------------------------------------------------------
-
-class PnsEigenAdamState(NamedTuple):
-    """State for PN-S EigenAdam (global eigenbasis)."""
-    adam_state: optax.OptState
-    step: Array
-    eigenvalues: Array
-    eigenvectors: Array
-    rng_key: Array
-    rotation_diff: Array
-
-    # Split-spaces moments (used when split_spaces=True)
-    m_top: Array
-    v_top: Array
-    m_perp: Array
-    v_perp: Array
-
-    # Spectral LR gates (A) + complement curvature gate (D1)
-    lr_gate_top: Array          # scalar
-    lr_gate_perp: Array         # scalar
-    lr_ref_top: Array           # scalar "reference" curvature (set on first refresh)
-    lr_ref_perp: Array          # scalar "reference" curvature (set on first refresh)
-    lam_max: Array              # scalar (last refreshed)
-    lam_bar_perp: Array         # scalar (last refreshed)
-
-
-# ---------------------------------------------------------------------------
-# Lanczos iterative eigen solver on a matrix-vector product (un-sketched)
-# ---------------------------------------------------------------------------
-
-def lanczos(
-    matvec: Callable[[Array], Array],
-    dim: int,
-    num_iter: int,
-    key: Array,
-    eps: float = 1e-6,
-    sort_by_abs: bool = False,
-) -> Tuple[Array, Array]:
-    """Run Lanczos to approximate top eigenvalues/eigenvectors.
-
-    Returns:
-      eigenvalues: (num_iter,) approximated eigenvalues (sorted).
-      eigenvectors: (num_iter, dim) corresponding eigenvectors (in flattened space).
-                   Returned as rows (each row is an eigenvector).
-    """
-    v0 = jax.random.normal(key, (dim,))
-    v0 = v0 / (jnp.linalg.norm(v0) + eps)
-
-    def body_fun(carry, i):
-        V, alphas, betas = carry
-        v = V[i]  # (dim,)
-
-        w = matvec(v)  # (dim,)
-        alpha = jnp.vdot(v, w)
-        w = w - alpha * v
-
-        def ortho_against_prev(_w, _i):
-            prev_v = V[_i]
-            proj = jnp.vdot(prev_v, _w)
-            return _w - proj * prev_v
-
-        w = jax.lax.fori_loop(0, i, lambda j, ww: ortho_against_prev(ww, j), w)
-
-        beta = jnp.linalg.norm(w)
-        beta = jnp.where(beta < eps, 0.0, beta)
-        next_v = jnp.where(beta > 0, w / (beta + eps), jnp.zeros_like(w))
-
-        V = V.at[i + 1].set(next_v)
-        alphas = alphas.at[i].set(alpha)
-        betas = betas.at[i].set(beta)
-
-        return (V, alphas, betas), None
-
-    V = jnp.zeros((num_iter + 1, dim))
-    V = V.at[0].set(v0)
-    alphas = jnp.zeros((num_iter,))
-    betas = jnp.zeros((num_iter,))
-
-    (V, alphas, betas), _ = jax.lax.scan(
-        body_fun,
-        (V, alphas, betas),
-        jnp.arange(num_iter),
-    )
-
-    k = num_iter
-    T = jnp.diag(alphas)
-    if k > 1:
-        T = T.at[jnp.arange(k - 1), jnp.arange(1, k)].set(betas[: k - 1])
-        T = T.at[jnp.arange(1, k), jnp.arange(k - 1)].set(betas[: k - 1])
-
-    evals, evecs_T = jnp.linalg.eigh(T)  # ascending
-
-    if sort_by_abs:
-        idx = jnp.argsort(jnp.abs(evals))[::-1]
-    else:
-        idx = jnp.argsort(evals)[::-1]
-
-    evals = evals[idx]
-    evecs_T = evecs_T[:, idx]
-
-    V_k = V[:-1]  # (k, dim)
-    eigenvectors_flat = (evecs_T.T @ V_k).reshape(k, dim)  # rows
-
-    return evals, eigenvectors_flat
-
-
-# ---------------------------------------------------------------------------
-# Preconditioner (whole-gradient mode)
-# ---------------------------------------------------------------------------
-
-def apply_eigen_preconditioner(
-    grad_flat: Array,
-    eigenvalues: Array,
-    eigenvectors: Array,
-    damping: float = 1e-4,
-    saddle_free_neg: bool = False,
-) -> Array:
-    """Apply partial Newton-like sqrt-preconditioner in eigenbasis."""
-    if eigenvalues.size == 0:
-        return grad_flat
-
-    V = eigenvectors  # (k, dim) rows
-    lambdas = eigenvalues  # (k,)
-
-    proj = V @ grad_flat          # (k,)
-    proj_vec = V.T @ proj         # (dim,)
-
-    if saddle_free_neg:
-        lam_eff = jnp.abs(lambdas)
-    else:
-        lam_eff = lambdas
-
-    scale = 1.0 / (lam_eff + damping)
-    scale = jnp.sqrt(scale)
-
-    scaled = proj * scale         # (k,)
-    new_subspace = V.T @ scaled   # (dim,)
-
-    g_perp = grad_flat - proj_vec
-    return new_subspace + g_perp
 
 
 def _apply_eigenadam_whole(
@@ -184,8 +43,8 @@ def _apply_eigenadam_whole(
 
 
 # ---------------------------------------------------------------------------
-# Split-spaces mode: Adam in top-k eigen-coordinates with eigenvalue normalization
-# + Adam in complement, with spectral LR gates (A) and complement curvature LR gate (D1).
+# Split-spaces mode: dedicated eigenspace EMA/Adam moments in top-k coordinates
+# + selected base optimizer in the orthogonal complement.
 # ---------------------------------------------------------------------------
 
 def _apply_split_adam_topk(
@@ -196,75 +55,59 @@ def _apply_split_adam_topk(
     eigenvectors: Array,
     m_top: Array,
     v_top: Array,
-    m_perp: Array,
-    v_perp: Array,
     step: Array,
+    top_modes_for_ema: int,
     lr_top_eff: float,
-    lr_perp_eff: float,
     beta1: float,
     beta2: float,
     eps: float,
-    precond_damping: float,
-    use_saddle_free: bool,
-    weight_decay: float,
-) -> Tuple[PyTree, Array, Array, Array, Array]:
+    perp_lr_scale: float,
+    base_opt: optax.GradientTransformation,
+    opt_state: optax.OptState,
+) -> Tuple[PyTree, optax.OptState, Array, Array]:
     """
-    - Top-k: Adam on projected gradient coefficients, multiplied by 1/(λ+δ) ("normalize in eigendirections")
-    - Perp: standard diagonal Adam
-    - Decoupled weight decay applied once (tied to lr_perp_eff)
+    - Top-(k-1) eigenspace: dedicated EMA/Adam moments in eigen-coordinates.
+      The last tracked eigendirection is excluded from top-space updates.
+    - Complement space: updates from the selected base optimizer only.
+      We project base updates back onto the complement to keep the split strict.
     """
     flat_grads, unravel_grads = ravel_pytree(grads)
-    flat_params, _ = ravel_pytree(params)
+    V = eigenvectors  # (k_max, dim), rows
 
-    V = eigenvectors        # (k_max, dim), rows
-    lambdas = eigenvalues   # (k_max,)
+    k_max = V.shape[0]
+    top_mask = (jnp.arange(k_max) < top_modes_for_ema).astype(flat_grads.dtype)
+    V_top = V * top_mask[:, None]
 
-    # Project gradient into tracked subspace (k_max,)
-    g_top = V @ flat_grads
-    g_par = V.T @ g_top
+    # Project gradient into top-(k-1) subspace
+    g_top = V_top @ flat_grads
+    g_par = V_top.T @ g_top
     g_perp = flat_grads - g_par
 
-    # Bias correction
+    # ---- Top space: EMA/Adam in top-(k-1) coordinates
     t = step.astype(jnp.float32) + 1.0
     bc1 = 1.0 - beta1 ** t
     bc2 = 1.0 - beta2 ** t
 
-    # ---- Top space: Adam in eigen-coordinates + eigenvalue normalization
-    m_top = beta1 * m_top + (1.0 - beta1) * g_top
-    v_top = beta2 * v_top + (1.0 - beta2) * (g_top * g_top)
+    m_top = top_mask * (beta1 * m_top + (1.0 - beta1) * g_top)
+    v_top = top_mask * (beta2 * jnp.maximum(v_top, 0.0) + (1.0 - beta2) * (g_top * g_top))
 
-    m_top_hat = m_top / bc1
-    v_top_hat = v_top / bc2
+    m_top_hat = top_mask * (m_top / bc1)
+    v_top_hat = top_mask * jnp.maximum(v_top / bc2, 0.0)
+    step_top_coords = -lr_top_eff * m_top_hat / jnp.sqrt(v_top_hat + eps)
+    step_top_flat = V_top.T @ step_top_coords  # (dim,)
 
-    if use_saddle_free:
-        lam_eff = jnp.abs(lambdas)
-    else:
-        # Safe for GGN-like PSD: avoid negative (can happen from numerics)
-        lam_eff = jnp.maximum(lambdas, 0.0)
+    # ---- Complement: selected base optimizer, driven by g_perp only
+    g_perp_tree = unravel_grads(g_perp)
+    base_updates, new_opt_state = base_opt.update(g_perp_tree, opt_state, params=params)
+    base_updates_flat, _ = ravel_pytree(base_updates)
 
-    lam_eff = lam_eff + precond_damping
-    s_scale = 1.0 / (lam_eff + 1e-12)  # "normalize in eigendirections"
+    # Keep base optimizer contribution in complement only.
+    base_top = V_top @ base_updates_flat
+    base_parallel = V_top.T @ base_top
+    step_perp_flat = perp_lr_scale * (base_updates_flat - base_parallel)
 
-    step_top_coords = -lr_top_eff * s_scale * m_top_hat / (jnp.sqrt(v_top_hat) + eps)
-    step_top_flat = V.T @ step_top_coords  # (dim,)
-
-    # ---- Complement: standard diagonal Adam
-    m_perp = beta1 * m_perp + (1.0 - beta1) * g_perp
-    v_perp = beta2 * v_perp + (1.0 - beta2) * (g_perp * g_perp)
-
-    m_perp_hat = m_perp / bc1
-    v_perp_hat = v_perp / bc2
-
-    step_perp_flat = -lr_perp_eff * m_perp_hat / (jnp.sqrt(v_perp_hat) + eps)
-
-    # Combine
     step_flat = step_top_flat + step_perp_flat
-
-    # Decoupled weight decay (tie to lr_perp_eff to keep semantics stable)
-    if weight_decay != 0.0:
-        step_flat = step_flat - lr_perp_eff * weight_decay * flat_params
-
-    return unravel_grads(step_flat), m_top, v_top, m_perp, v_perp
+    return unravel_grads(step_flat), new_opt_state, m_top, v_top
 
 
 # ---------------------------------------------------------------------------
@@ -369,11 +212,21 @@ def pns_eigenadam(
     rmsprop_decay: Optional[float] = None,
     rmsprop_momentum: float = 0.0,
     rmsprop_centered: bool = False,
-    # --- A/D: spectral LR controllers ---
-    lr_gate_ema: float = 0.1,         # smoothing of gates at refresh
-    lr_gate_clip_min: float = 0.25,   # clamp gate multipliers
-    lr_gate_clip_max: float = 4.0,
-    hutchinson_probes: int = 1,       # D1: how many trace probes at refresh
+    # Streaming subspace tracking between full Lanczos refreshes.
+    subspace_tracking_enabled: bool = False,
+    subspace_tracking_every: int = 1,
+    subspace_tracking_alpha: float = 0.1,
+    subspace_tracking_power_iters: int = 1,
+    # Faster curvature eigensolve options.
+    lanczos_warm_start: bool = True,
+    lanczos_light_ortho: bool = True,
+    lanczos_light_ortho_every: int = 4,
+    # EOS-style automatic complement LR from the last tracked top-k eigenvalue.
+    perp_eos_enabled: bool = True,
+    perp_eos_gamma: float = 1.0,
+    perp_eos_ema: float = 0.1,
+    perp_eos_min: float = 1.0e-6,
+    perp_eos_max: float = 1.0,
 ) -> optax.GradientTransformation:
     """
     PN-S EigenAdam as an Optax gradient transformation (global eigenbasis).
@@ -382,12 +235,13 @@ def pns_eigenadam(
         * Precondition full gradient in eigenbasis, then apply chosen base optimizer.
 
     - split_spaces == True:
-        * Top-k: Adam in eigen-coordinates with eigenvalue normalization 1/(λ+δ).
-        * Perp: standard diagonal Adam.
-        * Additionally: spectral LR gates:
-            (A) lr_top_eff = lr_top * gate_top, where gate_top ~ (ref)/(λmax+δ)
-            (D1) lr_perp_eff = lr_perp * gate_perp, where gate_perp ~ (ref)/(λbar_perp+δ)
-          Gates are updated only at curvature refresh steps and smoothed by EMA.
+        * Top-(k-1): EMA/Adam smoothing of projected coefficients.
+        * Perp: selected base optimizer on the complement space only.
+        * Optional EOS-controlled lr_perp from the last tracked top-k eigenvalue.
+    - Between full refreshes:
+        * Optional Oja/PAST-style streaming subspace tracking using HVPs.
+    - Curvature refresh acceleration:
+        * Optional Lanczos warm-start + light reorthogonalization.
     """
     if lanczos_iters is None:
         lanczos_iters = max_eigenvectors
@@ -395,11 +249,22 @@ def pns_eigenadam(
 
     use_saddle_free = ((backend == "hessian") or (backend == "fisher"))
     sort_by_abs = ((backend == "hessian") or (backend == "fisher"))
+    track_every = max(int(subspace_tracking_every), 1)
+    track_alpha = float(jnp.clip(jnp.array(subspace_tracking_alpha, dtype=jnp.float32), 0.0, 1.0))
+    track_power_iters = max(int(subspace_tracking_power_iters), 1)
+    light_ortho_every = max(int(lanczos_light_ortho_every), 1)
+    eos_gamma = float(jnp.clip(jnp.array(perp_eos_gamma, dtype=jnp.float32), 1e-6, 2.0))
+    eos_ema = float(jnp.clip(jnp.array(perp_eos_ema, dtype=jnp.float32), 0.0, 1.0))
+    eos_min = float(jnp.maximum(jnp.array(perp_eos_min, dtype=jnp.float32), 1e-12))
+    eos_max = float(jnp.maximum(jnp.array(perp_eos_max, dtype=jnp.float32), eos_min))
+    top_modes_for_ema = max(k_top - 1, 0)
 
     base_name = base_optimizer.lower().replace("-", "_")
+    lr_perp_base = learning_rate if lr_perp is None else lr_perp
+    base_lr = lr_perp_base if split_spaces else learning_rate
     base_opt = _make_pns_base_optimizer(
         base_optimizer=base_name,
-        learning_rate=learning_rate,
+        learning_rate=base_lr,
         beta1=beta1,
         beta2=beta2,
         eps=eps,
@@ -420,7 +285,7 @@ def pns_eigenadam(
         eigenvectors = jnp.zeros((max_eigenvectors, dim), dtype=dtype)
 
         # We keep base optimizer state even if split_spaces=True (harmless).
-        adam_state = base_opt.init(params)
+        opt_state = base_opt.init(params)
         rng_key = jax.random.PRNGKey(0)
         step = jnp.array(0, dtype=jnp.int32)
         rotation_diff = jnp.array(0.0, dtype=dtype)
@@ -429,17 +294,10 @@ def pns_eigenadam(
         v_top = jnp.zeros((max_eigenvectors,), dtype=dtype)
         m_perp = jnp.zeros((dim,), dtype=dtype)
         v_perp = jnp.zeros((dim,), dtype=dtype)
-
-        # Gates & references (0 means "unset"; set on first curvature refresh)
-        lr_gate_top = jnp.array(1.0, dtype=dtype)
-        lr_gate_perp = jnp.array(1.0, dtype=dtype)
-        lr_ref_top = jnp.array(0.0, dtype=dtype)
-        lr_ref_perp = jnp.array(0.0, dtype=dtype)
-        lam_max = jnp.array(0.0, dtype=dtype)
-        lam_bar_perp = jnp.array(0.0, dtype=dtype)
+        lr_perp_eff = jnp.array(lr_perp_base, dtype=dtype)
 
         return PnsEigenAdamState(
-            adam_state=adam_state,
+            opt_state=opt_state,
             step=step,
             eigenvalues=eigenvalues,
             eigenvectors=eigenvectors,
@@ -449,12 +307,7 @@ def pns_eigenadam(
             v_top=v_top,
             m_perp=m_perp,
             v_perp=v_perp,
-            lr_gate_top=lr_gate_top,
-            lr_gate_perp=lr_gate_perp,
-            lr_ref_top=lr_ref_top,
-            lr_ref_perp=lr_ref_perp,
-            lam_max=lam_max,
-            lam_bar_perp=lam_bar_perp,
+            lr_perp_eff=lr_perp_eff,
         )
 
     def update_fn(grads: PyTree, state: PnsEigenAdamState, params: Optional[Params] = None):
@@ -471,19 +324,13 @@ def pns_eigenadam(
         v_top = state.v_top
         m_perp = state.m_perp
         v_perp = state.v_perp
+        lr_perp_eff = state.lr_perp_eff
 
-        lr_gate_top = state.lr_gate_top
-        lr_gate_perp = state.lr_gate_perp
-        lr_ref_top = state.lr_ref_top
-        lr_ref_perp = state.lr_ref_perp
-        lam_max = state.lam_max
-        lam_bar_perp = state.lam_bar_perp
-
-        lr_top_base = learning_rate if lr_top is None else lr_top
-        lr_perp_base = learning_rate if lr_perp is None else lr_perp
+        lr_top_eff = learning_rate if lr_top is None else lr_top
+        should_update = jnp.array(False)
 
         # ---------------------------------------------------------------
-        # 1) Curvature refresh (eigenpairs) + update LR gates (A & D1)
+        # 1) Curvature refresh (eigenpairs)
         # ---------------------------------------------------------------
         if ggn_matvec_fn is not None and curvature_update_every > 0:
             should_update = (step % curvature_update_every) == 0
@@ -497,12 +344,6 @@ def pns_eigenadam(
                     rotation_diff,
                     m_top,
                     v_top,
-                    lr_gate_top,
-                    lr_gate_perp,
-                    lr_ref_top,
-                    lr_ref_perp,
-                    lam_max,
-                    lam_bar_perp,
                 ) = carry
 
                 flat_params, unravel_params = ravel_pytree(params)
@@ -517,12 +358,16 @@ def pns_eigenadam(
 
                 # Lanczos eigenpairs
                 rng_key, lanczos_key = jax.random.split(rng_key)
+                warm_start_v = eigenvectors[0] if lanczos_warm_start else None
                 evals, evecs = lanczos(
                     matvec=matvec_flat,
                     dim=dim,
                     num_iter=lanczos_iters,
                     key=lanczos_key,
                     sort_by_abs=sort_by_abs,
+                    init_v=warm_start_v,
+                    use_light_ortho=lanczos_light_ortho,
+                    light_ortho_every=light_ortho_every,
                 )
 
                 # For Hessian/Fisher backends: reorder by |λ| descending
@@ -559,7 +404,8 @@ def pns_eigenadam(
                     m_top_small = m_top[:k_top]
                     v_top_small = v_top[:k_top]
                     m_top_new_small = R @ m_top_small
-                    v_top_new_small = R @ v_top_small  # heuristic
+                    # Keep second moments nonnegative under basis change.
+                    v_top_new_small = (R * R) @ jnp.maximum(v_top_small, 0.0)
 
                     m_top_new = jnp.zeros_like(m_top)
                     v_top_new = jnp.zeros_like(v_top)
@@ -569,46 +415,6 @@ def pns_eigenadam(
                     m_top_new = m_top
                     v_top_new = v_top
 
-                # -------- A) spectral radius gate from λmax
-                lam_max_new = jnp.max(jnp.abs(evals[:k_top])) if k_top > 0 else jnp.array(0.0, dtype=dtype)
-                denom_top = lam_max_new + precond_damping
-
-                # Set reference on first refresh so gate≈1 initially
-                lr_ref_top_new = jnp.where(lr_ref_top > 0.0, lr_ref_top, denom_top)
-                raw_gate_top = lr_ref_top_new / (denom_top + 1e-12)
-                raw_gate_top = jnp.clip(raw_gate_top, lr_gate_clip_min, lr_gate_clip_max)
-                lr_gate_top_new = (1.0 - lr_gate_ema) * lr_gate_top + lr_gate_ema * raw_gate_top
-
-                # -------- D1) complement scalar curvature via Hutchinson trace
-                # Estimate tr(H) with a few Rademacher probes at refresh.
-                def one_probe_trace(key):
-                    r = jax.random.choice(key, jnp.array([-1.0, 1.0], dtype=dtype), (dim,))
-                    Hr = matvec_flat(r)
-                    return jnp.vdot(r, Hr)
-
-                if hutchinson_probes <= 1:
-                    rng_key, k_tr = jax.random.split(rng_key)
-                    tr_est = one_probe_trace(k_tr)
-                else:
-                    keys = jax.random.split(rng_key, hutchinson_probes + 1)
-                    rng_key = keys[0]
-                    tr_vals = jax.vmap(one_probe_trace)(keys[1:])
-                    tr_est = jnp.mean(tr_vals)
-
-                sum_top = jnp.sum(evals[:k_top]) if k_top > 0 else jnp.array(0.0, dtype=dtype)
-                denom_dim = jnp.maximum(dim - k_top, 1)
-                lam_bar_perp_new = (tr_est - sum_top) / denom_dim
-
-                # For safety: keep nonnegative if using PSD curvature (GGN/Fisher).
-                if not use_saddle_free:
-                    lam_bar_perp_new = jnp.maximum(lam_bar_perp_new, 0.0)
-
-                denom_perp = lam_bar_perp_new + precond_damping
-                lr_ref_perp_new = jnp.where(lr_ref_perp > 0.0, lr_ref_perp, denom_perp)
-                raw_gate_perp = lr_ref_perp_new / (denom_perp + 1e-12)
-                raw_gate_perp = jnp.clip(raw_gate_perp, lr_gate_clip_min, lr_gate_clip_max)
-                lr_gate_perp_new = (1.0 - lr_gate_ema) * lr_gate_perp + lr_gate_ema * raw_gate_perp
-
                 return (
                     eigenvalues_new,
                     eigenvectors_new,
@@ -617,12 +423,6 @@ def pns_eigenadam(
                     rotation_diff_new,
                     m_top_new,
                     v_top_new,
-                    lr_gate_top_new,
-                    lr_gate_perp_new,
-                    lr_ref_top_new,
-                    lr_ref_perp_new,
-                    lam_max_new,
-                    lam_bar_perp_new,
                 )
 
             def dont_update(carry):
@@ -636,12 +436,6 @@ def pns_eigenadam(
                 rotation_diff,
                 m_top,
                 v_top,
-                lr_gate_top,
-                lr_gate_perp,
-                lr_ref_top,
-                lr_ref_perp,
-                lam_max,
-                lam_bar_perp,
             ) = jax.lax.cond(
                 should_update,
                 do_update,
@@ -654,24 +448,159 @@ def pns_eigenadam(
                     rotation_diff,
                     m_top,
                     v_top,
-                    lr_gate_top,
-                    lr_gate_perp,
-                    lr_ref_top,
-                    lr_ref_perp,
-                    lam_max,
-                    lam_bar_perp,
                 ),
             )
 
-        # Effective learning rates (A + D1)
-        lr_top_eff = lr_top_base * lr_gate_top
-        lr_perp_eff = lr_perp_base * lr_gate_perp
+            # Optional streaming subspace tracking between full Lanczos refreshes.
+            if subspace_tracking_enabled and k_top > 0:
+                basis_ready = jnp.linalg.norm(eigenvectors[:k_top, :]) > 1e-8
+                should_track = jnp.logical_and(
+                    jnp.logical_and(jnp.logical_not(should_update), basis_ready),
+                    (step % track_every) == 0,
+                )
+
+                def do_track(carry):
+                    (
+                        eigenvalues,
+                        eigenvectors,
+                        rng_key,
+                        params,
+                        rotation_diff,
+                        m_top,
+                        v_top,
+                    ) = carry
+
+                    flat_params, unravel_params = ravel_pytree(params)
+                    dtype = flat_params.dtype
+                    prev_vecs_k = eigenvectors[:k_top, :]   # (k_top, dim)
+                    U_prev_cols = prev_vecs_k.T             # (dim, k_top)
+
+                    def hvp_cols(U_cols: Array, rng_in: Array) -> Tuple[Array, Array]:
+                        keys = jax.random.split(rng_in, k_top + 1)
+                        rng_out = keys[0]
+
+                        def one_hvp(v_col: Array, key_col: Array) -> Array:
+                            v_pytree = unravel_params(v_col)
+                            Hv_pytree = ggn_matvec_fn(params, v_pytree, key_col)
+                            Hv_flat, _ = ravel_pytree(Hv_pytree)
+                            return Hv_flat
+
+                        HU_cols = jax.vmap(one_hvp, in_axes=(1, 0), out_axes=1)(U_cols, keys[1:])
+                        return HU_cols, rng_out
+
+                    def power_step(_i, power_carry):
+                        U_cols, rng_step = power_carry
+                        HU_cols, rng_step = hvp_cols(U_cols, rng_step)
+                        Q_cols, _ = jnp.linalg.qr(HU_cols, mode="reduced")
+                        return (Q_cols, rng_step)
+
+                    U_tilde_cols, rng_key = jax.lax.fori_loop(
+                        0,
+                        track_power_iters,
+                        power_step,
+                        (U_prev_cols, rng_key),
+                    )
+
+                    U_mix_cols = (1.0 - track_alpha) * U_prev_cols + track_alpha * U_tilde_cols
+                    U_new_cols, _ = jnp.linalg.qr(U_mix_cols, mode="reduced")
+                    U_new_rows = U_new_cols.T  # (k_top, dim)
+
+                    HU_new_cols, rng_key = hvp_cols(U_new_cols, rng_key)
+                    evals_k = jnp.sum(U_new_cols * HU_new_cols, axis=0)
+                    if not use_saddle_free:
+                        evals_k = jnp.maximum(evals_k, 0.0)
+
+                    diff = U_new_rows - prev_vecs_k
+                    frob_num = jnp.linalg.norm(diff)
+                    frob_den = jnp.linalg.norm(prev_vecs_k)
+                    frob_den_safe = jnp.where(frob_den > 1e-8, frob_den, 1.0)
+                    rotation_diff_new = jnp.where(
+                        frob_den > 1e-8,
+                        frob_num / frob_den_safe,
+                        jnp.array(0.0, dtype=dtype),
+                    )
+
+                    eigenvalues_new = jnp.zeros_like(eigenvalues)
+                    eigenvalues_new = eigenvalues_new.at[:k_top].set(evals_k)
+
+                    eigenvectors_new = jnp.zeros_like(eigenvectors)
+                    eigenvectors_new = eigenvectors_new.at[:k_top, :].set(U_new_rows)
+
+                    if split_spaces:
+                        R = U_new_rows @ prev_vecs_k.T
+                        m_top_small = m_top[:k_top]
+                        v_top_small = v_top[:k_top]
+                        m_top_new_small = R @ m_top_small
+                        v_top_new_small = (R * R) @ jnp.maximum(v_top_small, 0.0)
+
+                        m_top_new = jnp.zeros_like(m_top)
+                        v_top_new = jnp.zeros_like(v_top)
+                        m_top_new = m_top_new.at[:k_top].set(m_top_new_small)
+                        v_top_new = v_top_new.at[:k_top].set(v_top_new_small)
+                    else:
+                        m_top_new = m_top
+                        v_top_new = v_top
+
+                    return (
+                        eigenvalues_new,
+                        eigenvectors_new,
+                        rng_key,
+                        params,
+                        rotation_diff_new,
+                        m_top_new,
+                        v_top_new,
+                    )
+
+                (
+                    eigenvalues,
+                    eigenvectors,
+                    rng_key,
+                    _,
+                    rotation_diff,
+                    m_top,
+                    v_top,
+                ) = jax.lax.cond(
+                    should_track,
+                    do_track,
+                    dont_update,
+                    operand=(
+                        eigenvalues,
+                        eigenvectors,
+                        rng_key,
+                        params,
+                        rotation_diff,
+                        m_top,
+                        v_top,
+                    ),
+                )
+
+        if split_spaces and perp_eos_enabled:
+            dtype = eigenvalues.dtype
+            if k_top > 0:
+                lam_proxy = eigenvalues[k_top - 1]
+                if use_saddle_free:
+                    lam_proxy = jnp.abs(lam_proxy)
+                else:
+                    lam_proxy = jnp.maximum(lam_proxy, 0.0)
+            else:
+                lam_proxy = jnp.array(0.0, dtype=dtype)
+
+            eta_target = eos_gamma / (lam_proxy + precond_damping)
+            eta_target = jnp.clip(eta_target, eos_min, eos_max)
+            lr_perp_eff = jax.lax.cond(
+                should_update,
+                lambda prev: (1.0 - eos_ema) * prev + eos_ema * eta_target,
+                lambda prev: prev,
+                lr_perp_eff,
+            )
+        else:
+            lr_perp_eff = jnp.array(lr_perp_base, dtype=eigenvalues.dtype)
 
         # ---------------------------------------------------------------
         # 2) Apply update
         # ---------------------------------------------------------------
         if not split_spaces:
-            updates, new_adam_state = _apply_eigenadam_whole(
+            updates, new_opt_state = _apply_eigenadam_whole(
                 grads=grads,
                 params=params,
                 eigenvalues=eigenvalues,
@@ -679,36 +608,37 @@ def pns_eigenadam(
                 precond_damping=precond_damping,
                 use_saddle_free=use_saddle_free,
                 base_opt=base_opt,
-                opt_state=state.adam_state,
+                opt_state=state.opt_state,
             )
             new_m_top, new_v_top = m_top, v_top
             new_m_perp, new_v_perp = m_perp, v_perp
+            new_lr_perp_eff = lr_perp_eff
 
         else:
-            updates, new_m_top, new_v_top, new_m_perp, new_v_perp = _apply_split_adam_topk(
+            perp_lr_scale = lr_perp_eff / (lr_perp_base + 1e-12)
+            updates, new_opt_state, new_m_top, new_v_top = _apply_split_adam_topk(
                 grads=grads,
                 params=params,
                 eigenvalues=eigenvalues,
                 eigenvectors=eigenvectors,
                 m_top=m_top,
                 v_top=v_top,
-                m_perp=m_perp,
-                v_perp=v_perp,
                 step=step,
+                top_modes_for_ema=top_modes_for_ema,
                 lr_top_eff=lr_top_eff,
-                lr_perp_eff=lr_perp_eff,
                 beta1=beta1,
                 beta2=beta2,
                 eps=eps,
-                precond_damping=precond_damping,
-                use_saddle_free=use_saddle_free,
-                weight_decay=weight_decay,
+                perp_lr_scale=perp_lr_scale,
+                base_opt=base_opt,
+                opt_state=state.opt_state,
             )
-            # base optimizer state unused in split mode
-            new_adam_state = state.adam_state
+            # Complement moments are handled by the base optimizer state.
+            new_m_perp, new_v_perp = m_perp, v_perp
+            new_lr_perp_eff = lr_perp_eff
 
         new_state = PnsEigenAdamState(
-            adam_state=new_adam_state,
+            opt_state=new_opt_state,
             step=step,
             eigenvalues=eigenvalues,
             eigenvectors=eigenvectors,
@@ -718,12 +648,7 @@ def pns_eigenadam(
             v_top=new_v_top,
             m_perp=new_m_perp,
             v_perp=new_v_perp,
-            lr_gate_top=lr_gate_top,
-            lr_gate_perp=lr_gate_perp,
-            lr_ref_top=lr_ref_top,
-            lr_ref_perp=lr_ref_perp,
-            lam_max=lam_max,
-            lam_bar_perp=lam_bar_perp,
+            lr_perp_eff=new_lr_perp_eff,
         )
         return updates, new_state
 

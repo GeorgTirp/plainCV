@@ -29,7 +29,8 @@ from flax.metrics.tensorboard import SummaryWriter
 
 from data import get_datasets
 from engine.flax_engine import create_train_state, make_train_step, make_eval_step
-from optim.ggn_utils import make_ggn_matvec_fn
+from optim.eigentools import init_eigentracking, track_eigenstate
+from optim.factory import build_curvature_matvec_fn
 
 from models.mlp import MLP
 from models.resnet import SmallResNet, ResNet30, ResNet18
@@ -42,6 +43,8 @@ from utils import (
     get_exp_dir_path,
     save_loss_curves,
     _sanitize_name,
+    init_eigen_tracking_csv,
+    append_eigen_tracking_row,
 )
 
 FLAGS = flags.FLAGS
@@ -57,7 +60,7 @@ def construct_model(cfg):
     """Build model from config."""
     if cfg.model == "mlp":
         return MLP(num_classes=cfg.num_classes)
-    elif cfg.model == "resnet_small":
+    elif cfg.model in {"resnet_small", "small_resnet"}:
         return SmallResNet(
             num_classes=cfg.num_classes,
             use_bn=getattr(cfg, "resnet_use_batchnorm", True),
@@ -155,6 +158,72 @@ def main(_argv):
         curvature_batch=curvature_batch,
     )
 
+    eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
+    eigen_tracking_state = None
+    eigen_tracking_csv_path = None
+    eigen_tracking_every = int(getattr(cfg, "eigen_tracking_every", 100))
+    if eigen_tracking_enabled:
+        eigen_tracking_topk = int(
+            getattr(
+                cfg,
+                "eigen_tracking_topk",
+                getattr(cfg, "curvature_eigenvectors", 8),
+            )
+        )
+        if eigen_tracking_topk <= 0:
+            raise ValueError("eigen_tracking_topk must be >= 1 when tracking is enabled.")
+
+        eigen_tracking_backend = getattr(
+            cfg,
+            "eigen_tracking_backend",
+            getattr(cfg, "pns_curvature_backend", "ggn"),
+        )
+        eigen_tracking_iters = getattr(cfg, "eigen_tracking_lanczos_iters", None)
+        if eigen_tracking_iters is None:
+            eigen_tracking_iters = eigen_tracking_topk
+        eigen_tracking_sort_by_abs = getattr(cfg, "eigen_tracking_sort_by_abs", None)
+        if eigen_tracking_sort_by_abs is None:
+            eigen_tracking_sort_by_abs = (
+                str(eigen_tracking_backend).lower() in {"hessian", "fisher"}
+            )
+        eigen_tracking_light_ortho = bool(
+            getattr(cfg, "eigen_tracking_light_ortho", True)
+        )
+        eigen_tracking_light_ortho_every = int(
+            getattr(cfg, "eigen_tracking_light_ortho_every", 4)
+        )
+        eigen_tracking_matvec_fn = build_curvature_matvec_fn(
+            cfg,
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=state.batch_stats,
+            backend=eigen_tracking_backend,
+        )
+        eigen_tracking_state = init_eigentracking(
+            state.params,
+            k=eigen_tracking_topk,
+            seed=int(getattr(cfg, "seed", 0)),
+        )
+        eigen_tracking_csv_path = init_eigen_tracking_csv(
+            cfg,
+            eigen_tracking_topk,
+        )
+
+        @jax.jit
+        def run_eigen_tracking(params, grads, updates, step, tracking_state):
+            return track_eigenstate(
+                params=params,
+                grads=grads,
+                updates=updates,
+                step=step,
+                eigen_state=tracking_state,
+                matvec_fn=eigen_tracking_matvec_fn,
+                num_iter=eigen_tracking_iters,
+                sort_by_abs=eigen_tracking_sort_by_abs,
+                use_light_ortho=eigen_tracking_light_ortho,
+                light_ortho_every=eigen_tracking_light_ortho_every,
+            )
+
     muon_log_files = {}
     if log_curv and use_muon:
         muon_curv_dir = os.path.join(exp_dir, "gradient_eigenvalues")
@@ -227,7 +296,10 @@ def main(_argv):
     #    )
     ## --------------------------------------------------------------
 
-    train_step = make_train_step()
+    train_step = make_train_step(return_updates=False)
+    tracking_train_step = (
+        make_train_step(return_updates=True) if eigen_tracking_enabled else None
+    )
     eval_step = make_eval_step()
 
     # For curves: wall-clock vs loss and iteration vs loss
@@ -239,6 +311,7 @@ def main(_argv):
     eval_accs = []
 
     training_start_time = time.time()
+    train_global_step = 0
 
     # --------------------
     # Training loop
@@ -258,7 +331,29 @@ def main(_argv):
         train_metrics = []
         for batch in train_ds:
             rng, batch_rng = jax.random.split(rng)
-            state, metrics = train_step(state, batch, batch_rng)
+            should_track = (
+                eigen_tracking_enabled
+                and ((train_global_step + 1) % eigen_tracking_every == 0)
+            )
+            if should_track:
+                params_before = state.params
+                state, metrics, grads, updates = tracking_train_step(
+                    state, batch, batch_rng
+                )
+                eigen_tracking_state = run_eigen_tracking(
+                    params_before,
+                    grads,
+                    updates,
+                    state.step,
+                    eigen_tracking_state,
+                )
+                append_eigen_tracking_row(
+                    eigen_tracking_csv_path,
+                    eigen_tracking_state,
+                )
+            else:
+                state, metrics = train_step(state, batch, batch_rng)
+            train_global_step += 1
             train_metrics.append(metrics)
 
         # ---- Eval ----
