@@ -1,0 +1,26 @@
+# sweep.yaml
+program: train.py
+method: bayes
+metric:
+  name: eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --config=/home/georg/Documents/Non-convex_RP/plainCV/config/config_vit.yaml
+
+parameters:
+  # Use names that match keys in the base config YAML.
+  lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 3e-3
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-7
+    max: 1e-2
+
+
+run_cap: 4

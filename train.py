@@ -31,7 +31,6 @@ from data import get_datasets
 from engine.flax_engine import create_train_state, make_train_step, make_eval_step
 from optim.eigentools import init_eigentracking, track_eigenstate
 from optim.factory import build_curvature_matvec_fn
-
 from models.mlp import MLP
 from models.resnet import SmallResNet, ResNet30, ResNet18
 from models.vit_small import VisionTransformer
@@ -54,7 +53,6 @@ flags.DEFINE_string(
     None,
     "Override exp_name from the config for the output folder.",
 )
-
 
 def construct_model(cfg):
     """Build model from config."""
@@ -99,9 +97,14 @@ def main(_argv):
         from train_lm import run as run_lm
         return run_lm(cfg)
 
+    wb_run = init_wandb(cfg)
+    if wb_run is not None:
+        wb_run.define_metric("step")
+        wb_run.define_metric("*", step_metric="step")
+        wb_run.define_metric("eval_loss", summary="min")
+
     # Experiment dir + logging
     maybe_make_dir(cfg)
-    init_wandb(cfg)
     exp_dir = get_exp_dir_path(cfg)
     writer = SummaryWriter(log_dir=exp_dir)
 
@@ -383,17 +386,18 @@ def main(_argv):
         train_accs.append(float(train_summary["accuracy"]))
         eval_accs.append(float(eval_summary["accuracy"]))
 
+        metrics = {
+                "epoch": epoch,
+                "train_loss": float(train_summary["loss"]),
+                "train_accuracy": float(train_summary["accuracy"]),
+                "eval_loss": float(eval_summary["loss"]),
+                "eval_accuracy": float(eval_summary["accuracy"]),
+                "epoch_time": epoch_time,
+            }
         # Console + optional wandb logging
         log_scalar_dict(
             cfg,
-            {
-                "epoch": epoch,
-                "train/loss": float(train_summary["loss"]),
-                "train/accuracy": float(train_summary["accuracy"]),
-                "eval/loss": float(eval_summary["loss"]),
-                "eval/accuracy": float(eval_summary["accuracy"]),
-                "epoch_time": epoch_time,
-            },
+            metrics,
         )
 
         if log_curv and use_pns and curvature_csv_path is not None:

@@ -21,7 +21,7 @@ hf_cg_tol: 0.01
 hf_damping: 0.01
 hutchinson_samples: 1
 image_size: 28
-lr: 0.001
+lr: 1.0724681690563372e-05
 model: resnet_small
 muon_adaptive: false
 muon_beta: 0.95
@@ -41,7 +41,7 @@ pns_block_iters: 4
 pns_curvature_backend: ggn
 pns_curvature_update_every: 64
 pns_eigensolver: block_oi
-pns_eigenvalue_keep_threshold: 5.0
+pns_eigenvalue_keep_threshold: 5
 pns_freeze_subspace_after_threshold: true
 pns_innovation_check_every: 10
 pns_innovation_enabled: true
@@ -59,8 +59,8 @@ pns_lr_perp: 0.001
 pns_lr_top: 0.001
 pns_perp_eos_ema: 0.1
 pns_perp_eos_enabled: true
-pns_perp_eos_gamma: 1.0
-pns_perp_eos_max: 1.0
+pns_perp_eos_gamma: 1
+pns_perp_eos_max: 1
 pns_perp_eos_min: 1.0e-06
 pns_precond_damping: 0.0001
 pns_split_spaces: false
@@ -76,7 +76,7 @@ rho: 0.01
 schedule_free: false
 schedule_free_b1: 0.9
 schedule_free_lr: 0.01
-schedule_free_weight_lr_power: 2.0
+schedule_free_weight_lr_power: 2
 seed: 0
 vit_dropout: 0.1
 vit_heads: 4
@@ -86,4 +86,4 @@ vit_mlp_dim: 256
 vit_patch_size: 4
 vit_use_batchnorm: false
 vit_use_layernorm: true
-weight_decay: 0.01
+weight_decay: 0.0011480181152604529

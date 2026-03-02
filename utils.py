@@ -11,7 +11,6 @@ try:
 except ImportError:
     plt = None
 from itertools import product
-from collections import namedtuple
 
 from absl import flags
 
@@ -24,6 +23,31 @@ except ImportError:
 FLAGS = flags.FLAGS
 
 _NUMERIC_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+class Config(dict):
+    """Mutable config with attribute access and namedtuple-like helpers."""
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+    def __delattr__(self, key):
+        try:
+            del self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def _asdict(self):
+        return dict(self)
+
+    def to_dict(self):
+        return dict(self)
 
 # These are used by cluster/slurm scripts in the original plainLM repo.
 # It's harmless to have them here; on local runs they'll just be None.
@@ -74,7 +98,7 @@ def _coerce_yaml_values(value):
 
 def load_config(path: str):
     """
-    Parse a YAML config file and return the corresponding config as a namedtuple.
+    Parse a YAML config file and return the corresponding config as a mutable mapping.
 
     - If the YAML contains only scalars, we just wrap them.
     - If some values are lists and FLAGS.job_idx is not None, we interpret the
@@ -90,11 +114,6 @@ def load_config(path: str):
     """
     with open(path, "r") as f:
         config_dict = _coerce_yaml_values(yaml.safe_load(f))
-
-    # We keep the original "flat dict" style from plainLM.
-    # If you want nested dicts, just avoid lists and sweeps will be skipped.
-    keys = list(config_dict.keys())
-    Config = namedtuple("Config", keys)
 
     if FLAGS.job_idx is None:
         # No sweep: use YAML as-is
@@ -116,14 +135,21 @@ def load_config(path: str):
             )
 
         combo = combinations[FLAGS.job_idx]
+        keys = list(config_dict.keys())
         cfg = {keys[i]: combo[i] for i in range(len(keys))}
 
-    return Config(**cfg), sweep_size
+    return Config(cfg), sweep_size
 
 
 # ---------------------------------------------------------------------------
 # Weights & Biases (optional)
 # ---------------------------------------------------------------------------
+
+def _wandb_cfg_to_dict(wb_cfg):
+    if hasattr(wb_cfg, "as_dict"):
+        return wb_cfg.as_dict()
+    return dict(wb_cfg)
+
 
 def init_wandb(cfg):
     """
@@ -135,13 +161,14 @@ def init_wandb(cfg):
       - wandb_run_name: str
       - wandb_dir: str
 
-    If wandb is not installed or use_wandb is False, this is a no-op.
+    If wandb is not installed and no sweep is active, this is a no-op.
     """
     if wandb is None:
         return
 
     use_wandb = getattr(cfg, "use_wandb", False)
-    if not use_wandb:
+    sweep_active = os.environ.get("WANDB_SWEEP_ID") is not None
+    if not use_wandb and not sweep_active:
         return
 
     os.environ["WANDB__SERVICE_WAIT"] = "600"
@@ -151,14 +178,22 @@ def init_wandb(cfg):
     run_name = getattr(cfg, "wandb_run_name", getattr(cfg, "exp_name", "run"))
     wandb_dir = getattr(cfg, "wandb_dir", "./wandb")
 
-    # Optional safety check: if you really want dedup detection, implement here.
-    # For now we just always start a run.
-    wandb.init(
-        project=project,
-        name=run_name,
-        dir=wandb_dir,
-        config=cfg._asdict(),
-    )
+    if wandb.run is None:
+        run = wandb.init(
+            project=project,
+            name=run_name,
+            dir=wandb_dir,
+            config=cfg._asdict(),
+        )
+    else:
+        run = wandb.run
+
+    for key, value in _wandb_cfg_to_dict(run.config).items():
+        if key.startswith("_"):
+            continue
+        cfg[key] = value
+
+    return run
 
 
 def log_job_info():
@@ -269,7 +304,7 @@ def log_scalar_dict(cfg, metrics: dict):
                 parts.append(f"{k}: {v}")
         print(" | ".join(parts))
 
-    if getattr(cfg, "use_wandb", False) and wandb is not None:
+    if wandb is not None and (getattr(cfg, "use_wandb", False) or wandb.run is not None):
         wandb.log(metrics)
 
 

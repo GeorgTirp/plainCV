@@ -4,7 +4,6 @@ import os
 import sys
 import time
 from typing import Iterable, Tuple, Optional
-
 import yaml
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -232,10 +231,15 @@ def run(cfg):
     if cfg.model != "transformer" and not str(cfg.model).startswith("pythia"):
         raise ValueError(f"LM training expects model='transformer' or 'pythia*', got {cfg.model}.")
 
+    wb_run = init_wandb(cfg)
+    if wb_run is not None:
+        wb_run.define_metric("step")
+        wb_run.define_metric("*", step_metric="step")
+        wb_run.define_metric("eval_loss", summary="min")
+
     use_doc_mask = bool(getattr(cfg, "intra_doc_masking", False))
 
     maybe_make_dir(cfg)
-    init_wandb(cfg)
 
     trainloader, validloader = get_dataloaders(cfg)
 
