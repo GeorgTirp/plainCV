@@ -178,6 +178,14 @@ def _clip_grads(grads, max_norm: Optional[float]):
     return jtu.tree_map(lambda g: g * scale, grads)
 
 
+def _loss_and_acc(logits, labels):
+    # Keep numerically sensitive softmax-cross-entropy in fp32 regardless of model compute dtype.
+    logits_f32 = logits.astype(jnp.float32)
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits_f32, labels).mean()
+    acc = jnp.mean(jnp.argmax(logits_f32, axis=-1) == labels)
+    return loss, acc
+
+
 def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
     del vocab_size
 
@@ -193,9 +201,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
                         attn_mask=attn_mask,
                         deterministic=True,
                     )
-                    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-                    acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
-                    return loss, acc
+                    return _loss_and_acc(logits, labels)
 
                 (loss, acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
                 grads = jax.lax.pmean(grads, axis_name="data")
@@ -211,8 +217,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
                     attn_mask=attn_mask,
                     deterministic=True,
                 )
-                loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-                acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+                loss, acc = _loss_and_acc(logits, labels)
                 loss = jax.lax.pmean(loss, axis_name="data")
                 acc = jax.lax.pmean(acc, axis_name="data")
                 return loss, acc
@@ -228,9 +233,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
                     attn_mask=attn_mask,
                     deterministic=True,
                 )
-                loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-                acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
-                return loss, acc
+                return _loss_and_acc(logits, labels)
 
             (loss, acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
             return grads, loss, acc
@@ -243,8 +246,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
                 attn_mask=attn_mask,
                 deterministic=True,
             )
-            loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-            acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+            loss, acc = _loss_and_acc(logits, labels)
             return loss, acc
 
         return compute_grads, eval_step
@@ -260,9 +262,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
                     attn_mask=None,
                     deterministic=True,
                 )
-                loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-                acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
-                return loss, acc
+                return _loss_and_acc(logits, labels)
 
             (loss, acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
             grads = jax.lax.pmean(grads, axis_name="data")
@@ -278,8 +278,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
                 attn_mask=None,
                 deterministic=True,
             )
-            loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-            acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+            loss, acc = _loss_and_acc(logits, labels)
             loss = jax.lax.pmean(loss, axis_name="data")
             acc = jax.lax.pmean(acc, axis_name="data")
             return loss, acc
@@ -295,9 +294,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
                 attn_mask=None,
                 deterministic=True,
             )
-            loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-            acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
-            return loss, acc
+            return _loss_and_acc(logits, labels)
 
         (loss, acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         return grads, loss, acc
@@ -310,8 +307,7 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
             attn_mask=None,
             deterministic=True,
         )
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-        acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+        loss, acc = _loss_and_acc(logits, labels)
         return loss, acc
 
     return compute_grads, eval_step

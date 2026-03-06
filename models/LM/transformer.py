@@ -22,6 +22,8 @@ class ModelConfig:
     rmsnorm_eps: float = 1e-6
     tie_embeddings: bool = False
     rope_theta: float = 500000.0  # your PyTorch uses 500000
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
 
 # -------------------------
@@ -31,17 +33,33 @@ class Norm(nn.Module):
     dim: int
     normtype: Literal["rmsnorm", "layernorm", "batchnorm"] = "rmsnorm"
     eps: float = 1e-6
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
         if self.normtype == "rmsnorm":
             # flax.linen.RMSNorm exists in Linen.
-            return nn.RMSNorm(epsilon=self.eps)(x)
+            return nn.RMSNorm(
+                epsilon=self.eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+            )(x)
         if self.normtype == "layernorm":
-            return nn.LayerNorm(epsilon=self.eps)(x)
+            return nn.LayerNorm(
+                epsilon=self.eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+            )(x)
         if self.normtype == "batchnorm":
             # BatchNorm needs mutable batch_stats when training.
-            return nn.BatchNorm(use_running_average=deterministic, momentum=0.9, epsilon=self.eps)(x)
+            return nn.BatchNorm(
+                use_running_average=deterministic,
+                momentum=0.9,
+                epsilon=self.eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+            )(x)
         raise ValueError("normtype must be one of: rmsnorm, layernorm, batchnorm")
 
 
@@ -54,12 +72,28 @@ class MLP(nn.Module):
     hidden_dim: int
     base_init: nn.initializers.Initializer
     out_init: nn.initializers.Initializer
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = nn.Dense(self.hidden_dim, use_bias=False, kernel_init=self.base_init, name="fc1")(x)
+        x = nn.Dense(
+            self.hidden_dim,
+            use_bias=False,
+            kernel_init=self.base_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="fc1",
+        )(x)
         x = nn.silu(x)
-        x = nn.Dense(self.dim, use_bias=False, kernel_init=self.out_init, name="fc2")(x)
+        x = nn.Dense(
+            self.dim,
+            use_bias=False,
+            kernel_init=self.out_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="fc2",
+        )(x)
         return x
 
 
@@ -68,13 +102,36 @@ class GLU(nn.Module):
     hidden_dim: int
     base_init: nn.initializers.Initializer
     out_init: nn.initializers.Initializer
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        gate = nn.Dense(self.hidden_dim, use_bias=False, kernel_init=self.base_init, name="fc_gate")(x)
-        up   = nn.Dense(self.hidden_dim, use_bias=False, kernel_init=self.base_init, name="fc_up")(x)
+        gate = nn.Dense(
+            self.hidden_dim,
+            use_bias=False,
+            kernel_init=self.base_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="fc_gate",
+        )(x)
+        up = nn.Dense(
+            self.hidden_dim,
+            use_bias=False,
+            kernel_init=self.base_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="fc_up",
+        )(x)
         x = nn.silu(gate) * up
-        x = nn.Dense(self.dim, use_bias=False, kernel_init=self.out_init, name="fc2")(x)
+        x = nn.Dense(
+            self.dim,
+            use_bias=False,
+            kernel_init=self.out_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="fc2",
+        )(x)
         return x
 
 
@@ -83,12 +140,28 @@ class MLPReluSquared(nn.Module):
     hidden_dim: int
     base_init: nn.initializers.Initializer
     out_init: nn.initializers.Initializer
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = nn.Dense(self.hidden_dim, use_bias=False, kernel_init=self.base_init, name="fc1")(x)
+        x = nn.Dense(
+            self.hidden_dim,
+            use_bias=False,
+            kernel_init=self.base_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="fc1",
+        )(x)
         x = jnp.square(jax.nn.relu(x))
-        x = nn.Dense(self.dim, use_bias=False, kernel_init=self.out_init, name="fc2")(x)
+        x = nn.Dense(
+            self.dim,
+            use_bias=False,
+            kernel_init=self.out_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="fc2",
+        )(x)
         return x
 
 
@@ -118,7 +191,14 @@ class Attention(nn.Module):
         resid_init = nn.initializers.normal(stddev=0.02 / math.sqrt(2 * self.cfg.n_layers))
 
         # (B, T, 3D)
-        qkv = nn.Dense(3 * d, use_bias=False, kernel_init=base_init, name="w_qkv")(x)
+        qkv = nn.Dense(
+            3 * d,
+            use_bias=False,
+            kernel_init=base_init,
+            dtype=self.cfg.dtype,
+            param_dtype=self.cfg.param_dtype,
+            name="w_qkv",
+        )(x)
 
         # Split to (B, T, D) each
         q, k, v = jnp.split(qkv, 3, axis=-1)
@@ -163,7 +243,14 @@ class Attention(nn.Module):
         out = out.reshape(bsz, seqlen, d)
 
         # output proj (residual-scaled init)
-        out = nn.Dense(d, use_bias=False, kernel_init=resid_init, name="w_out")(out)
+        out = nn.Dense(
+            d,
+            use_bias=False,
+            kernel_init=resid_init,
+            dtype=self.cfg.dtype,
+            param_dtype=self.cfg.param_dtype,
+            name="w_out",
+        )(out)
         return out
 
 
@@ -185,8 +272,22 @@ class Block(nn.Module):
         deterministic: bool = True,
     ) -> jnp.ndarray:
         # Norms
-        attn_norm = Norm(self.cfg.dim, normtype=self.normtype, eps=self.cfg.rmsnorm_eps, name="attn_norm")
-        mlp_norm  = Norm(self.cfg.dim, normtype=self.normtype, eps=self.cfg.rmsnorm_eps, name="mlp_norm")
+        attn_norm = Norm(
+            self.cfg.dim,
+            normtype=self.normtype,
+            eps=self.cfg.rmsnorm_eps,
+            dtype=self.cfg.dtype,
+            param_dtype=self.cfg.param_dtype,
+            name="attn_norm",
+        )
+        mlp_norm = Norm(
+            self.cfg.dim,
+            normtype=self.normtype,
+            eps=self.cfg.rmsnorm_eps,
+            dtype=self.cfg.dtype,
+            param_dtype=self.cfg.param_dtype,
+            name="mlp_norm",
+        )
 
         # Attention
         x = x + Attention(self.cfg, name="attn")(attn_norm(x, deterministic=deterministic), freqs_cis, attn_mask)
@@ -197,11 +298,35 @@ class Block(nn.Module):
         resid_init = nn.initializers.normal(stddev=0.02 / math.sqrt(2 * self.cfg.n_layers))
 
         if self.cfg.mlp == "mlp":
-            mlp = MLP(self.cfg.dim, hidden_dim, base_init=base_init, out_init=resid_init, name="mlp")
+            mlp = MLP(
+                self.cfg.dim,
+                hidden_dim,
+                base_init=base_init,
+                out_init=resid_init,
+                dtype=self.cfg.dtype,
+                param_dtype=self.cfg.param_dtype,
+                name="mlp",
+            )
         elif self.cfg.mlp == "glu":
-            mlp = GLU(self.cfg.dim, hidden_dim, base_init=base_init, out_init=resid_init, name="mlp")
+            mlp = GLU(
+                self.cfg.dim,
+                hidden_dim,
+                base_init=base_init,
+                out_init=resid_init,
+                dtype=self.cfg.dtype,
+                param_dtype=self.cfg.param_dtype,
+                name="mlp",
+            )
         elif self.cfg.mlp == "mlp_relu_sq":
-            mlp = MLPReluSquared(self.cfg.dim, hidden_dim, base_init=base_init, out_init=resid_init, name="mlp")
+            mlp = MLPReluSquared(
+                self.cfg.dim,
+                hidden_dim,
+                base_init=base_init,
+                out_init=resid_init,
+                dtype=self.cfg.dtype,
+                param_dtype=self.cfg.param_dtype,
+                name="mlp",
+            )
 
         else:
             raise ValueError(f"Unknown mlp type: {self.cfg.mlp}")
@@ -237,6 +362,8 @@ class Transformer(nn.Module):
             num_embeddings=cfg.vocab_size,
             features=cfg.dim,
             embedding_init=base_init,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             name="embed_tokens",
         )
         x = embed(input_ids)  # (B, T, D)
@@ -254,13 +381,27 @@ class Transformer(nn.Module):
             )
 
         # Output norm
-        x = Norm(cfg.dim, normtype=self.normtype, eps=cfg.rmsnorm_eps, name="out_norm")(x, deterministic=deterministic)
+        x = Norm(
+            cfg.dim,
+            normtype=self.normtype,
+            eps=cfg.rmsnorm_eps,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            name="out_norm",
+        )(x, deterministic=deterministic)
 
         # LM head (optionally tie embeddings)
         if cfg.tie_embeddings:
             # Use Embed.attend for tied output projection. 
             logits = embed.attend(x)
         else:
-            logits = nn.Dense(cfg.vocab_size, use_bias=False, kernel_init=base_init, name="lm_head")(x)
+            logits = nn.Dense(
+                cfg.vocab_size,
+                use_bias=False,
+                kernel_init=base_init,
+                dtype=cfg.dtype,
+                param_dtype=cfg.param_dtype,
+                name="lm_head",
+            )(x)
 
         return logits

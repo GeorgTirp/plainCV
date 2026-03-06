@@ -36,6 +36,25 @@ def _count_non_embedding_params(params: Dict[str, Any]) -> int:
     return _count_params(unflatten_dict(keep, sep="/"))
 
 
+def _resolve_dtype(dtype_cfg, *, default=jnp.float32):
+    if dtype_cfg is None:
+        return default
+    if dtype_cfg in {jnp.float32, jnp.float16, jnp.bfloat16}:
+        return dtype_cfg
+    if isinstance(dtype_cfg, str):
+        key = dtype_cfg.strip().lower()
+        mapping = {
+            "float32": jnp.float32,
+            "float16": jnp.float16,
+            "bfloat16": jnp.bfloat16,
+        }
+        if key in mapping:
+            return mapping[key]
+    raise ValueError(
+        f"Unsupported dtype '{dtype_cfg}'. Expected one of: float32, float16, bfloat16."
+    )
+
+
 def construct_model(
     cfg,
     rng: Optional[jax.random.PRNGKey] = None,
@@ -51,6 +70,10 @@ def construct_model(
     """
     if rng is None:
         rng = jax.random.PRNGKey(getattr(cfg, "seed", 0))
+
+    compute_dtype = _resolve_dtype(getattr(cfg, "dtype", "float32"))
+    param_dtype = _resolve_dtype(getattr(cfg, "param_dtype", "float32"))
+    print(f"LM dtypes | compute: {compute_dtype} | params: {param_dtype}")
 
     # -------------------------
     # Transformer++ (your Flax Transformer)
@@ -69,6 +92,8 @@ def construct_model(
             seq_len=cfg.seq_len,
             tie_embeddings=cfg.tie_embeddings,
             rope_theta=getattr(cfg, "rope_theta", 500000.0),
+            dtype=compute_dtype,
+            param_dtype=param_dtype,
         )
         model = Transformer(model_cfg)
 
@@ -86,7 +111,7 @@ def construct_model(
         from transformers import AutoConfig, FlaxAutoModelForCausalLM
 
         model_cfg = AutoConfig.from_pretrained(f"EleutherAI/{cfg.model}")
-        model = FlaxAutoModelForCausalLM.from_config(model_cfg, dtype=jnp.float32)
+        model = FlaxAutoModelForCausalLM.from_config(model_cfg, dtype=compute_dtype)
 
         # HF Flax models: init_weights(rng, input_shape=...) returns params
         input_shape = (init_batch_size, cfg.seq_len)
