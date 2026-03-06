@@ -3,6 +3,7 @@
 import os
 import sys
 import time
+from functools import partial
 from typing import Iterable, Tuple, Optional
 import yaml
 
@@ -52,7 +53,9 @@ _apply_preimport_config()
 from absl import app, flags
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
+from flax import jax_utils as flax_jax_utils
 from flax.training import train_state
 from jax import tree_util as jtu
 
@@ -145,6 +148,28 @@ def _prepare_batch(batch, seq_len: int, use_doc_mask: bool):
     return inputs, labels, attn_mask
 
 
+def _reshape_for_pmap(x: Optional[jnp.ndarray], n_devices: int):
+    if x is None:
+        return None
+    if x.shape[0] % n_devices != 0:
+        raise ValueError(
+            f"Leading batch dimension {x.shape[0]} is not divisible by n_devices={n_devices}."
+        )
+    per_device = x.shape[0] // n_devices
+    return x.reshape((n_devices, per_device) + x.shape[1:])
+
+
+def _prepare_batch_for_devices(batch, seq_len: int, use_doc_mask: bool, n_devices: int):
+    inputs, labels, attn_mask = _prepare_batch(batch, seq_len, use_doc_mask)
+    if n_devices <= 1:
+        return inputs, labels, attn_mask
+    return (
+        _reshape_for_pmap(inputs, n_devices),
+        _reshape_for_pmap(labels, n_devices),
+        _reshape_for_pmap(attn_mask, n_devices),
+    )
+
+
 def _clip_grads(grads, max_norm: Optional[float]):
     if max_norm is None:
         return grads
@@ -153,8 +178,46 @@ def _clip_grads(grads, max_norm: Optional[float]):
     return jtu.tree_map(lambda g: g * scale, grads)
 
 
-def _make_train_fns(model, vocab_size: int, use_doc_mask: bool):
+def _make_train_fns(model, vocab_size: int, use_doc_mask: bool, use_pmap: bool):
+    del vocab_size
+
     if use_doc_mask:
+        if use_pmap:
+
+            @partial(jax.pmap, axis_name="data")
+            def compute_grads(params, inputs, labels, attn_mask):
+                def loss_fn(p):
+                    logits = model.apply(
+                        {"params": p},
+                        inputs,
+                        attn_mask=attn_mask,
+                        deterministic=True,
+                    )
+                    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+                    acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+                    return loss, acc
+
+                (loss, acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+                grads = jax.lax.pmean(grads, axis_name="data")
+                loss = jax.lax.pmean(loss, axis_name="data")
+                acc = jax.lax.pmean(acc, axis_name="data")
+                return grads, loss, acc
+
+            @partial(jax.pmap, axis_name="data")
+            def eval_step(params, inputs, labels, attn_mask):
+                logits = model.apply(
+                    {"params": params},
+                    inputs,
+                    attn_mask=attn_mask,
+                    deterministic=True,
+                )
+                loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+                acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+                loss = jax.lax.pmean(loss, axis_name="data")
+                acc = jax.lax.pmean(acc, axis_name="data")
+                return loss, acc
+
+            return compute_grads, eval_step
 
         @jax.jit
         def compute_grads(params, inputs, labels, attn_mask):
@@ -182,6 +245,43 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool):
             )
             loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
             acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+            return loss, acc
+
+        return compute_grads, eval_step
+
+    if use_pmap:
+
+        @partial(jax.pmap, axis_name="data")
+        def compute_grads(params, inputs, labels):
+            def loss_fn(p):
+                logits = model.apply(
+                    {"params": p},
+                    inputs,
+                    attn_mask=None,
+                    deterministic=True,
+                )
+                loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+                acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+                return loss, acc
+
+            (loss, acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+            grads = jax.lax.pmean(grads, axis_name="data")
+            loss = jax.lax.pmean(loss, axis_name="data")
+            acc = jax.lax.pmean(acc, axis_name="data")
+            return grads, loss, acc
+
+        @partial(jax.pmap, axis_name="data")
+        def eval_step(params, inputs, labels):
+            logits = model.apply(
+                {"params": params},
+                inputs,
+                attn_mask=None,
+                deterministic=True,
+            )
+            loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+            acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+            loss = jax.lax.pmean(loss, axis_name="data")
+            acc = jax.lax.pmean(acc, axis_name="data")
             return loss, acc
 
         return compute_grads, eval_step
@@ -217,14 +317,95 @@ def _make_train_fns(model, vocab_size: int, use_doc_mask: bool):
     return compute_grads, eval_step
 
 
-def _next_batch(it, loader):
-    try:
-        batch = next(it)
-        return batch, it
-    except StopIteration:
-        it = iter(loader)
-        batch = next(it)
-        return batch, it
+def _make_apply_grads_fn(grad_clip: Optional[float], use_pmap: bool):
+    if use_pmap:
+
+        @jax.pmap
+        def apply_grads(state, grads):
+            grads = _clip_grads(grads, grad_clip)
+            updates, new_opt_state = state.tx.update(
+                grads,
+                state.opt_state,
+                state.params,
+            )
+            new_params = optax.apply_updates(state.params, updates)
+            new_state = state.replace(
+                step=state.step + 1,
+                params=new_params,
+                opt_state=new_opt_state,
+            )
+            return new_state, updates
+
+        return apply_grads
+
+    @jax.jit
+    def apply_grads(state, grads):
+        grads = _clip_grads(grads, grad_clip)
+        updates, new_opt_state = state.tx.update(
+            grads,
+            state.opt_state,
+            state.params,
+        )
+        new_params = optax.apply_updates(state.params, updates)
+        new_state = state.replace(
+            step=state.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+        )
+        return new_state, updates
+
+    return apply_grads
+
+
+def _merge_batches(batches):
+    if len(batches) == 1:
+        return batches[0]
+
+    merged = {
+        "input_ids": np.concatenate(
+            [np.asarray(batch["input_ids"]) for batch in batches],
+            axis=0,
+        )
+    }
+    if "docs_lengths" in batches[0]:
+        merged["docs_lengths"] = []
+        for batch in batches:
+            merged["docs_lengths"].extend(batch["docs_lengths"])
+    return merged
+
+
+def _next_batch(it, loader, num_batches: int = 1):
+    batches = []
+    for _ in range(num_batches):
+        try:
+            batch = next(it)
+        except StopIteration:
+            it = iter(loader)
+            batch = next(it)
+        batches.append(batch)
+    return _merge_batches(batches), it
+
+
+def _iter_grouped_batches(loader, num_batches: int = 1):
+    if num_batches == 1:
+        yield from loader
+        return
+
+    it = iter(loader)
+    while True:
+        batches = []
+        for _ in range(num_batches):
+            try:
+                batches.append(next(it))
+            except StopIteration:
+                return
+        yield _merge_batches(batches)
+
+
+def _unwrap_replicated(x, use_pmap: bool):
+    if not use_pmap:
+        return x
+    return flax_jax_utils.unreplicate(x)
 
 
 def run(cfg):
@@ -238,6 +419,12 @@ def run(cfg):
         wb_run.define_metric("eval_loss", summary="min")
 
     use_doc_mask = bool(getattr(cfg, "intra_doc_masking", False))
+    n_devices = jax.local_device_count()
+    use_pmap = n_devices > 1
+    grouped_batches = n_devices if use_pmap else 1
+
+    if use_pmap:
+        print(f"Using pmap over {n_devices} local devices.")
 
     maybe_make_dir(cfg)
 
@@ -247,7 +434,7 @@ def run(cfg):
     # This is safe for all optimizers and required for PNS/Sophia/HF-like methods.
     curvature_batch = None
     try:
-        curv_raw = next(iter(trainloader))
+        curv_raw, _ = _next_batch(iter(trainloader), trainloader, num_batches=grouped_batches)
         curv_inputs, curv_labels, curv_attn_mask = _prepare_batch(curv_raw, cfg.seq_len, use_doc_mask)
         curvature_batch = (curv_inputs, curv_labels, curv_attn_mask)
     except Exception as exc:
@@ -260,6 +447,8 @@ def run(cfg):
 
     tx = get_optimizer(cfg, model_def=model, curvature_batch=curvature_batch, batch_stats=None)
     state = LMTrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    if use_pmap:
+        state = flax_jax_utils.replicate(state)
 
     eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
     eigen_tracking_state = None
@@ -307,8 +496,9 @@ def run(cfg):
             batch_stats=None,
             backend=eigen_tracking_backend,
         )
+        eigen_params = _unwrap_replicated(state.params, use_pmap)
         eigen_tracking_state = init_eigentracking(
-            state.params,
+            eigen_params,
             k=eigen_tracking_topk,
             seed=int(getattr(cfg, "seed", 0)),
         )
@@ -332,7 +522,12 @@ def run(cfg):
                 light_ortho_every=eigen_tracking_light_ortho_every,
             )
 
-    compute_grads, eval_step = _make_train_fns(model, cfg.vocab_size, use_doc_mask)
+    compute_grads, eval_step = _make_train_fns(
+        model,
+        cfg.vocab_size,
+        use_doc_mask,
+        use_pmap=use_pmap,
+    )
 
     steps_budget = int(getattr(cfg, "steps_budget", 100))
     grad_accum_steps = int(getattr(cfg, "grad_accumulation_steps", 1))
@@ -340,6 +535,7 @@ def run(cfg):
     eval_every = getattr(cfg, "eval_every_steps", None)
     eval_every = int(eval_every) if eval_every is not None else None
     grad_clip = getattr(cfg, "grad_clip", None)
+    apply_grads = _make_apply_grads_fn(grad_clip, use_pmap=use_pmap)
 
     train_iter = iter(trainloader)
     global_step = 0
@@ -347,12 +543,17 @@ def run(cfg):
 
     while global_step < steps_budget:
         grads_accum = None
-        loss_accum = 0.0
-        acc_accum = 0.0
+        loss_accum = None
+        acc_accum = None
 
         for _ in range(grad_accum_steps):
-            batch, train_iter = _next_batch(train_iter, trainloader)
-            inputs, labels, attn_mask = _prepare_batch(batch, cfg.seq_len, use_doc_mask)
+            batch, train_iter = _next_batch(train_iter, trainloader, num_batches=grouped_batches)
+            inputs, labels, attn_mask = _prepare_batch_for_devices(
+                batch,
+                cfg.seq_len,
+                use_doc_mask,
+                n_devices,
+            )
 
             if use_doc_mask:
                 grads, loss, acc = compute_grads(state.params, inputs, labels, attn_mask)
@@ -362,32 +563,21 @@ def run(cfg):
             grads_accum = grads if grads_accum is None else jtu.tree_map(
                 lambda a, b: a + b, grads_accum, grads
             )
-            loss_accum += loss
-            acc_accum += acc
+            loss_accum = loss if loss_accum is None else loss_accum + loss
+            acc_accum = acc if acc_accum is None else acc_accum + acc
 
         grads_accum = jtu.tree_map(lambda g: g / grad_accum_steps, grads_accum)
-        grads_accum = _clip_grads(grads_accum, grad_clip)
-        params_before = state.params if eigen_tracking_enabled else None
-        updates, new_opt_state = state.tx.update(
-            grads_accum,
-            state.opt_state,
-            state.params,
-        )
-        new_params = optax.apply_updates(state.params, updates)
-        state = state.replace(
-            step=state.step + 1,
-            params=new_params,
-            opt_state=new_opt_state,
-        )
+        params_before = _unwrap_replicated(state.params, use_pmap) if eigen_tracking_enabled else None
+        state, updates = apply_grads(state, grads_accum)
 
         global_step += 1
 
         if eigen_tracking_enabled and global_step % eigen_tracking_every == 0:
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
-                grads_accum,
-                updates,
-                state.step,
+                _unwrap_replicated(grads_accum, use_pmap),
+                _unwrap_replicated(updates, use_pmap),
+                _unwrap_replicated(state.step, use_pmap),
                 eigen_tracking_state,
             )
             append_eigen_tracking_row(
@@ -396,8 +586,12 @@ def run(cfg):
             )
 
         if global_step % log_every == 0:
-            loss_val = float(jax.device_get(loss_accum / grad_accum_steps))
-            acc_val = float(jax.device_get(acc_accum / grad_accum_steps))
+            loss_val = float(
+                jax.device_get(_unwrap_replicated(loss_accum / grad_accum_steps, use_pmap))
+            )
+            acc_val = float(
+                jax.device_get(_unwrap_replicated(acc_accum / grad_accum_steps, use_pmap))
+            )
             metrics = {
                 "step": global_step,
                 "train_loss": loss_val,
@@ -411,14 +605,19 @@ def run(cfg):
             eval_loss = 0.0
             eval_acc = 0.0
             n_batches = 0
-            for batch in validloader:
-                inputs, labels, attn_mask = _prepare_batch(batch, cfg.seq_len, use_doc_mask)
+            for batch in _iter_grouped_batches(validloader, num_batches=grouped_batches):
+                inputs, labels, attn_mask = _prepare_batch_for_devices(
+                    batch,
+                    cfg.seq_len,
+                    use_doc_mask,
+                    n_devices,
+                )
                 if use_doc_mask:
                     loss, acc = eval_step(state.params, inputs, labels, attn_mask)
                 else:
                     loss, acc = eval_step(state.params, inputs, labels)
-                eval_loss += loss
-                eval_acc += acc
+                eval_loss += _unwrap_replicated(loss, use_pmap)
+                eval_acc += _unwrap_replicated(acc, use_pmap)
                 n_batches += 1
             eval_loss = float(jax.device_get(eval_loss / max(1, n_batches)))
             eval_acc = float(jax.device_get(eval_acc / max(1, n_batches)))
