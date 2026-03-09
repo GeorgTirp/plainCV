@@ -640,6 +640,9 @@ def get_optimizer(
     elif name == "shampoo":
         weight_decay = getattr(cfg, "weight_decay", 0.0)
         eps = getattr(cfg, "eps", 1e-4)
+        beta1 = getattr(cfg, "beta1", 0.9)
+        beta2 = getattr(cfg, "beta2", 0.999)
+        adam_eps = getattr(cfg, "adam_eps", 1e-8)
         max_dim = getattr(cfg, "shampoo_max_dim", 2048)
         exponent = getattr(cfg, "shampoo_exponent", 0.25)
 
@@ -649,6 +652,9 @@ def get_optimizer(
             max_dim=max_dim,
             exponent=exponent,
             weight_decay=weight_decay,
+            adam_b1=beta1,
+            adam_b2=beta2,
+            adam_eps=adam_eps,
         )
     
         # ------------------------

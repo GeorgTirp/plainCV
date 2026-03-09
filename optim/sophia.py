@@ -215,7 +215,8 @@ def sophia_shampoo(
     lr = float(learning_rate)
     # Build an inner Shampoo transform to reuse its state and update logic
     shampoo_tx = scale_by_shampoo(
-        eps=shampoo_eps,
+        shampoo_eps=shampoo_eps,
+        fallback_to_adamw=False,
         max_dim=shampoo_max_dim,
         exponent=shampoo_exponent,
     )

@@ -10,101 +10,82 @@ import optax
 Array = jax.Array
 PyTree = Any
 
-# We reuse the same idea as SOAP: only do full Shampoo on reasonably-sized 2D views
+# Only run full Shampoo on reasonably-sized 2D matrices.
 MAX_DIM = 2048
 
 
 class ShampooPerParamState(NamedTuple):
-    """State for a single parameter tensor (stored on a 2D view)."""
-    L: Array          # left Kronecker factor (rows x rows)
-    R: Array          # right Kronecker factor (cols x cols)
+    """Per-parameter state.
+
+    For 2D matrix params (`use_shampoo=True`), we use Shampoo's Kronecker state.
+    For non-2D params (`use_shampoo=False`), we use AdamW moments (m, v).
+    """
+
+    m: Array
+    v: Array
+    L: Array
+    R: Array
     use_shampoo: bool
 
 
 class ShampooState(NamedTuple):
-    count: Array      # scalar int32 step counter
-    per_param: PyTree # PyTree[ShampooPerParamState]
+    count: Array
+    per_param: PyTree  # PyTree[ShampooPerParamState]
 
 
 def _is_shampoo_state(x: Any) -> bool:
     return isinstance(x, ShampooPerParamState)
 
 
-def _reshape_to_2d(x: Array) -> Array:
-    """Same convention as SOAP: map arbitrary param shapes to a 2D view.
-
-    - 0D: scalar -> 1x1
-    - 1D: vector -> 1 x N
-    - 2D: matrix -> as is
-    - 4D: conv kernel (Kh, Kw, Cin, Cout) -> Cout x (Kh*Kw*Cin)
-    - Fallback: flatten leading dim, pack rest in columns.
-    """
-    if x.ndim == 0:
-        return x.reshape(1, 1)
-    if x.ndim == 1:
-        return x.reshape(1, -1)
-    if x.ndim == 2:
-        return x
-    if x.ndim == 4:
-        kh, kw, cin, cout = x.shape
-        return jnp.reshape(x, (cout, kh * kw * cin))
-    return x.reshape(x.shape[0], -1)
+def _is_shampoo_matrix(p: Array, *, max_dim: int) -> bool:
+    return (
+        p.ndim == 2
+        and p.shape[0] > 1
+        and p.shape[1] > 1
+        and p.shape[0] <= max_dim
+        and p.shape[1] <= max_dim
+    )
 
 
 def scale_by_shampoo(
-    eps: float = 1e-4,
+    shampoo_eps: float = 1e-4,
+    weight_decay: float = 0.0,
+    adam_b1: float = 0.9,
+    adam_b2: float = 0.999,
+    adam_eps: float = 1e-8,
+    fallback_to_adamw: bool = True,
     max_dim: int = MAX_DIM,
-    exponent: float = 0.25,  # original Shampoo uses 1/4
+    exponent: float = 0.25,
 ) -> optax.GradientTransformation:
-    """Shampoo preconditioner (matrix case) as an Optax gradient transformation.
-
-    This implements Algorithm 1 (matrix case) from:
-      *Shampoo: Preconditioned Stochastic Tensor Optimization*,
-      Gupta et al., ICML 2018.
-
-    For a 2D weight matrix W (rows x cols) and gradient G:
-      - Maintain:
-          L_t = sum_{s<=t} G_s G_s^T
-          R_t = sum_{s<=t} G_s^T G_s
-      - Update direction:
-          ΔW ∝ L_t^{-1/4} G_t R_t^{-1/4}
-
-    This transformation only computes the preconditioned gradient; the actual
-    step (minus sign and learning rate) is applied by `optax.scale_by_learning_rate`.
-
-    Args:
-      eps: small diagonal jitter added inside the matrix power to keep it PD.
-      max_dim: maximum rows/cols to run full Shampoo on; larger matrices
-        fall back to un-preconditioned gradients for safety.
-      exponent: matrix power exponent for preconditioning; 0.25 is the
-        original choice (L^{-1/4}, R^{-1/4}).
-
-    Returns:
-      optax.GradientTransformation that maps raw grads -> preconditioned grads.
+    """Muon-style routing:
+    - 2D matrices: Shampoo preconditioning
+    - everything else: AdamW (or identity if `fallback_to_adamw=False`)
     """
 
     def init_per_param(p: Array) -> ShampooPerParamState:
-        p2d = _reshape_to_2d(p)
-        rows, cols = p2d.shape
+        p_arr = jnp.asarray(p)
+        m0 = jnp.zeros_like(p_arr)
+        v0 = jnp.zeros_like(p_arr)
 
-        # Shapes of Kronecker factors always match gradient's 2D view
-        L0 = eps * jnp.eye(rows, dtype=p.dtype)
-        R0 = eps * jnp.eye(cols, dtype=p.dtype)
+        if _is_shampoo_matrix(p_arr, max_dim=max_dim):
+            rows, cols = p_arr.shape
+            L0 = shampoo_eps * jnp.eye(rows, dtype=p_arr.dtype)
+            R0 = shampoo_eps * jnp.eye(cols, dtype=p_arr.dtype)
+            return ShampooPerParamState(
+                m=m0,
+                v=v0,
+                L=L0,
+                R=R0,
+                use_shampoo=True,
+            )
 
-        # We may choose not to actually *use* Shampoo on some shapes (too big or degenerate),
-        # but we still keep L,R with consistent shapes so lax.cond tracing is happy.
-        too_big_or_degenerate = (
-            (rows > max_dim)
-            or (cols > max_dim)
-            or (rows <= 1)
-            or (cols <= 1)
-        )
-        use_shampoo = not too_big_or_degenerate
-
+        one = jnp.eye(1, dtype=p_arr.dtype)
         return ShampooPerParamState(
-            L=L0,
-            R=R0,
-            use_shampoo=use_shampoo,
+            m=m0,
+            v=v0,
+            L=one,
+            R=one,
+            use_shampoo=False,
         )
 
     def init_fn(params: PyTree) -> ShampooState:
@@ -119,9 +100,11 @@ def scale_by_shampoo(
         state: ShampooState,
         params: Optional[PyTree] = None,
     ) -> tuple[PyTree, ShampooState]:
-        del params  # Shampoo uses only gradients
-
         count = state.count + jnp.array(1, dtype=jnp.int32)
+        b1_t = jnp.power(adam_b1, count.astype(jnp.float32))
+        b2_t = jnp.power(adam_b2, count.astype(jnp.float32))
+        m_bc_den = 1.0 - b1_t
+        v_bc_den = 1.0 - b2_t
 
         flat_grads, treedef = jtu.tree_flatten(grads)
         flat_states, treedef2 = jtu.tree_flatten(
@@ -131,70 +114,98 @@ def scale_by_shampoo(
         if treedef != treedef2:
             raise ValueError("Shampoo state and grads PyTrees do not match structure.")
 
+        if params is None:
+            flat_params = [None] * len(flat_grads)
+        else:
+            flat_params, params_treedef = jtu.tree_flatten(params)
+            if params_treedef != treedef:
+                raise ValueError("Shampoo params and grads PyTrees do not match structure.")
+
         flat_updates: list[Array] = []
         flat_new_states: list[ShampooPerParamState] = []
 
-        for g, s in zip(flat_grads, flat_states):
-            # Convert any non-array leaf into an array; this keeps things robust
-            g_arr = jnp.asarray(g)
-            g2d = _reshape_to_2d(g_arr)
-            rows, cols = g2d.shape
+        for g, p, s in zip(flat_grads, flat_params, flat_states):
+            m, v, L, R, use_shampoo = s
+            g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
+            p_arr = None if p is None else jnp.asarray(p)
 
-            L, R, use_shampoo = s
-            use_shampoo_pred = jnp.asarray(use_shampoo, dtype=bool)
+            # Reinitialize if shape changed.
+            if g_arr.shape != m.shape:
+                reference = p_arr if p_arr is not None else g_arr
+                s = init_per_param(reference)
+                m, v, L, R, use_shampoo = s
+                g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
-            def shampoo_branch(_):
-                # -------- Shampoo update (Algorithm 1, matrix case) --------
-                # L_t = L_{t-1} + G_t G_t^T
-                # R_t = R_{t-1} + G_t^T G_t
+            if bool(use_shampoo):
+                if (g_arr.ndim != 2) or (L.shape != (g_arr.shape[0], g_arr.shape[0])) or (
+                    R.shape != (g_arr.shape[1], g_arr.shape[1])
+                ):
+                    use_shampoo = False
+
+            if bool(use_shampoo):
+                g2d = g_arr
+                rows, cols = g2d.shape
+
                 L_new = L + g2d @ g2d.T
                 R_new = R + g2d.T @ g2d
 
-                # Regularize & compute matrix powers L_new^{-exponent}, R_new^{-exponent}
-                L_reg = L_new + eps * jnp.eye(rows, dtype=L_new.dtype)
-                R_reg = R_new + eps * jnp.eye(cols, dtype=R_new.dtype)
+                L_reg = L_new + shampoo_eps * jnp.eye(rows, dtype=L_new.dtype)
+                R_reg = R_new + shampoo_eps * jnp.eye(cols, dtype=R_new.dtype)
 
                 eig_L, U_L = jnp.linalg.eigh(L_reg)
                 eig_R, U_R = jnp.linalg.eigh(R_reg)
-
-                eig_L_clamped = jnp.maximum(eig_L, eps)
-                eig_R_clamped = jnp.maximum(eig_R, eps)
-
+                eig_L_clamped = jnp.maximum(eig_L, shampoo_eps)
+                eig_R_clamped = jnp.maximum(eig_R, shampoo_eps)
                 pow_L = eig_L_clamped ** (-exponent)
                 pow_R = eig_R_clamped ** (-exponent)
 
-                # U diag(pow) U^T, done without constructing diag explicitly
                 P_L = (U_L * pow_L) @ U_L.T
                 P_R = (U_R * pow_R) @ U_R.T
+                g_pre = P_L @ g2d @ P_R
 
-                # Preconditioned gradient: L^{-exp} G R^{-exp}
-                g_pre_2d = P_L @ g2d @ P_R
-                g_pre = g_pre_2d.reshape(g_arr.shape)
+                if (p_arr is not None) and (weight_decay != 0.0):
+                    g_pre = g_pre + weight_decay * p_arr
 
-                new_s = ShampooPerParamState(
-                    L=L_new,
-                    R=R_new,
-                    use_shampoo=use_shampoo,
+                flat_updates.append(g_pre)
+                flat_new_states.append(
+                    ShampooPerParamState(
+                        m=m,
+                        v=v,
+                        L=L_new,
+                        R=R_new,
+                        use_shampoo=True,
+                    )
                 )
-                return g_pre, new_s
+                continue
 
-            def identity_branch(_):
-                # Fallback: just pass gradient through unchanged; still keep L,R shapes.
+            if fallback_to_adamw:
+                # AdamW fallback for all non-2D (and invalid) parameters.
+                m_new = (1.0 - adam_b1) * g_arr + adam_b1 * m
+                v_new = (1.0 - adam_b2) * (g_arr * g_arr) + adam_b2 * v
+                m_hat = m_new / m_bc_den
+                v_hat = v_new / v_bc_den
+                upd = m_hat / (jnp.sqrt(v_hat) + adam_eps)
+                if (p_arr is not None) and (weight_decay != 0.0):
+                    upd = upd + weight_decay * p_arr
                 new_s = ShampooPerParamState(
+                    m=m_new,
+                    v=v_new,
                     L=L,
                     R=R,
-                    use_shampoo=use_shampoo,
+                    use_shampoo=False,
                 )
-                return g_arr, new_s
-
-            g_pre, new_s = jax.lax.cond(
-                use_shampoo_pred,
-                shampoo_branch,
-                identity_branch,
-                operand=None,
-            )
-
-            flat_updates.append(g_pre)
+            else:
+                # Identity fallback to preserve callers that only want Shampoo
+                # preconditioning on matrix params (e.g., Sophia+Shampoo).
+                upd = g_arr
+                new_s = ShampooPerParamState(
+                    m=m,
+                    v=v,
+                    L=L,
+                    R=R,
+                    use_shampoo=False,
+                )
+            flat_updates.append(upd)
             flat_new_states.append(new_s)
 
         updates = jtu.tree_unflatten(treedef, flat_updates)
@@ -214,34 +225,22 @@ def shampoo(
     eps: float = 1e-4,
     max_dim: int = MAX_DIM,
     exponent: float = 0.25,
-    weight_decay: float = 0.0,  # if you want, you can wrap with add_decayed_weights externally
+    weight_decay: float = 0.0,
+    adam_b1: float = 0.9,
+    adam_b2: float = 0.999,
+    adam_eps: float = 1e-8,
 ) -> optax.GradientTransformation:
-    """Shampoo optimizer (matrix case) as an Optax alias.
-
-    This is the “pure” Shampoo update (no Adam part):
-
-        W_{t+1} = W_t - η * L_t^{-1/4} G_t R_t^{-1/4}
-
-    with:
-        L_t = ε I + ∑_{s<=t} G_s G_s^T
-        R_t = ε I + ∑_{s<=t} G_s^T G_s
-
-    Args:
-      learning_rate: global step size η.
-      eps: diagonal jitter in the preconditioners.
-      max_dim: max rows/cols for a tensor to be Shampoo-preconditioned.
-      exponent: matrix power exponent (original paper uses 1/4).
-      weight_decay: currently unused here; you can add decoupled weight decay
-        around this using `optax.add_decayed_weights` if you like.
-
-    Returns:
-      An Optax GradientTransformation implementing Shampoo.
+    """Muon-style Shampoo optimizer:
+    - 2D params: Shampoo
+    - non-2D params: AdamW
     """
-    del weight_decay  # keeping interface parallel to other opts; can wire in later
-
     return optax.chain(
         scale_by_shampoo(
-            eps=eps,
+            shampoo_eps=eps,
+            weight_decay=weight_decay,
+            adam_b1=adam_b1,
+            adam_b2=adam_b2,
+            adam_eps=adam_eps,
             max_dim=max_dim,
             exponent=exponent,
         ),

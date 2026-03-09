@@ -7,82 +7,78 @@ import jax.numpy as jnp
 from jax import tree_util as jtu
 import optax
 
-from .eigentools import lanczos, EigenTrackingState
 Array = jax.Array
 PyTree = Any
 
-# Only run full SOAP on reasonably-sized 2D views
+# Only run full SOAP on reasonably-sized 2D matrices.
 MAX_DIM = 2048
 
 
 class SoapPerParamState(NamedTuple):
-    """State for a single parameter tensor (stored on a 2D view)."""
-    m: Array      # first moment, (rows, cols)
-    v: Array      # second moment, (rows, cols) (in eigenbasis)
-    L: Array      # Kronecker factor, (rows, rows)
-    R: Array      # Kronecker factor, (cols, cols)
-    QL: Array     # eigenvectors of L, (rows, rows)
-    QR: Array     # eigenvectors of R, (cols, cols)
-    
+    """Per-parameter state.
+
+    For 2D matrix params (`use_soap=True`), SOAP uses (m, v, L, R, QL, QR).
+    For non-2D params (`use_soap=False`), we use AdamW moments (m, v) and keep
+    (L, R, QL, QR) as 1x1 placeholders.
+    """
+
+    m: Array
+    v: Array
+    L: Array
+    R: Array
+    QL: Array
+    QR: Array
     use_soap: bool
 
 
 class SoapState(NamedTuple):
-    count: Array    # scalar int32
+    count: Array
     per_param: PyTree  # PyTree[SoapPerParamState]
-    eigenvalues: Array # top-k eigenvalues
 
 
 def _is_soap_state(x: Any) -> bool:
     return isinstance(x, SoapPerParamState)
 
 
-def _reshape_to_2d(x: Array) -> Array:
-    if x.ndim == 0:
-        return x.reshape(1, 1)
-    if x.ndim == 1:
-        # Bias / BN scale/bias -> treat as vector; SOAP will mark as too_big/use_soap=False
-        return x.reshape(1, -1)
-    if x.ndim == 2:
-        # Typical dense weights: (in_features, out_features)
-        return x
-    if x.ndim == 4:
-        # Conv kernels (Kh, Kw, Cin, Cout) -> rows=Cout, cols=Kh*Kw*Cin
-        kh, kw, cin, cout = x.shape
-        return jnp.reshape(x, (cout, kh * kw * cin))
-    # Fallback: flatten leading dim, keep rest in columns
-    return x.reshape(x.shape[0], -1)
+def _is_soap_matrix(p: Array) -> bool:
+    return (
+        p.ndim == 2
+        and p.shape[0] > 1
+        and p.shape[1] > 1
+        and p.shape[0] <= MAX_DIM
+        and p.shape[1] <= MAX_DIM
+    )
 
 
 def _init_per_param(p: Array) -> SoapPerParamState:
-    p2d = _reshape_to_2d(p)
-    rows, cols = p2d.shape
-    zeros = jnp.zeros_like(p2d)
+    p_arr = jnp.asarray(p)
+    m0 = jnp.zeros_like(p_arr)
+    v0 = jnp.zeros_like(p_arr)
 
-    too_big = (rows > MAX_DIM) or (cols > MAX_DIM)
-    if too_big:
-        one = jnp.eye(1, dtype=p.dtype)
+    if _is_soap_matrix(p_arr):
+        rows, cols = p_arr.shape
+        eye_rows = jnp.eye(rows, dtype=p_arr.dtype)
+        eye_cols = jnp.eye(cols, dtype=p_arr.dtype)
         return SoapPerParamState(
-            m=zeros,
-            v=zeros,
-            L=one,
-            R=one,
-            QL=one,
-            QR=one,
-            use_soap=False,
-        )
-    else:
-        eye_rows = jnp.eye(rows, dtype=p.dtype)
-        eye_cols = jnp.eye(cols, dtype=p.dtype)
-        return SoapPerParamState(
-            m=zeros,
-            v=zeros,
+            m=m0,
+            v=v0,
             L=eye_rows,
             R=eye_cols,
             QL=eye_rows,
             QR=eye_cols,
             use_soap=True,
         )
+
+    one = jnp.eye(1, dtype=p_arr.dtype)
+    return SoapPerParamState(
+        m=m0,
+        v=v0,
+        L=one,
+        R=one,
+        QL=one,
+        QR=one,
+        use_soap=False,
+    )
 
 
 def _kronecker_second_moments(g2d: Array) -> tuple[Array, Array]:
@@ -93,11 +89,15 @@ def scale_by_soap(
     b1: float = 0.9,
     b2: float = 0.95,
     eps: float = 1e-8,
+    weight_decay: float = 0.0,
     precondition_frequency: int = 10,
     shampoo_beta2: Optional[float] = None,
     log_skipped: bool = False,
-    k: int = 0
 ) -> optax.GradientTransformation:
+    """Muon-style routing:
+    - 2D matrices: SOAP
+    - everything else: AdamW
+    """
     shampoo_beta2 = b2 if shampoo_beta2 is None else shampoo_beta2
 
     def init_fn(params: PyTree) -> SoapState:
@@ -112,11 +112,8 @@ def scale_by_soap(
                 return s
 
             jtu.tree_map_with_path(record, per_param)
-            print(
-                f"SOAP: skipped {len(skipped)} params "
-                f"(too large/degenerate): {skipped}"
-            )
-            eigenvals = jnp.zeros()
+            print(f"SOAP: routed {len(skipped)} params to AdamW fallback: {skipped}")
+
         return SoapState(
             count=jnp.zeros([], dtype=jnp.int32),
             per_param=per_param,
@@ -127,7 +124,6 @@ def scale_by_soap(
         state: SoapState,
         params: Optional[PyTree] = None,
     ) -> tuple[PyTree, SoapState]:
-        del params
         count = state.count + jnp.array(1, dtype=jnp.int32)
 
         b1_t = jnp.power(b1, count.astype(jnp.float32))
@@ -138,107 +134,60 @@ def scale_by_soap(
         flat_grads, treedef = jtu.tree_flatten(grads)
         flat_states, treedef2 = jtu.tree_flatten(
             state.per_param,
-            is_leaf=_is_soap_state,  # keep SoapPerParamState as a leaf
+            is_leaf=_is_soap_state,
         )
         if treedef != treedef2:
             raise ValueError("SOAP state and grads PyTrees do not match structure.")
 
+        if params is None:
+            flat_params = [None] * len(flat_grads)
+        else:
+            flat_params, params_treedef = jtu.tree_flatten(params)
+            if params_treedef != treedef:
+                raise ValueError("SOAP params and grads PyTrees do not match structure.")
+
         flat_updates: list[Array] = []
         flat_new_states: list[SoapPerParamState] = []
 
-        for g, s in zip(flat_grads, flat_states):
-            # For robustness: treat non-array or None as zero update.
-            if g is None or not isinstance(g, jax.Array):
-                # Keeps structure but makes sure update is an array
-                g2d = s.m  # same 2D shape as this param’s state
-                zero = jnp.zeros_like(g2d)
-                flat_updates.append(zero.reshape(g2d.shape))
-                flat_new_states.append(s)
-                continue
-
-            g2d = _reshape_to_2d(g)
+        for g, p, s in zip(flat_grads, flat_params, flat_states):
             m, v, L, R, QL, QR, use_soap = s
+            g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
+            p_arr = None if p is None else jnp.asarray(p)
 
-            # If shapes drift (e.g., parameter resized), reinitialize per-param
-            # state to match the current gradient shape to avoid matmul errors.
-            shape_ok = (
-                g2d.shape == m.shape
-                and QL.shape[0] == g2d.shape[0]
-                and QR.shape[0] == g2d.shape[1]
-            )
-            if not shape_ok:
-                s = _init_per_param(g)
+            # Reinitialize if shape changed.
+            if g_arr.shape != m.shape:
+                reference = p_arr if p_arr is not None else g_arr
+                s = _init_per_param(reference)
                 m, v, L, R, QL, QR, use_soap = s
-                g2d = _reshape_to_2d(g)
+                g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
-            rows, cols = g2d.shape
+            if bool(use_soap):
+                # If a matrix param no longer looks valid for SOAP, fall back to AdamW.
+                if (g_arr.ndim != 2) or (
+                    QL.shape != (g_arr.shape[0], g_arr.shape[0])
+                ) or (QR.shape != (g_arr.shape[1], g_arr.shape[1])):
+                    use_soap = False
 
-            def adam_branch(_):
-                # -------- plain Adam fallback --------
+            if bool(use_soap):
+                g2d = g_arr
+                rows, cols = g2d.shape
+
                 m_new = (1.0 - b1) * g2d + b1 * m
-                v_new = (1.0 - b2) * (g2d * g2d) + b2 * v
-
-                m_hat = m_new / m_bc_den
-                v_hat = v_new / v_bc_den
-
-                n2d = m_hat / (jnp.sqrt(v_hat) + eps)
-                n = n2d.reshape(g.shape)
-
-                new_s = SoapPerParamState(
-                    m=m_new,
-                    v=v_new,
-                    L=L,
-                    R=R,
-                    QL=QL,
-                    QR=QR,
-                    use_soap=use_soap,
-                )
-
-                return n, new_s
-
-            # Hard skip SOAP for vectors or degenerate shapes; reshape won't fix those.
-            if (rows <= 1) or (cols <= 1):
-                n, new_s = adam_branch(None)
-                flat_updates.append(n)
-                flat_new_states.append(new_s)
-                continue
-
-            # Final guard: eigen factors must exactly match current g2d shape.
-            eig_shape_ok = (
-                QL.shape[0] == rows
-                and QL.shape[1] == rows
-                and QR.shape[0] == cols
-                and QR.shape[1] == cols
-            )
-            if not eig_shape_ok:
-                n, new_s = adam_branch(None)
-                flat_updates.append(n)
-                flat_new_states.append(new_s)
-                continue
-
-            use_soap_pred = jnp.asarray(use_soap, dtype=bool)
-
-            def soap_branch(_):
-                # -------- SOAP branch --------
-                m_new = (1.0 - b1) * g2d + b1 * m
-
                 g_rot = QL.T @ g2d @ QR
                 m_rot = QL.T @ m_new @ QR
-
                 v_new = (1.0 - b2) * (g_rot * g_rot) + b2 * v
 
                 m_hat = m_rot / m_bc_den
                 v_hat = v_new / v_bc_den
                 n_rot = m_hat / (jnp.sqrt(v_hat) + eps)
-
-                n2d = QL @ n_rot @ QR.T
+                n = QL @ n_rot @ QR.T
 
                 L_update, R_update = _kronecker_second_moments(g2d)
                 L_new = shampoo_beta2 * L + (1.0 - shampoo_beta2) * L_update
                 R_new = shampoo_beta2 * R + (1.0 - shampoo_beta2) * R_update
 
                 def recompute_eig(LRQLQR):
-                    L_in, R_in, QL_in, QR_in = LRQLQR
+                    L_in, R_in, _, _ = LRQLQR
                     L_sym = 0.5 * (L_in + L_in.T)
                     R_sym = 0.5 * (R_in + R_in.T)
                     _, QL_new = jnp.linalg.eigh(L_sym)
@@ -258,6 +207,9 @@ def scale_by_soap(
                     operand=(L_new, R_new, QL, QR),
                 )
 
+                if (p_arr is not None) and (weight_decay != 0.0):
+                    n = n + weight_decay * p_arr
+
                 new_s = SoapPerParamState(
                     m=m_new,
                     v=v_new,
@@ -265,29 +217,36 @@ def scale_by_soap(
                     R=R_fin,
                     QL=QL_fin,
                     QR=QR_fin,
-                    use_soap=use_soap,
+                    use_soap=True,
                 )
+                flat_updates.append(n)
+                flat_new_states.append(new_s)
+                continue
 
-                n = n2d.reshape(g.shape)
-                return n, new_s
+            # AdamW fallback for all non-2D (and invalid) parameters.
+            m_new = (1.0 - b1) * g_arr + b1 * m
+            v_new = (1.0 - b2) * (g_arr * g_arr) + b2 * v
+            m_hat = m_new / m_bc_den
+            v_hat = v_new / v_bc_den
+            n = m_hat / (jnp.sqrt(v_hat) + eps)
+            if (p_arr is not None) and (weight_decay != 0.0):
+                n = n + weight_decay * p_arr
 
-            n, new_s = jax.lax.cond(
-                use_soap_pred,
-                soap_branch,
-                adam_branch,
-                operand=None,
+            new_s = SoapPerParamState(
+                m=m_new,
+                v=v_new,
+                L=L,
+                R=R,
+                QL=QL,
+                QR=QR,
+                use_soap=False,
             )
             flat_updates.append(n)
             flat_new_states.append(new_s)
 
         updates = jtu.tree_unflatten(treedef, flat_updates)
         new_per_param = jtu.tree_unflatten(treedef, flat_new_states)
-
-        new_state = SoapState(
-            count=count,
-            per_param=new_per_param,
-        )
-        return updates, new_state
+        return updates, SoapState(count=count, per_param=new_per_param)
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -297,19 +256,17 @@ def soap(
     b1: float = 0.9,
     b2: float = 0.95,
     eps: float = 1e-8,
-    weight_decay: float = 0.0,  # unused in this minimal version
+    weight_decay: float = 0.0,
     precondition_frequency: int = 10,
     shampoo_beta2: Optional[float] = None,
     log_skipped: bool = False,
 ) -> optax.GradientTransformation:
-    """SOAP optimizer as an Optax alias (without decoupled weight decay)."""
-    del weight_decay  # simplify for now; add back once Optax is patched
-
     return optax.chain(
         scale_by_soap(
             b1=b1,
             b2=b2,
             eps=eps,
+            weight_decay=weight_decay,
             precondition_frequency=precondition_frequency,
             shampoo_beta2=shampoo_beta2,
             log_skipped=log_skipped,
