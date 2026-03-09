@@ -1,0 +1,55 @@
+# sweep.yaml
+program: train_lm.py
+method: bayes
+metric:
+  name: eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/lm_adam.yaml
+
+parameters:
+  # Use names that match keys in the base config YAML.
+  lr:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 3e-2
+  
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.30
+
+  beta1:
+    distribution: uniform
+    min: 0.85
+    max: 0.95
+
+  beta2:
+    distribution: uniform
+    min: 0.90
+    max: 0.995
+
+  eps:
+    distribution: log_uniform_values
+    min: 1.0e-10
+    max: 1.0e-6
+
+  precondition_frequency:
+    values: [32]
+
+  shampoo_beta2:
+    distribution: uniform
+    min: 0.90
+    max: 0.999
+
+  soap_log_skipped:
+    values: [false]
+
+  
+
+run_cap: 20

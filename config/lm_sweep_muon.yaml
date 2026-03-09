@@ -1,0 +1,47 @@
+# sweep.yaml
+program: train_lm.py
+method: bayes
+metric:
+  name: eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/lm_muon.yaml
+
+parameters:
+  # Use names that match keys in the base config YAML.
+  lr:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 3e-2
+  
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.30
+
+  beta1:
+    distribution: uniform
+    min: 0.85
+    max: 0.95
+
+  beta2:
+    distribution: uniform
+    min: 0.92
+    max: 0.995
+
+  muon_beta:
+    distribution: uniform
+    min: 0.85
+    max: 0.99
+
+
+  muon_nesterov:
+    values: [true, false]
+
+
+run_cap: 20
