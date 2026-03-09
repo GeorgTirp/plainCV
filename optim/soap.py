@@ -55,6 +55,17 @@ def _init_per_param(p: Array) -> SoapPerParamState:
     m0 = jnp.zeros_like(p_arr)
     v0 = jnp.zeros_like(p_arr)
 
+    if p_arr.ndim == 2 and not _is_soap_matrix(p_arr):
+        rows, cols = p_arr.shape
+        if rows <= 1 or cols <= 1:
+            raise ValueError(
+                f"SOAP requires non-degenerate 2D matrices, got shape={p_arr.shape}."
+            )
+        raise ValueError(
+            f"SOAP matrix shape={p_arr.shape} exceeds MAX_DIM={MAX_DIM}. "
+            "Increase MAX_DIM or route this parameter away from SOAP."
+        )
+
     if _is_soap_matrix(p_arr):
         rows, cols = p_arr.shape
         eye_rows = jnp.eye(rows, dtype=p_arr.dtype)
@@ -161,12 +172,20 @@ def scale_by_soap(
                 m, v, L, R, QL, QR, use_soap = s
                 g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
+            if g_arr.ndim == 2 and not bool(use_soap):
+                raise ValueError(
+                    "SOAP 2D matrix leaf entered AdamW fallback path. "
+                    "2D matrices must use SOAP updates."
+                )
+
             if bool(use_soap):
-                # If a matrix param no longer looks valid for SOAP, fall back to AdamW.
                 if (g_arr.ndim != 2) or (
                     QL.shape != (g_arr.shape[0], g_arr.shape[0])
                 ) or (QR.shape != (g_arr.shape[1], g_arr.shape[1])):
-                    use_soap = False
+                    raise ValueError(
+                        "SOAP state mismatch for a 2D matrix leaf: "
+                        f"grad_shape={g_arr.shape}, QL_shape={QL.shape}, QR_shape={QR.shape}."
+                    )
 
             if bool(use_soap):
                 g2d = g_arr
@@ -223,7 +242,7 @@ def scale_by_soap(
                 flat_new_states.append(new_s)
                 continue
 
-            # AdamW fallback for all non-2D (and invalid) parameters.
+            # AdamW fallback for non-2D parameters.
             m_new = (1.0 - b1) * g_arr + b1 * m
             v_new = (1.0 - b2) * (g_arr * g_arr) + b2 * v
             m_hat = m_new / m_bc_den

@@ -67,6 +67,17 @@ def scale_by_shampoo(
         m0 = jnp.zeros_like(p_arr)
         v0 = jnp.zeros_like(p_arr)
 
+        if p_arr.ndim == 2 and not _is_shampoo_matrix(p_arr, max_dim=max_dim):
+            rows, cols = p_arr.shape
+            if rows <= 1 or cols <= 1:
+                raise ValueError(
+                    f"Shampoo requires non-degenerate 2D matrices, got shape={p_arr.shape}."
+                )
+            raise ValueError(
+                f"Shampoo matrix shape={p_arr.shape} exceeds max_dim={max_dim}. "
+                "Increase shampoo_max_dim or route this parameter away from Shampoo."
+            )
+
         if _is_shampoo_matrix(p_arr, max_dim=max_dim):
             rows, cols = p_arr.shape
             L0 = shampoo_eps * jnp.eye(rows, dtype=p_arr.dtype)
@@ -136,11 +147,20 @@ def scale_by_shampoo(
                 m, v, L, R, use_shampoo = s
                 g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
+            if g_arr.ndim == 2 and not bool(use_shampoo):
+                raise ValueError(
+                    "Shampoo 2D matrix leaf entered fallback path. "
+                    "2D matrices must use Shampoo updates."
+                )
+
             if bool(use_shampoo):
                 if (g_arr.ndim != 2) or (L.shape != (g_arr.shape[0], g_arr.shape[0])) or (
                     R.shape != (g_arr.shape[1], g_arr.shape[1])
                 ):
-                    use_shampoo = False
+                    raise ValueError(
+                        "Shampoo state mismatch for a 2D matrix leaf: "
+                        f"grad_shape={g_arr.shape}, L_shape={L.shape}, R_shape={R.shape}."
+                    )
 
             if bool(use_shampoo):
                 g2d = g_arr
@@ -179,7 +199,7 @@ def scale_by_shampoo(
                 continue
 
             if fallback_to_adamw:
-                # AdamW fallback for all non-2D (and invalid) parameters.
+                # AdamW fallback for non-2D parameters.
                 m_new = (1.0 - adam_b1) * g_arr + adam_b1 * m
                 v_new = (1.0 - adam_b2) * (g_arr * g_arr) + adam_b2 * v
                 m_hat = m_new / m_bc_den
