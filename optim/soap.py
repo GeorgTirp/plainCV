@@ -10,8 +10,7 @@ import optax
 Array = jax.Array
 PyTree = Any
 
-# Only run full SOAP on reasonably-sized 2D matrices.
-MAX_DIM = 2048
+# Only run full SOAP on non-degenerate 2D matrices.
 
 
 class SoapPerParamState(NamedTuple):
@@ -45,8 +44,6 @@ def _is_soap_matrix(p: Array) -> bool:
         p.ndim == 2
         and p.shape[0] > 1
         and p.shape[1] > 1
-        and p.shape[0] <= MAX_DIM
-        and p.shape[1] <= MAX_DIM
     )
 
 
@@ -61,10 +58,6 @@ def _init_per_param(p: Array) -> SoapPerParamState:
             raise ValueError(
                 f"SOAP requires non-degenerate 2D matrices, got shape={p_arr.shape}."
             )
-        raise ValueError(
-            f"SOAP matrix shape={p_arr.shape} exceeds MAX_DIM={MAX_DIM}. "
-            "Increase MAX_DIM or route this parameter away from SOAP."
-        )
 
     if _is_soap_matrix(p_arr):
         rows, cols = p_arr.shape

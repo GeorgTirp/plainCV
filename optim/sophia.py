@@ -194,7 +194,6 @@ def sophia_shampoo(
     hessian_update_every: int = 10,
     # Shampoo-specific knobs
     shampoo_eps: float = 1e-4,
-    shampoo_max_dim: int = 2048,
     shampoo_exponent: float = 0.25,
 ) -> optax.GradientTransformation:
     """
@@ -217,7 +216,6 @@ def sophia_shampoo(
     shampoo_tx = scale_by_shampoo(
         shampoo_eps=shampoo_eps,
         fallback_to_adamw=False,
-        max_dim=shampoo_max_dim,
         exponent=shampoo_exponent,
     )
 

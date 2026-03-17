@@ -10,8 +10,7 @@ import optax
 Array = jax.Array
 PyTree = Any
 
-# Only run full Shampoo on reasonably-sized 2D matrices.
-MAX_DIM = 2048
+# Only run full Shampoo on non-degenerate 2D matrices.
 
 
 class ShampooPerParamState(NamedTuple):
@@ -37,13 +36,11 @@ def _is_shampoo_state(x: Any) -> bool:
     return isinstance(x, ShampooPerParamState)
 
 
-def _is_shampoo_matrix(p: Array, *, max_dim: int) -> bool:
+def _is_shampoo_matrix(p: Array) -> bool:
     return (
         p.ndim == 2
         and p.shape[0] > 1
         and p.shape[1] > 1
-        and p.shape[0] <= max_dim
-        and p.shape[1] <= max_dim
     )
 
 
@@ -54,7 +51,6 @@ def scale_by_shampoo(
     adam_b2: float = 0.999,
     adam_eps: float = 1e-8,
     fallback_to_adamw: bool = True,
-    max_dim: int = MAX_DIM,
     exponent: float = 0.25,
 ) -> optax.GradientTransformation:
     """Muon-style routing:
@@ -67,18 +63,14 @@ def scale_by_shampoo(
         m0 = jnp.zeros_like(p_arr)
         v0 = jnp.zeros_like(p_arr)
 
-        if p_arr.ndim == 2 and not _is_shampoo_matrix(p_arr, max_dim=max_dim):
+        if p_arr.ndim == 2 and not _is_shampoo_matrix(p_arr):
             rows, cols = p_arr.shape
             if rows <= 1 or cols <= 1:
                 raise ValueError(
                     f"Shampoo requires non-degenerate 2D matrices, got shape={p_arr.shape}."
                 )
-            raise ValueError(
-                f"Shampoo matrix shape={p_arr.shape} exceeds max_dim={max_dim}. "
-                "Increase shampoo_max_dim or route this parameter away from Shampoo."
-            )
 
-        if _is_shampoo_matrix(p_arr, max_dim=max_dim):
+        if _is_shampoo_matrix(p_arr):
             rows, cols = p_arr.shape
             L0 = shampoo_eps * jnp.eye(rows, dtype=p_arr.dtype)
             R0 = shampoo_eps * jnp.eye(cols, dtype=p_arr.dtype)
@@ -238,7 +230,6 @@ def scale_by_shampoo(
 def shampoo(
     learning_rate: float,
     eps: float = 1e-4,
-    max_dim: int = MAX_DIM,
     exponent: float = 0.25,
     weight_decay: float = 0.0,
     adam_b1: float = 0.9,
@@ -256,7 +247,6 @@ def shampoo(
             adam_b1=adam_b1,
             adam_b2=adam_b2,
             adam_eps=adam_eps,
-            max_dim=max_dim,
             exponent=exponent,
         ),
         optax.scale_by_learning_rate(learning_rate),

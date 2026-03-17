@@ -643,13 +643,11 @@ def get_optimizer(
         beta1 = getattr(cfg, "beta1", 0.9)
         beta2 = getattr(cfg, "beta2", 0.999)
         adam_eps = getattr(cfg, "adam_eps", 1e-8)
-        max_dim = getattr(cfg, "shampoo_max_dim", 2048)
         exponent = getattr(cfg, "shampoo_exponent", 0.25)
 
         tx = shampoo_opt(
             learning_rate=lr,
             eps=eps,
-            max_dim=max_dim,
             exponent=exponent,
             weight_decay=weight_decay,
             adam_b1=beta1,
@@ -736,7 +734,6 @@ def get_optimizer(
             )
         else:  # "sophia_shampoo"
             shampoo_eps = getattr(cfg, "shampoo_eps", 1e-4)
-            shampoo_max_dim = getattr(cfg, "shampoo_max_dim", 2048)
             shampoo_exponent = getattr(cfg, "shampoo_exponent", 0.25)
 
             tx = sophia_shampoo_opt(
@@ -749,7 +746,6 @@ def get_optimizer(
                 eps=eps,
                 hessian_update_every=hessian_update_every,
                 shampoo_eps=shampoo_eps,
-                shampoo_max_dim=shampoo_max_dim,
                 shampoo_exponent=shampoo_exponent,
             )
 
