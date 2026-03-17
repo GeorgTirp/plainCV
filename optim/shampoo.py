@@ -44,6 +44,40 @@ def _is_shampoo_matrix(p: Array) -> bool:
     )
 
 
+def _path_to_name(path) -> str:
+    parts = []
+    for key in path:
+        if hasattr(key, "key"):
+            parts.append(str(key.key))
+        elif hasattr(key, "name"):
+            parts.append(str(key.name))
+        elif hasattr(key, "idx"):
+            parts.append(str(key.idx))
+        else:
+            parts.append(str(key))
+    return "/".join(parts)
+
+
+def _should_use_shampoo(path, p: Array) -> bool:
+    p_arr = jnp.asarray(p)
+    if not _is_shampoo_matrix(p_arr):
+        return False
+
+    name = _path_to_name(path).lower()
+    leaf = name.split("/")[-1] if name else ""
+    if leaf != "kernel":
+        return False
+    if ("embed" in name) or ("embedding" in name) or ("lm_head" in name):
+        return False
+    if ("norm" in name) or (leaf in {"bias", "scale"}):
+        return False
+    return True
+
+
+def _has_shampoo_preconditioner_state(L: Array, R: Array) -> bool:
+    return (L.shape[0] > 1) and (R.shape[0] > 1)
+
+
 def scale_by_shampoo(
     shampoo_eps: float = 1e-4,
     weight_decay: float = 0.0,
@@ -58,7 +92,7 @@ def scale_by_shampoo(
     - everything else: AdamW (or identity if `fallback_to_adamw=False`)
     """
 
-    def init_per_param(p: Array) -> ShampooPerParamState:
+    def init_per_param(p: Array, *, use_shampoo: bool) -> ShampooPerParamState:
         p_arr = jnp.asarray(p)
         m0 = jnp.zeros_like(p_arr)
         v0 = jnp.zeros_like(p_arr)
@@ -70,7 +104,7 @@ def scale_by_shampoo(
                     f"Shampoo requires non-degenerate 2D matrices, got shape={p_arr.shape}."
                 )
 
-        if _is_shampoo_matrix(p_arr):
+        if _is_shampoo_matrix(p_arr) and use_shampoo:
             rows, cols = p_arr.shape
             L0 = shampoo_eps * jnp.eye(rows, dtype=p_arr.dtype)
             R0 = shampoo_eps * jnp.eye(cols, dtype=p_arr.dtype)
@@ -92,7 +126,13 @@ def scale_by_shampoo(
         )
 
     def init_fn(params: PyTree) -> ShampooState:
-        per_param = jtu.tree_map(init_per_param, params)
+        per_param = jtu.tree_map_with_path(
+            lambda path, p: init_per_param(
+                p,
+                use_shampoo=_should_use_shampoo(path, p),
+            ),
+            params,
+        )
         return ShampooState(
             count=jnp.zeros([], dtype=jnp.int32),
             per_param=per_param,
@@ -135,13 +175,16 @@ def scale_by_shampoo(
             # Reinitialize if shape changed.
             if g_arr.shape != m.shape:
                 reference = p_arr if p_arr is not None else g_arr
-                s = init_per_param(reference)
+                s = init_per_param(
+                    reference,
+                    use_shampoo=_has_shampoo_preconditioner_state(L, R),
+                )
                 m, v, L, R, _ = s
                 g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
             # Use static rank routing to avoid Python bool conversion on traced
             # optimizer-state flags inside jit.
-            if g_arr.ndim == 2:
+            if g_arr.ndim == 2 and _has_shampoo_preconditioner_state(L, R):
                 if (L.shape != (g_arr.shape[0], g_arr.shape[0])) or (
                     R.shape != (g_arr.shape[1], g_arr.shape[1])
                 ):

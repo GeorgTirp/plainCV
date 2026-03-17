@@ -47,7 +47,41 @@ def _is_soap_matrix(p: Array) -> bool:
     )
 
 
-def _init_per_param(p: Array) -> SoapPerParamState:
+def _path_to_name(path) -> str:
+    parts = []
+    for key in path:
+        if hasattr(key, "key"):
+            parts.append(str(key.key))
+        elif hasattr(key, "name"):
+            parts.append(str(key.name))
+        elif hasattr(key, "idx"):
+            parts.append(str(key.idx))
+        else:
+            parts.append(str(key))
+    return "/".join(parts)
+
+
+def _should_use_soap(path, p: Array) -> bool:
+    p_arr = jnp.asarray(p)
+    if not _is_soap_matrix(p_arr):
+        return False
+
+    name = _path_to_name(path).lower()
+    leaf = name.split("/")[-1] if name else ""
+    if leaf != "kernel":
+        return False
+    if ("embed" in name) or ("embedding" in name) or ("lm_head" in name):
+        return False
+    if ("norm" in name) or (leaf in {"bias", "scale"}):
+        return False
+    return True
+
+
+def _has_soap_preconditioner_state(L: Array, R: Array, QL: Array, QR: Array) -> bool:
+    return (L.shape[0] > 1) and (R.shape[0] > 1) and (QL.shape[0] > 1) and (QR.shape[0] > 1)
+
+
+def _init_per_param(p: Array, *, use_soap: bool) -> SoapPerParamState:
     p_arr = jnp.asarray(p)
     m0 = jnp.zeros_like(p_arr)
     v0 = jnp.zeros_like(p_arr)
@@ -59,7 +93,7 @@ def _init_per_param(p: Array) -> SoapPerParamState:
                 f"SOAP requires non-degenerate 2D matrices, got shape={p_arr.shape}."
             )
 
-    if _is_soap_matrix(p_arr):
+    if _is_soap_matrix(p_arr) and use_soap:
         rows, cols = p_arr.shape
         eye_rows = jnp.eye(rows, dtype=p_arr.dtype)
         eye_cols = jnp.eye(cols, dtype=p_arr.dtype)
@@ -105,13 +139,19 @@ def scale_by_soap(
     shampoo_beta2 = b2 if shampoo_beta2 is None else shampoo_beta2
 
     def init_fn(params: PyTree) -> SoapState:
-        per_param = jtu.tree_map(_init_per_param, params)
+        per_param = jtu.tree_map_with_path(
+            lambda path, p: _init_per_param(
+                p,
+                use_soap=_should_use_soap(path, p),
+            ),
+            params,
+        )
         if log_skipped:
             skipped = []
 
             def record(path, s):
                 if isinstance(s, SoapPerParamState) and (not bool(s.use_soap)):
-                    name = "/".join(str(k) for k in path)
+                    name = _path_to_name(path)
                     skipped.append(name)
                 return s
 
@@ -161,13 +201,16 @@ def scale_by_soap(
             # Reinitialize if shape changed.
             if g_arr.shape != m.shape:
                 reference = p_arr if p_arr is not None else g_arr
-                s = _init_per_param(reference)
+                s = _init_per_param(
+                    reference,
+                    use_soap=_has_soap_preconditioner_state(L, R, QL, QR),
+                )
                 m, v, L, R, QL, QR, _ = s
                 g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
             # Use static rank routing to avoid Python bool conversion on traced
             # optimizer-state flags inside jit.
-            if g_arr.ndim == 2:
+            if g_arr.ndim == 2 and _has_soap_preconditioner_state(L, R, QL, QR):
                 if (QL.shape != (g_arr.shape[0], g_arr.shape[0])) or (
                     QR.shape != (g_arr.shape[1], g_arr.shape[1])
                 ):
