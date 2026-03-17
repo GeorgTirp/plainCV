@@ -404,6 +404,29 @@ def _unwrap_replicated(x, use_pmap: bool):
     return flax_jax_utils.unreplicate(x)
 
 
+def _probe_pmap_collectives(n_devices: int) -> tuple[bool, Optional[str]]:
+    """Return whether pmap collectives are usable on this host.
+
+    Some cluster setups expose multiple GPUs but lack a usable NCCL runtime.
+    In that case, pmap + psum/pmean fails at runtime. We probe once and
+    gracefully fall back to single-device execution if needed.
+    """
+    if n_devices <= 1:
+        return False, None
+
+    try:
+        test = jnp.arange(n_devices, dtype=jnp.float32)
+
+        @partial(jax.pmap, axis_name="data")
+        def _psum(x):
+            return jax.lax.psum(x, axis_name="data")
+
+        _ = jax.device_get(_psum(test))
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 def run(cfg):
     if cfg.model != "transformer" and not str(cfg.model).startswith("pythia"):
         raise ValueError(f"LM training expects model='transformer' or 'pythia*', got {cfg.model}.")
@@ -415,12 +438,37 @@ def run(cfg):
         wb_run.define_metric("eval_loss", summary="min")
 
     use_doc_mask = bool(getattr(cfg, "intra_doc_masking", False))
-    n_devices = jax.local_device_count()
-    use_pmap = n_devices > 1
+    n_local_devices = jax.local_device_count()
+    requested_use_pmap = getattr(cfg, "use_pmap", None)
+    force_single_device = bool(getattr(cfg, "force_single_device", False))
+
+    if requested_use_pmap is None:
+        use_pmap = n_local_devices > 1 and not force_single_device
+    else:
+        use_pmap = bool(requested_use_pmap) and n_local_devices > 1 and not force_single_device
+
+    if use_pmap:
+        pmap_ok, pmap_err = _probe_pmap_collectives(n_local_devices)
+        if not pmap_ok:
+            print(
+                "Disabling pmap and falling back to single-device training because "
+                f"multi-device collectives are unavailable (likely NCCL issue): {pmap_err}"
+            )
+            use_pmap = False
+
+    n_devices = n_local_devices if use_pmap else 1
     grouped_batches = n_devices if use_pmap else 1
 
     if use_pmap:
         print(f"Using pmap over {n_devices} local devices.")
+    else:
+        if n_local_devices > 1:
+            print(
+                f"Using single-device mode on 1/{n_local_devices} visible devices "
+                "(pmap disabled)."
+            )
+        else:
+            print("Using single-device mode.")
 
     maybe_make_dir(cfg)
 
@@ -531,6 +579,13 @@ def run(cfg):
     eval_every = getattr(cfg, "eval_every_steps", None)
     eval_every = int(eval_every) if eval_every is not None else None
     grad_clip = getattr(cfg, "grad_clip", None)
+    world_size = int(jax.process_count()) * int(n_devices)
+    tokens_per_step = (
+        int(cfg.seq_len)
+        * int(cfg.micro_batch_size)
+        * grad_accum_steps
+        * world_size
+    )
     apply_grads = _make_apply_grads_fn(grad_clip, use_pmap=use_pmap)
 
     train_iter = iter(trainloader)
@@ -588,8 +643,10 @@ def run(cfg):
             acc_val = float(
                 jax.device_get(_unwrap_replicated(acc_accum / grad_accum_steps, use_pmap))
             )
+            tokens_seen = int(global_step * tokens_per_step)
             metrics = {
                 "step": global_step,
+                "tokens_seen": tokens_seen,
                 "train_loss": loss_val,
                 "train_acc": acc_val,
                 "train_ppl": float(jnp.exp(loss_val)),
@@ -617,8 +674,10 @@ def run(cfg):
                 n_batches += 1
             eval_loss = float(jax.device_get(eval_loss / max(1, n_batches)))
             eval_acc = float(jax.device_get(eval_acc / max(1, n_batches)))
+            tokens_seen = int(global_step * tokens_per_step)
             metrics = {
                 "step": global_step,
+                "tokens_seen": tokens_seen,
                 "eval_loss": eval_loss,
                 "eval_acc": eval_acc,
                 "eval_ppl": float(jnp.exp(eval_loss)),

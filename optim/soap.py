@@ -161,7 +161,7 @@ def scale_by_soap(
         flat_new_states: list[SoapPerParamState] = []
 
         for g, p, s in zip(flat_grads, flat_params, flat_states):
-            m, v, L, R, QL, QR, use_soap = s
+            m, v, L, R, QL, QR, _ = s
             g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
             p_arr = None if p is None else jnp.asarray(p)
 
@@ -169,25 +169,20 @@ def scale_by_soap(
             if g_arr.shape != m.shape:
                 reference = p_arr if p_arr is not None else g_arr
                 s = _init_per_param(reference)
-                m, v, L, R, QL, QR, use_soap = s
+                m, v, L, R, QL, QR, _ = s
                 g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
-            if g_arr.ndim == 2 and not bool(use_soap):
-                raise ValueError(
-                    "SOAP 2D matrix leaf entered AdamW fallback path. "
-                    "2D matrices must use SOAP updates."
-                )
-
-            if bool(use_soap):
-                if (g_arr.ndim != 2) or (
-                    QL.shape != (g_arr.shape[0], g_arr.shape[0])
-                ) or (QR.shape != (g_arr.shape[1], g_arr.shape[1])):
+            # Use static rank routing to avoid Python bool conversion on traced
+            # optimizer-state flags inside jit.
+            if g_arr.ndim == 2:
+                if (QL.shape != (g_arr.shape[0], g_arr.shape[0])) or (
+                    QR.shape != (g_arr.shape[1], g_arr.shape[1])
+                ):
                     raise ValueError(
                         "SOAP state mismatch for a 2D matrix leaf: "
                         f"grad_shape={g_arr.shape}, QL_shape={QL.shape}, QR_shape={QR.shape}."
                     )
 
-            if bool(use_soap):
                 g2d = g_arr
                 rows, cols = g2d.shape
 

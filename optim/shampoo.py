@@ -136,7 +136,7 @@ def scale_by_shampoo(
         flat_new_states: list[ShampooPerParamState] = []
 
         for g, p, s in zip(flat_grads, flat_params, flat_states):
-            m, v, L, R, use_shampoo = s
+            m, v, L, R, _ = s
             g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
             p_arr = None if p is None else jnp.asarray(p)
 
@@ -144,17 +144,13 @@ def scale_by_shampoo(
             if g_arr.shape != m.shape:
                 reference = p_arr if p_arr is not None else g_arr
                 s = init_per_param(reference)
-                m, v, L, R, use_shampoo = s
+                m, v, L, R, _ = s
                 g_arr = jnp.zeros_like(m) if g is None else jnp.asarray(g)
 
-            if g_arr.ndim == 2 and not bool(use_shampoo):
-                raise ValueError(
-                    "Shampoo 2D matrix leaf entered fallback path. "
-                    "2D matrices must use Shampoo updates."
-                )
-
-            if bool(use_shampoo):
-                if (g_arr.ndim != 2) or (L.shape != (g_arr.shape[0], g_arr.shape[0])) or (
+            # Use static rank routing to avoid Python bool conversion on traced
+            # optimizer-state flags inside jit.
+            if g_arr.ndim == 2:
+                if (L.shape != (g_arr.shape[0], g_arr.shape[0])) or (
                     R.shape != (g_arr.shape[1], g_arr.shape[1])
                 ):
                     raise ValueError(
@@ -162,7 +158,6 @@ def scale_by_shampoo(
                         f"grad_shape={g_arr.shape}, L_shape={L.shape}, R_shape={R.shape}."
                     )
 
-            if bool(use_shampoo):
                 g2d = g_arr
                 rows, cols = g2d.shape
 
