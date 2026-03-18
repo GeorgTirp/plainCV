@@ -4,6 +4,7 @@ import shutil
 import re
 import yaml
 import csv
+from datetime import datetime
 from typing import Sequence
 import jax
 try:
@@ -19,6 +20,11 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 FLAGS = flags.FLAGS
 
@@ -151,6 +157,40 @@ def _wandb_cfg_to_dict(wb_cfg):
     return dict(wb_cfg)
 
 
+def _next_wandb_run_index(counter_path: str) -> int:
+    """Allocate a monotonically increasing run index persisted on disk."""
+    counter_dir = os.path.dirname(counter_path)
+    if counter_dir:
+        os.makedirs(counter_dir, exist_ok=True)
+
+    with open(counter_path, "a+", encoding="utf-8") as counter_file:
+        if fcntl is not None:
+            fcntl.flock(counter_file.fileno(), fcntl.LOCK_EX)
+
+        try:
+            counter_file.seek(0)
+            raw = counter_file.read().strip()
+            try:
+                current = int(raw)
+            except (TypeError, ValueError):
+                current = 0
+            next_index = current + 1
+
+            counter_file.seek(0)
+            counter_file.truncate()
+            counter_file.write(str(next_index))
+            counter_file.flush()
+            try:
+                os.fsync(counter_file.fileno())
+            except OSError:
+                pass
+        finally:
+            if fcntl is not None:
+                fcntl.flock(counter_file.fileno(), fcntl.LOCK_UN)
+
+    return next_index
+
+
 def init_wandb(cfg):
     """
     Optionally initialize a Weights & Biases run.
@@ -167,26 +207,68 @@ def init_wandb(cfg):
         return
 
     use_wandb = getattr(cfg, "use_wandb", False)
-    sweep_active = os.environ.get("WANDB_SWEEP_ID") is not None
+    sweep_id = os.environ.get("WANDB_SWEEP_ID")
+    sweep_active = sweep_id is not None
     if not use_wandb and not sweep_active:
         return
 
     os.environ["WANDB__SERVICE_WAIT"] = "600"
     os.environ["WANDB_SILENT"] = "true"
 
-    project = getattr(cfg, "wandb_project", "plainCV")
-    run_name = getattr(cfg, "wandb_run_name", getattr(cfg, "exp_name", "run"))
-    wandb_dir = getattr(cfg, "wandb_dir", "./wandb")
+    # During sweeps, prefer agent-provided routing metadata.
+    project = os.environ.get("WANDB_PROJECT", getattr(cfg, "wandb_project", "plainCV"))
+    entity = os.environ.get("WANDB_ENTITY", getattr(cfg, "wandb_entity", None))
+    run_name_base = getattr(cfg, "wandb_run_name", getattr(cfg, "exp_name", "run"))
+    wandb_dir = os.path.abspath(getattr(cfg, "wandb_dir", "./wandb"))
+    exp_dir = os.path.abspath(get_exp_dir_path(cfg))
+    local_config_path = os.path.join(exp_dir, "config.yaml")
+
+    run_name = run_name_base
+    run_index = None
+    if run_name and not sweep_active and bool(getattr(cfg, "wandb_unique_names", True)):
+        run_index = _next_wandb_run_index(os.path.join(wandb_dir, ".run_counter"))
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_name = f"{run_index:05d}_{timestamp}_{run_name_base}"
+
+    cfg["local_exp_dir"] = exp_dir
+    cfg["local_config_path"] = local_config_path
+    cfg["wandb_run_name_base"] = run_name_base
+    if run_index is not None:
+        cfg["wandb_run_index"] = run_index
+    cfg["wandb_run_name_resolved"] = run_name
 
     if wandb.run is None:
-        run = wandb.init(
-            project=project,
-            name=run_name,
-            dir=wandb_dir,
-            config=cfg._asdict(),
-        )
+        init_kwargs = {
+            "project": project,
+            "dir": wandb_dir,
+            "config": cfg._asdict(),
+        }
+        if entity:
+            init_kwargs["entity"] = entity
+        # Let W&B agent name sweep runs unless this is a regular run.
+        if run_name and not sweep_active:
+            init_kwargs["name"] = run_name
+
+        try:
+            run = wandb.init(**init_kwargs)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if sweep_active and "sweep" in msg and "not found" in msg:
+                raise RuntimeError(
+                    f"W&B sweep '{sweep_id}' not found for project='{project}'"
+                    + (f", entity='{entity}'" if entity else "")
+                    + ". Ensure the agent was started with the full path "
+                      "'entity/project/sweep_id' and that the sweep still exists."
+                ) from exc
+            raise
     else:
         run = wandb.run
+
+    if run is not None:
+        run.summary["local_exp_dir"] = exp_dir
+        run.summary["local_config_path"] = local_config_path
+        if run_index is not None:
+            run.summary["wandb_run_index"] = run_index
 
     for key, value in _wandb_cfg_to_dict(run.config).items():
         if key.startswith("_"):
