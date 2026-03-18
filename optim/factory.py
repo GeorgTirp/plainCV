@@ -22,6 +22,7 @@ from .ggn_utils import (
 from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
 from .shampoo import shampoo as shampoo_opt
+from .signum import signum as signum_opt
 from .sophia import sophia as sophia_opt
 from .sophia import sophia_shampoo as sophia_shampoo_opt
 from .lanzos_hybrid import pns_eigen_hybrid
@@ -200,6 +201,20 @@ def get_optimizer(
             b1=beta1,
             b2=beta2,
             eps=eps,
+            weight_decay=weight_decay,
+        )
+
+    # ------------------------
+    # Signum (signSGD + momentum)
+    # ------------------------
+    elif name in {"signum", "sign_sgd", "sign-sgd", "signsgd"}:
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        momentum = getattr(cfg, "signum_momentum", getattr(cfg, "beta1", 0.9))
+        nesterov = getattr(cfg, "signum_nesterov", False)
+        tx = signum_opt(
+            learning_rate=lr,
+            momentum=momentum,
+            nesterov=nesterov,
             weight_decay=weight_decay,
         )
 
