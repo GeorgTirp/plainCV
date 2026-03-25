@@ -630,13 +630,14 @@ def get_optimizer(
     # SOAP
     # ------------------------
     elif name == "soap":
-        weight_decay = getattr(cfg, "weight_decay", 0.0)
-        beta1 = getattr(cfg, "beta1", 0.9)
+        weight_decay = getattr(cfg, "weight_decay", 0.01)
+        beta1 = getattr(cfg, "beta1", 0.95)
         beta2 = getattr(cfg, "beta2", 0.95)
         eps = getattr(cfg, "eps", 1e-8)
         precond_freq = getattr(cfg, "precondition_frequency", 10)
         shampoo_beta2 = getattr(cfg, "shampoo_beta2", None)
         log_skipped = getattr(cfg, "soap_log_skipped", False)
+        correct_bias = getattr(cfg, "correct_bias", True)
 
         tx = soap_opt(
             learning_rate=lr,
@@ -647,6 +648,7 @@ def get_optimizer(
             precondition_frequency=precond_freq,
             shampoo_beta2=shampoo_beta2,
             log_skipped=log_skipped,
+            correct_bias=correct_bias,
         )
 
      # ------------------------
