@@ -441,7 +441,7 @@ def get_optimizer(
     elif name == "muon":
         # Shared / legacy config fields
         weight_decay = getattr(cfg, "weight_decay", 0.0)
-        beta1 = getattr(cfg, "beta1", 0.9)   # Adam part (non-2D params)
+        beta1 = getattr(cfg, "beta1", 0.9)   # Adam part (non-routed params)
         beta2 = getattr(cfg, "beta2", 0.999)
         eps = getattr(cfg, "eps", 1e-8)
 
@@ -473,12 +473,12 @@ def get_optimizer(
             mu_dtype=None,
             nesterov=nesterov,
             adaptive=adaptive,
-            # Adam part for non-2D params:
+            # Adam part for non-routed params:
             adam_b1=beta1,
             adam_b2=beta2,
             adam_eps_root=adam_eps_root,
             adam_weight_decay=weight_decay,
-            # Default: Muon only on 2D params
+            # Routing is handled by build_muon_dim_numbers (shared with SOAP).
             muon_weight_dimension_numbers=dim_fn,
             # consistent_rms=consistent_rms,
         )

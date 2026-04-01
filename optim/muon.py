@@ -8,6 +8,8 @@ from typing import Any, Optional
 import optax
 import jax.tree_util as jtu
 
+from .matrix_routing import should_use_matrix_preconditioner
+
 @dataclass
 class MuonConfig:
     """Hyperparameters for the Muon optimizer.
@@ -34,7 +36,7 @@ class MuonConfig:
     nesterov: bool = True
     adaptive: bool = False          # see Optax docs (dual-norm scaling)
 
-    # AdamW part (used for non-2D params)
+    # AdamW part (used for all non-routed params)
     adam_b1: float = 0.9
     adam_b2: float = 0.999
     adam_eps_root: float = 0.0
@@ -89,7 +91,7 @@ def build_muon_tx_from_cfg(cfg: Any) -> optax.GradientTransformation:
         )
 
     By default this:
-      - applies Muon to all 2D parameters (ndim == 2),
+      - applies Muon to 2D non-embedding kernel parameters,
       - uses AdamW (with adam_weight_decay) for everything else.
     """
     mu_cfg = _muon_config_from_generic_config(cfg)
@@ -107,6 +109,7 @@ def build_muon_tx_from_cfg(cfg: Any) -> optax.GradientTransformation:
         adam_b2=mu_cfg.adam_b2,
         adam_eps_root=mu_cfg.adam_eps_root,
         adam_weight_decay=mu_cfg.weight_decay,
+        muon_weight_dimension_numbers=build_muon_dim_numbers,
         # If you later want to apply Muon to conv kernels, you can also pass
         #   muon_weight_dimension_numbers=...
         # following the Optax Muon example notebook.
@@ -117,19 +120,12 @@ def build_muon_tx_from_cfg(cfg: Any) -> optax.GradientTransformation:
 def build_muon_dim_numbers(params):
     """Return a pytree of same structure, with MuonDimensionNumbers or None."""
     def leaf_fn(path, leaf):
-        # path is a tuple of keys (if you use tree_map_with_path),
-        # but we can also just inspect the leaf's shape.
-        if hasattr(leaf, "ndim"):
-            if leaf.ndim == 2:
-                # Dense weights: (in_features, out_features)
-                return optax.contrib.MuonDimensionNumbers(0, 1)
-            elif leaf.ndim == 4:
-                # Conv weights: (Kh, Kw, Cin, Cout)
-                return optax.contrib.MuonDimensionNumbers((0, 1, 2), (3,))
-        # Biases, batchnorm params, etc. -> let AdamW handle them
+        if hasattr(leaf, "ndim") and should_use_matrix_preconditioner(path, leaf):
+            # Dense-like matrix kernels: (fan_in, fan_out)
+            return optax.contrib.MuonDimensionNumbers(0, 1)
+        # Embeddings, norms, biases and all non-selected leaves -> AdamW.
         return None
 
-    # If you don't care about using the path, you can just map over leaves.
     return jtu.tree_map_with_path(leaf_fn, params)
 
 
@@ -182,4 +178,5 @@ def build_muon_tx(
         adam_b2=cfg.adam_b2,
         adam_eps_root=cfg.adam_eps_root,
         adam_weight_decay=cfg.weight_decay,
+        muon_weight_dimension_numbers=build_muon_dim_numbers,
     )

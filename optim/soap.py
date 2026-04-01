@@ -7,6 +7,8 @@ import jax.numpy as jnp
 from jax import tree_util as jtu
 import optax
 
+from .matrix_routing import path_to_name, should_use_matrix_preconditioner
+
 Array = jax.Array
 PyTree = Any
 
@@ -41,24 +43,8 @@ def _is_soap_matrix(p: Array) -> bool:
     )
 
 
-def _path_to_name(path) -> str:
-    parts = []
-    for key in path:
-        if hasattr(key, "key"):
-            parts.append(str(key.key))
-        elif hasattr(key, "name"):
-            parts.append(str(key.name))
-        elif hasattr(key, "idx"):
-            parts.append(str(key.idx))
-        else:
-            parts.append(str(key))
-    return "/".join(parts)
-
-
 def _should_use_soap(path, p: Array) -> bool:
-    del path
-    p_arr = jnp.asarray(p)
-    return _is_soap_matrix(p_arr)
+    return should_use_matrix_preconditioner(path, p)
 
 
 def _has_soap_preconditioner_state(L: Array, R: Array, QL: Array, QR: Array) -> bool:
@@ -157,7 +143,7 @@ def scale_by_soap(
     log_skipped: bool = False,
     correct_bias: bool = True,
 ) -> optax.GradientTransformation:
-    """2D SOAP with AdamW fallback for all non-2D params."""
+    """SOAP on selected 2D non-embedding kernels with AdamW fallback elsewhere."""
     shampoo_beta2 = b2 if shampoo_beta2 is None else shampoo_beta2
 
     def init_fn(params: PyTree) -> SoapState:
@@ -175,7 +161,7 @@ def scale_by_soap(
                 if isinstance(s, SoapPerParamState) and (
                     not _has_soap_preconditioner_state(s.L, s.R, s.QL, s.QR)
                 ):
-                    name = _path_to_name(path)
+                    name = path_to_name(path)
                     skipped.append(name)
                 return s
 
@@ -223,7 +209,7 @@ def scale_by_soap(
                 reference = p_arr if p_arr is not None else g_arr
                 s = _init_per_param(
                     reference,
-                    use_soap=_is_soap_matrix(jnp.asarray(reference)),
+                    use_soap=_has_soap_preconditioner_state(L, R, QL, QR),
                 )
                 m, v, L, R, QL, QR, step = s
                 g_arr = jnp.asarray(g)
@@ -320,7 +306,7 @@ def scale_by_soap(
                 flat_new_states.append(new_s)
                 continue
 
-            # AdamW fallback for non-2D parameters.
+            # AdamW fallback for all non-SOAP-routed parameters.
             step_new = step + jnp.array(1, dtype=jnp.int32)
             m_new = (b1 * m + (1.0 - b1) * g_arr).astype(m.dtype)
             v_new = (b2 * v + (1.0 - b2) * (g_arr * g_arr)).astype(v.dtype)

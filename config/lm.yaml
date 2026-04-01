@@ -41,13 +41,13 @@ torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
 steps_budget: 50
-micro_batch_size: 2
+micro_batch_size: 16
 grad_accumulation_steps: 1
 
 # choose between {float32, float16, bfloat16}
-dtype: "float32"
+dtype: "bfloat16"
 
-optim: muon
+optim: shampoo
 fused_optim: False
 lr: 3.e-4
 weight_decay: 0.1
@@ -96,6 +96,7 @@ use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
 wandb_run_name: "lm_fwedu_10BT"
+wandb_unique_names: True
 exp_name: "lm_fwedu_10BT"
 out_dir: "./exp/llm"
 over_write: True

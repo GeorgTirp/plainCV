@@ -37,7 +37,7 @@ model: transformer
 n_heads: 8
 n_layers: 6
 num_workers: 0
-optim: muon
+optim: shampoo
 out_dir: ./exp/llm
 over_write: true
 pns_base_optimizer: adamw
