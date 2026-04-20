@@ -426,7 +426,12 @@ def _sanitize_name(name: str) -> str:
     )
 
 
-def init_eigen_tracking_csv(cfg, top_k: int, filename: str = "eigen_tracking.csv") -> str:
+def init_eigen_tracking_csv(
+    cfg,
+    top_k: int,
+    extra_modes: int = 0,
+    filename: str = "eigen_tracking.csv",
+) -> str:
     exp_dir = get_exp_dir_path(cfg)
     os.makedirs(exp_dir, exist_ok=True)
     csv_path = os.path.join(exp_dir, filename)
@@ -434,6 +439,7 @@ def init_eigen_tracking_csv(cfg, top_k: int, filename: str = "eigen_tracking.csv
     header = (
         ["global_step", "rotation_diff", "eff_cond"]
         + [f"eig_{i}" for i in range(top_k)]
+        + [f"extra_eig_{i}" for i in range(extra_modes)]
         + [f"alpha_{i}" for i in range(top_k)]
         + [f"alpha_lambda_{i}" for i in range(top_k)]
     )
@@ -447,6 +453,7 @@ def init_eigen_tracking_csv(cfg, top_k: int, filename: str = "eigen_tracking.csv
 
 def append_eigen_tracking_row(csv_path: str, tracking_state) -> None:
     tracking_state = jax.device_get(tracking_state)
+    extra_eigenvalues = getattr(tracking_state, "extra_eigenvalues", ())
 
     row = (
         [
@@ -455,6 +462,7 @@ def append_eigen_tracking_row(csv_path: str, tracking_state) -> None:
             float(tracking_state.eff_cond),
         ]
         + [float(x) for x in tracking_state.eigenvalues]
+        + [float(x) for x in extra_eigenvalues]
         + [float(x) for x in tracking_state.alpha]
         + [float(x) for x in tracking_state.alpha_lambda]
     )

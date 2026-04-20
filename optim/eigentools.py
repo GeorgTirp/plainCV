@@ -35,8 +35,11 @@ class EigenTrackingState(NamedTuple):
     step: Array
     eigenvalues: Array
     eigenvectors: Array
+    extra_eigenvalues: Array
+    extra_eigenvectors: Array
     alpha: Array
     alpha_lambda: Array
+    alpha_valid: Array
     eff_cond: Array
     rng_key: Array
     rotation_diff: Array
@@ -59,6 +62,7 @@ def init_eigentracking(
     params: Params,
     k: int,
     *,
+    extra_modes: int = 0,
     seed: int = 0,
 ) -> EigenTrackingState:
     flat_params, _ = ravel_pytree(params)
@@ -68,8 +72,11 @@ def init_eigentracking(
         step=jnp.array(0, dtype=jnp.int32),
         eigenvalues=jnp.zeros((k,), dtype=dtype),
         eigenvectors=jnp.zeros((k, dim), dtype=dtype),
-        alpha=jnp.zeros((k,), dtype=dtype),
-        alpha_lambda=jnp.zeros((k,), dtype=dtype),
+        extra_eigenvalues=jnp.zeros((extra_modes,), dtype=dtype),
+        extra_eigenvectors=jnp.zeros((extra_modes, dim), dtype=dtype),
+        alpha=jnp.full((k,), jnp.nan, dtype=dtype),
+        alpha_lambda=jnp.full((k,), jnp.nan, dtype=dtype),
+        alpha_valid=jnp.zeros((k,), dtype=bool),
         eff_cond=jnp.array(0.0, dtype=dtype),
         rng_key=jax.random.PRNGKey(seed),
         rotation_diff=jnp.array(0.0, dtype=dtype),
@@ -98,6 +105,35 @@ def _subspace_rotation_diff(
     )
 
 
+def _make_lanczos_warm_start(
+    prev_eigenvectors: Array,
+    prev_eigenvalues: Array,
+    eps: float,
+) -> Array:
+    """
+    Build a single warm-start vector from the previously tracked eigenspace.
+
+    We use an abs-eigenvalue-weighted combination of the previous basis rows.
+    If the previous basis is all zeros, lanczos(...) will automatically fall
+    back to its random initialization.
+    """
+    weights = jnp.abs(prev_eigenvalues)
+    weights = weights / (jnp.sum(weights) + eps)
+    warm_start = jnp.tensordot(weights, prev_eigenvectors, axes=1)
+    return warm_start
+
+
+def _align_eigenvector_rows(
+    prev_vecs: Array,
+    new_vecs: Array,
+) -> Array:
+    """Align row signs to the previous iterate for smoother tracking."""
+    dot = jnp.sum(prev_vecs * new_vecs, axis=1, keepdims=True)
+    sign = jnp.sign(dot)
+    sign = jnp.where(sign == 0.0, 1.0, sign)
+    return new_vecs * sign
+
+
 def track_eigenstate(
     params: Params,
     grads: PyTree,
@@ -111,6 +147,8 @@ def track_eigenstate(
     use_light_ortho: bool = False,
     light_ortho_every: int = 4,
     eps: float = 1e-12,
+    alpha_grad_tol_abs: float = 1e-10,
+    alpha_grad_tol_rel: float = 1e-3,
 ) -> EigenTrackingState:
     flat_params, unravel_params = ravel_pytree(params)
     dim = flat_params.shape[0]
@@ -119,10 +157,12 @@ def track_eigenstate(
 
     rng_key, lanczos_key = jax.random.split(eigen_state.rng_key)
     k = eigen_state.eigenvalues.shape[0]
-    if k == 0:
+    extra_k = eigen_state.extra_eigenvalues.shape[0]
+    total_keep = k + extra_k
+    if total_keep == 0:
         return eigen_state._replace(step=step, rng_key=rng_key)
 
-    lanczos_steps = max(k, k if num_iter is None else int(num_iter))
+    lanczos_steps = max(total_keep, total_keep if num_iter is None else int(num_iter))
 
     def matvec_flat(v_flat: Array) -> Array:
         v_pytree = unravel_params(v_flat)
@@ -130,54 +170,99 @@ def track_eigenstate(
         hv_flat, _ = ravel_pytree(hv_pytree)
         return hv_flat
 
+    prev_all_eigenvectors = jnp.concatenate(
+        [eigen_state.eigenvectors, eigen_state.extra_eigenvectors],
+        axis=0,
+    )
+    prev_all_eigenvalues = jnp.concatenate(
+        [eigen_state.eigenvalues, eigen_state.extra_eigenvalues],
+        axis=0,
+    )
+
+    # ---- Point 4 fix: warm-start Lanczos from previous eigenspace ----
+    warm_start_v = _make_lanczos_warm_start(
+        prev_all_eigenvectors,
+        prev_all_eigenvalues,
+        eps,
+    )
+
     evals, evecs = lanczos(
         matvec=matvec_flat,
         dim=dim,
         num_iter=lanczos_steps,
         key=lanczos_key,
+        eps=eps,
         sort_by_abs=sort_by_abs,
+        init_v=warm_start_v,
         use_light_ortho=use_light_ortho,
         light_ortho_every=light_ortho_every,
     )
 
     eigenvalues = evals[:k]
     eigenvectors = evecs[:k, :]
+    extra_eigenvalues = evals[k : k + extra_k]
+    extra_eigenvectors = evecs[k : k + extra_k, :]
 
     prev_vecs = eigen_state.eigenvectors
-    dot = jnp.sum(prev_vecs * eigenvectors, axis=1, keepdims=True)
-    sign = jnp.sign(dot)
-    sign = jnp.where(sign == 0.0, 1.0, sign)
-    eigenvectors = eigenvectors * sign
+    eigenvectors = _align_eigenvector_rows(prev_vecs, eigenvectors)
 
-    rotation_diff = _subspace_rotation_diff(prev_vecs, eigenvectors, eps)
+    prev_extra_vecs = eigen_state.extra_eigenvectors
+    extra_eigenvectors = _align_eigenvector_rows(prev_extra_vecs, extra_eigenvectors)
 
-    g_proj = _project_rows(eigenvectors, grad_flat)
-    d_proj = _project_rows(eigenvectors, upd_flat)
-    alpha = -d_proj / (g_proj + eps)
-    alpha_lambda = alpha * eigenvalues
+    if k > 0:
+        rotation_diff = _subspace_rotation_diff(prev_vecs, eigenvectors, eps)
 
-    alpha_lambda_abs = jnp.abs(alpha_lambda)
-    valid = alpha_lambda_abs > eps
-    max_abs = jnp.max(jnp.where(valid, alpha_lambda_abs, 0.0))
-    min_abs = jnp.min(
-        jnp.where(
-            valid,
-            alpha_lambda_abs,
-            jnp.full_like(alpha_lambda_abs, jnp.inf),
+        g_proj = _project_rows(eigenvectors, grad_flat)
+        d_proj = _project_rows(eigenvectors, upd_flat)
+
+        # Relative threshold is taken against the largest projected gradient
+        # magnitude in the tracked subspace, with an absolute floor.
+        g_ref = jnp.maximum(jnp.max(jnp.abs(g_proj)), eps)
+        g_tol = jnp.maximum(
+            jnp.asarray(alpha_grad_tol_abs, dtype=g_proj.dtype),
+            jnp.asarray(alpha_grad_tol_rel, dtype=g_proj.dtype) * g_ref,
         )
-    )
-    eff_cond = jnp.where(
-        jnp.any(valid),
-        max_abs / jnp.maximum(min_abs, eps),
-        jnp.array(0.0, dtype=alpha_lambda.dtype),
-    )
+        alpha_valid = jnp.abs(g_proj) > g_tol
+
+        safe_g_proj = jnp.where(alpha_valid, g_proj, 1.0)
+        alpha_raw = -d_proj / safe_g_proj
+        alpha = jnp.where(alpha_valid, alpha_raw, jnp.nan)
+
+        alpha_lambda_raw = alpha_raw * eigenvalues
+        alpha_lambda = jnp.where(alpha_valid, alpha_lambda_raw, jnp.nan)
+
+        alpha_lambda_abs = jnp.abs(jnp.where(alpha_valid, alpha_lambda_raw, 0.0))
+        valid_for_cond = jnp.logical_and(alpha_valid, alpha_lambda_abs > eps)
+
+        max_abs = jnp.max(jnp.where(valid_for_cond, alpha_lambda_abs, 0.0))
+        min_abs = jnp.min(
+            jnp.where(
+                valid_for_cond,
+                alpha_lambda_abs,
+                jnp.full_like(alpha_lambda_abs, jnp.inf),
+            )
+        )
+        eff_cond = jnp.where(
+            jnp.any(valid_for_cond),
+            max_abs / jnp.maximum(min_abs, eps),
+            jnp.array(0.0, dtype=alpha_lambda.dtype),
+        )
+    else:
+        rotation_diff = jnp.array(0.0, dtype=eigenvalues.dtype)
+        alpha = eigen_state.alpha
+        alpha_lambda = eigen_state.alpha_lambda
+        alpha_valid = eigen_state.alpha_valid
+        eff_cond = jnp.array(0.0, dtype=eigenvalues.dtype)
 
     return eigen_state._replace(
         step=step,
         eigenvalues=eigenvalues,
         eigenvectors=eigenvectors,
+        extra_eigenvalues=extra_eigenvalues,
+        extra_eigenvectors=extra_eigenvectors,
         alpha=alpha,
         alpha_lambda=alpha_lambda,
+        alpha_valid=alpha_valid,
         eff_cond=eff_cond,
         rng_key=rng_key,
         rotation_diff=rotation_diff,
@@ -197,6 +282,7 @@ def lanczos(
 ) -> Tuple[Array, Array]:
     v0_rand = jax.random.normal(key, (dim,))
     v0_rand = v0_rand / (jnp.linalg.norm(v0_rand) + eps)
+
     if init_v is None:
         v0 = v0_rand
     else:
@@ -280,27 +366,3 @@ def lanczos(
     v_k = v_basis[:-1]
     eigenvectors = _expand_from_basis(evecs_t.T, v_k).reshape(num_iter, dim)
     return evals, eigenvectors
-
-
-def apply_eigen_preconditioner(
-    grad_flat: Array,
-    eigenvalues: Array,
-    eigenvectors: Array,
-    damping: float = 1e-4,
-    saddle_free_neg: bool = False,
-) -> Array:
-    if eigenvalues.size == 0:
-        return grad_flat
-
-    proj = eigenvectors @ grad_flat
-    proj_vec = eigenvectors.T @ proj
-
-    if saddle_free_neg:
-        scale = 1.0 / (jnp.abs(eigenvalues) + damping)
-    else:
-        scale = 1.0 / (eigenvalues + damping)
-
-    scale = jnp.sqrt(scale)
-    new_subspace = eigenvectors.T @ (proj * scale)
-    g_perp = grad_flat - proj_vec
-    return new_subspace + g_perp

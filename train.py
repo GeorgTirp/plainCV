@@ -175,6 +175,11 @@ def main(_argv):
         )
         if eigen_tracking_topk <= 0:
             raise ValueError("eigen_tracking_topk must be >= 1 when tracking is enabled.")
+        eigen_tracking_extra_modes = int(
+            getattr(cfg, "eigen_tracking_extra_modes", 0)
+        )
+        if eigen_tracking_extra_modes < 0:
+            raise ValueError("eigen_tracking_extra_modes must be >= 0.")
 
         eigen_tracking_backend = getattr(
             cfg,
@@ -183,7 +188,9 @@ def main(_argv):
         )
         eigen_tracking_iters = getattr(cfg, "eigen_tracking_lanczos_iters", None)
         if eigen_tracking_iters is None:
-            eigen_tracking_iters = eigen_tracking_topk
+            eigen_tracking_iters = (
+                eigen_tracking_topk + eigen_tracking_extra_modes
+            )
         eigen_tracking_sort_by_abs = getattr(cfg, "eigen_tracking_sort_by_abs", None)
         if eigen_tracking_sort_by_abs is None:
             eigen_tracking_sort_by_abs = (
@@ -205,11 +212,13 @@ def main(_argv):
         eigen_tracking_state = init_eigentracking(
             state.params,
             k=eigen_tracking_topk,
+            extra_modes=eigen_tracking_extra_modes,
             seed=int(getattr(cfg, "seed", 0)),
         )
         eigen_tracking_csv_path = init_eigen_tracking_csv(
             cfg,
             eigen_tracking_topk,
+            extra_modes=eigen_tracking_extra_modes,
         )
 
         @jax.jit
