@@ -37,7 +37,7 @@ rope_theta: 500000.0
 torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
-steps_budget: 4800
+steps_budget: 12371
 micro_batch_size: 16
 grad_accumulation_steps: 8
 

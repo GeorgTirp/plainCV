@@ -39,25 +39,22 @@ rope_theta: 500000.0
 torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
-steps_budget: 4800
+steps_budget: 12371
 micro_batch_size: 16
 grad_accumulation_steps: 8
 
 # choose between {float32, float16, bfloat16}
 dtype: "bfloat16"
 
-optim: muon
+optim: soap
 fused_optim: False
 lr: 3.e-4
 weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95
 
-muon_beta: 0.95
-muon_ns_steps: 5
-muon_ns_coeffs: [3.4445, -4.7750, 2.0315]
-muon_nesterov: true
-muon_adaptive: false
+precondition_frequency: 32
+shampoo_beta2: 0.95
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: false
@@ -83,6 +80,7 @@ use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
 wandb_run_name: "lm_fwedu_10BT"
+wandb_unique_names: True
 exp_name: "lm_fwedu_10BT"
 out_dir: "./exp/llm"
 over_write: True
