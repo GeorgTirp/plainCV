@@ -404,6 +404,41 @@ def _unwrap_replicated(x, use_pmap: bool):
     return flax_jax_utils.unreplicate(x)
 
 
+def _should_run_eigen_tracking_for_step(cfg, completed_step: int) -> bool:
+    """Return whether eigen tracking should run after the completed train step."""
+    eigen_tracking_every = int(getattr(cfg, "eigen_tracking_every", 100))
+    if eigen_tracking_every <= 0:
+        raise ValueError("eigen_tracking_every must be >= 1 when tracking is enabled.")
+
+    if not bool(getattr(cfg, "eigen_tracking_post_soap_refresh", False)):
+        return (completed_step % eigen_tracking_every) == 0
+
+    if str(getattr(cfg, "optim", "")).lower() != "soap":
+        raise ValueError(
+            "eigen_tracking_post_soap_refresh=True is only supported with optim='soap'."
+        )
+
+    precondition_frequency = int(getattr(cfg, "precondition_frequency", 0))
+    if precondition_frequency <= 0:
+        raise ValueError(
+            "eigen_tracking_post_soap_refresh=True requires precondition_frequency >= 1."
+        )
+    if eigen_tracking_every % precondition_frequency != 0:
+        raise ValueError(
+            "With eigen_tracking_post_soap_refresh=True, eigen_tracking_every must "
+            "be a positive multiple of precondition_frequency."
+        )
+
+    # SOAP initializes the basis on the first optimizer step without applying an
+    # actual update. The first step that uses a refreshed basis therefore occurs
+    # one train step after the first QR refresh.
+    first_post_refresh_step = precondition_frequency + 2
+    return (
+        completed_step >= first_post_refresh_step
+        and ((completed_step - first_post_refresh_step) % eigen_tracking_every) == 0
+    )
+
+
 def _probe_pmap_collectives(n_devices: int) -> tuple[bool, Optional[str]]:
     """Return whether pmap collectives are usable on this host.
 
@@ -497,7 +532,6 @@ def run(cfg):
     eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
     eigen_tracking_state = None
     eigen_tracking_csv_path = None
-    eigen_tracking_every = int(getattr(cfg, "eigen_tracking_every", 100))
     if eigen_tracking_enabled:
         if curvature_batch is None:
             raise ValueError(
@@ -632,7 +666,7 @@ def run(cfg):
 
         global_step += 1
 
-        if eigen_tracking_enabled and global_step % eigen_tracking_every == 0:
+        if eigen_tracking_enabled and _should_run_eigen_tracking_for_step(cfg, global_step):
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
                 _unwrap_replicated(grads_accum, use_pmap),

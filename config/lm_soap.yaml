@@ -59,6 +59,7 @@ shampoo_beta2: 0.95
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: false
 eigen_tracking_every: 20
+eigen_tracking_post_soap_refresh: false  # if true, every must be a multiple of precondition_frequency
 eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 0
 eigen_tracking_lanczos_iters: null
