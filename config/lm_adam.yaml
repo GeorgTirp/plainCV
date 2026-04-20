@@ -60,6 +60,7 @@ beta2: 0.95
 eigen_tracking_enabled: false
 eigen_tracking_every: 20
 eigen_tracking_topk: 5
+eigen_tracking_extra_modes: 0
 eigen_tracking_lanczos_iters: null
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: null
