@@ -38,8 +38,11 @@ class EigenTrackingState(NamedTuple):
     extra_eigenvalues: Array
     extra_eigenvectors: Array
     alpha: Array
-    alpha_lambda: Array
+    extra_alpha: Array
+    phi: Array
+    extra_phi: Array
     alpha_valid: Array
+    extra_alpha_valid: Array
     eff_cond: Array
     rng_key: Array
     rotation_diff: Array
@@ -56,6 +59,36 @@ def _expand_from_basis(coeffs_matrix: Array, basis_rows: Array) -> Array:
         lambda coeffs: jnp.tensordot(coeffs, basis_rows, axes=1),
         coeffs_matrix,
     )
+
+
+def apply_eigen_preconditioner(
+    grad_flat: Array,
+    eigenvalues: Array,
+    eigenvectors: Array,
+    damping: float = 1e-4,
+    saddle_free_neg: bool = False,
+) -> Array:
+    """Apply a partial Newton-like preconditioner in a global eigenbasis."""
+    if eigenvalues.size == 0:
+        return grad_flat
+
+    V = eigenvectors
+    lambdas = eigenvalues
+
+    proj = V @ grad_flat
+    proj_vec = V.T @ proj
+
+    if saddle_free_neg:
+        lam_eff = jnp.abs(lambdas)
+        scale = 1.0 / (lam_eff + damping)
+    else:
+        scale = 1.0 / (lambdas + damping)
+
+    # Keep EigenAdam-style sqrt scaling used by the PN-S implementations.
+    scale = jnp.sqrt(scale)
+    new_subspace = V.T @ (proj * scale)
+    g_perp = grad_flat - proj_vec
+    return new_subspace + g_perp
 
 
 def init_eigentracking(
@@ -75,8 +108,11 @@ def init_eigentracking(
         extra_eigenvalues=jnp.zeros((extra_modes,), dtype=dtype),
         extra_eigenvectors=jnp.zeros((extra_modes, dim), dtype=dtype),
         alpha=jnp.full((k,), jnp.nan, dtype=dtype),
-        alpha_lambda=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_alpha=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
+        phi=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_phi=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         alpha_valid=jnp.zeros((k,), dtype=bool),
+        extra_alpha_valid=jnp.zeros((extra_modes,), dtype=bool),
         eff_cond=jnp.array(0.0, dtype=dtype),
         rng_key=jax.random.PRNGKey(seed),
         rotation_diff=jnp.array(0.0, dtype=dtype),
@@ -146,6 +182,7 @@ def track_eigenstate(
     sort_by_abs: bool = False,
     use_light_ortho: bool = False,
     light_ortho_every: int = 4,
+    learning_rate: float = 1.0,
     eps: float = 1e-12,
     alpha_grad_tol_abs: float = 1e-10,
     alpha_grad_tol_rel: float = 1e-3,
@@ -209,14 +246,17 @@ def track_eigenstate(
     prev_extra_vecs = eigen_state.extra_eigenvectors
     extra_eigenvectors = _align_eigenvector_rows(prev_extra_vecs, extra_eigenvectors)
 
-    if k > 0:
-        rotation_diff = _subspace_rotation_diff(prev_vecs, eigenvectors, eps)
+    rotation_diff = _subspace_rotation_diff(prev_vecs, eigenvectors, eps)
 
-        g_proj = _project_rows(eigenvectors, grad_flat)
-        d_proj = _project_rows(eigenvectors, upd_flat)
+    all_eigenvalues = jnp.concatenate([eigenvalues, extra_eigenvalues], axis=0)
+    all_eigenvectors = jnp.concatenate([eigenvectors, extra_eigenvectors], axis=0)
 
-        # Relative threshold is taken against the largest projected gradient
-        # magnitude in the tracked subspace, with an absolute floor.
+    if total_keep > 0:
+        g_proj = _project_rows(all_eigenvectors, grad_flat)
+        d_proj = _project_rows(all_eigenvectors, upd_flat)
+
+        # Relative threshold is taken against the largest projected gradient in
+        # the tracked modes, with an absolute floor to keep near-zero ratios sane.
         g_ref = jnp.maximum(jnp.max(jnp.abs(g_proj)), eps)
         g_tol = jnp.maximum(
             jnp.asarray(alpha_grad_tol_abs, dtype=g_proj.dtype),
@@ -226,32 +266,44 @@ def track_eigenstate(
 
         safe_g_proj = jnp.where(alpha_valid, g_proj, 1.0)
         alpha_raw = -d_proj / safe_g_proj
-        alpha = jnp.where(alpha_valid, alpha_raw, jnp.nan)
+        alpha_all = jnp.where(alpha_valid, alpha_raw, jnp.nan)
 
-        alpha_lambda_raw = alpha_raw * eigenvalues
-        alpha_lambda = jnp.where(alpha_valid, alpha_lambda_raw, jnp.nan)
+        lr = jnp.asarray(learning_rate, dtype=alpha_all.dtype)
+        safe_lr = jnp.where(jnp.abs(lr) > eps, lr, jnp.nan)
+        phi_raw = alpha_raw * all_eigenvalues / safe_lr
+        phi_all = jnp.where(alpha_valid, phi_raw, jnp.nan)
 
-        alpha_lambda_abs = jnp.abs(jnp.where(alpha_valid, alpha_lambda_raw, 0.0))
-        valid_for_cond = jnp.logical_and(alpha_valid, alpha_lambda_abs > eps)
+        alpha = alpha_all[:k]
+        extra_alpha = alpha_all[k : k + extra_k]
+        phi = phi_all[:k]
+        extra_phi = phi_all[k : k + extra_k]
+        top_alpha_valid = alpha_valid[:k]
+        extra_alpha_valid = alpha_valid[k : k + extra_k]
 
-        max_abs = jnp.max(jnp.where(valid_for_cond, alpha_lambda_abs, 0.0))
+        phi_abs = jnp.abs(jnp.where(top_alpha_valid, phi_raw[:k], 0.0))
+        valid_for_cond = jnp.logical_and(top_alpha_valid, phi_abs > eps)
+
+        max_abs = jnp.max(jnp.where(valid_for_cond, phi_abs, 0.0))
         min_abs = jnp.min(
             jnp.where(
                 valid_for_cond,
-                alpha_lambda_abs,
-                jnp.full_like(alpha_lambda_abs, jnp.inf),
+                phi_abs,
+                jnp.full_like(phi_abs, jnp.inf),
             )
         )
         eff_cond = jnp.where(
             jnp.any(valid_for_cond),
             max_abs / jnp.maximum(min_abs, eps),
-            jnp.array(0.0, dtype=alpha_lambda.dtype),
+            jnp.array(0.0, dtype=phi.dtype),
         )
     else:
         rotation_diff = jnp.array(0.0, dtype=eigenvalues.dtype)
         alpha = eigen_state.alpha
-        alpha_lambda = eigen_state.alpha_lambda
-        alpha_valid = eigen_state.alpha_valid
+        extra_alpha = eigen_state.extra_alpha
+        phi = eigen_state.phi
+        extra_phi = eigen_state.extra_phi
+        top_alpha_valid = eigen_state.alpha_valid
+        extra_alpha_valid = eigen_state.extra_alpha_valid
         eff_cond = jnp.array(0.0, dtype=eigenvalues.dtype)
 
     return eigen_state._replace(
@@ -261,8 +313,11 @@ def track_eigenstate(
         extra_eigenvalues=extra_eigenvalues,
         extra_eigenvectors=extra_eigenvectors,
         alpha=alpha,
-        alpha_lambda=alpha_lambda,
-        alpha_valid=alpha_valid,
+        extra_alpha=extra_alpha,
+        phi=phi,
+        extra_phi=extra_phi,
+        alpha_valid=top_alpha_valid,
+        extra_alpha_valid=extra_alpha_valid,
         eff_cond=eff_cond,
         rng_key=rng_key,
         rotation_diff=rotation_diff,

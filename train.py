@@ -269,6 +269,7 @@ def main(_argv):
                 sort_by_abs=eigen_tracking_sort_by_abs,
                 use_light_ortho=eigen_tracking_light_ortho,
                 light_ortho_every=eigen_tracking_light_ortho_every,
+                learning_rate=float(cfg.lr),
             )
 
     muon_log_files = {}
