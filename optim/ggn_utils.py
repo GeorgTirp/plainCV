@@ -4,6 +4,7 @@ from typing import Any, Callable, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
+from jax import tree_util as jtu
 import optax
 
 Array = jax.Array
@@ -30,6 +31,9 @@ def softmax_cross_entropy_hessian_vec(
     Returns:
       Hv_logits: (B, C) Hessian(logits) @ vec_logits
     """
+    logits = logits.astype(jnp.float32)
+    vec_logits = vec_logits.astype(jnp.float32)
+
     # probabilities
     probs = jax.nn.softmax(logits, axis=-1)  # (B, C)
 
@@ -82,20 +86,26 @@ def make_ggn_matvec_fn_lm(
     """
     input_ids, labels, attn_mask = curvature_batch
 
-    def logits_fn(params: Params) -> Array:
-        variables = {"params": params}
-        if batch_stats is not None:
-            variables["batch_stats"] = batch_stats
+    def _single_batch_ggn_matvec(
+        params: Params,
+        vec_pytree: PyTree,
+        batch_input_ids: Array,
+        batch_labels: Array,
+        batch_attn_mask: Optional[Array],
+    ) -> PyTree:
+        def logits_fn(params: Params) -> Array:
+            variables = {"params": params}
+            if batch_stats is not None:
+                variables["batch_stats"] = batch_stats
 
-        out = model_def.apply(
-            variables,
-            input_ids,
-            attn_mask=attn_mask,
-            deterministic=True,
-        )
-        return _extract_logits(out)
+            out = model_def.apply(
+                variables,
+                batch_input_ids,
+                attn_mask=batch_attn_mask,
+                deterministic=True,
+            )
+            return _extract_logits(out)
 
-    def ggn_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
         logits, jvp_logits = jax.jvp(
             logits_fn,
             (params,),
@@ -108,14 +118,37 @@ def make_ggn_matvec_fn_lm(
 
         hv2 = softmax_cross_entropy_hessian_vec(
             logits=logits2,
-            labels=labels.reshape(b * t),
+            labels=batch_labels.reshape(b * t),
             vec_logits=jvp2,
         )
-        hv_logits = hv2.reshape(b, t, v)
+        # Match the training objective, which averages CE over all tokens.
+        hv_logits = hv2.reshape(b, t, v) / jnp.asarray(b * t, dtype=hv2.dtype)
+        hv_logits = hv_logits.astype(logits.dtype)
 
         _, vjp_fun = jax.vjp(logits_fn, params)
         hv_params, = vjp_fun(hv_logits)
         return hv_params
+
+    def ggn_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        del rng_key
+        if input_ids.ndim == 2:
+            return _single_batch_ggn_matvec(params, vec_pytree, input_ids, labels, attn_mask)
+
+        num_probe_batches = int(input_ids.shape[0])
+        hvps = []
+        for i in range(num_probe_batches):
+            batch_attn_mask = None if attn_mask is None else attn_mask[i]
+            hvps.append(
+                _single_batch_ggn_matvec(
+                    params,
+                    vec_pytree,
+                    input_ids[i],
+                    labels[i],
+                    batch_attn_mask,
+                )
+            )
+        scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+        return jtu.tree_map(lambda *xs: sum(xs) / scale, *hvps)
 
     return jax.jit(ggn_matvec)
 
@@ -194,6 +227,7 @@ def make_ggn_matvec_fn(
             labels=labels,
             vec_logits=jvp_logits,
         )  # (B, C)
+        hv_logits = hv_logits / jnp.asarray(logits.shape[0], dtype=hv_logits.dtype)
 
         # 3. VJP: map back to parameter space: J^T (H_ℓ J v)
         _, vjp_fun = jax.vjp(logits_fn, params)
