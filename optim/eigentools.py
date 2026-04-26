@@ -37,6 +37,12 @@ class EigenTrackingState(NamedTuple):
     eigenvectors: Array
     extra_eigenvalues: Array
     extra_eigenvectors: Array
+    ritz_residual: Array
+    extra_ritz_residual: Array
+    g_proj: Array
+    extra_g_proj: Array
+    d_proj: Array
+    extra_d_proj: Array
     alpha: Array
     extra_alpha: Array
     phi: Array
@@ -107,6 +113,12 @@ def init_eigentracking(
         eigenvectors=jnp.zeros((k, dim), dtype=dtype),
         extra_eigenvalues=jnp.zeros((extra_modes,), dtype=dtype),
         extra_eigenvectors=jnp.zeros((extra_modes, dim), dtype=dtype),
+        ritz_residual=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_ritz_residual=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
+        g_proj=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_g_proj=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
+        d_proj=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_d_proj=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         alpha=jnp.full((k,), jnp.nan, dtype=dtype),
         extra_alpha=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         phi=jnp.full((k,), jnp.nan, dtype=dtype),
@@ -223,7 +235,7 @@ def track_eigenstate(
         eps,
     )
 
-    evals, evecs = lanczos(
+    evals, evecs, ritz_residuals = lanczos(
         matvec=matvec_flat,
         dim=dim,
         num_iter=lanczos_steps,
@@ -233,12 +245,19 @@ def track_eigenstate(
         init_v=warm_start_v,
         use_light_ortho=use_light_ortho,
         light_ortho_every=light_ortho_every,
+        return_residuals=True,
+        max_return_vectors=total_keep,
     )
 
     eigenvalues = evals[:k]
     eigenvectors = evecs[:k, :]
     extra_eigenvalues = evals[k : k + extra_k]
     extra_eigenvectors = evecs[k : k + extra_k, :]
+    # Relative Ritz residual: ||A v - lambda v|| / (|lambda| + eps).
+    ritz_residual = ritz_residuals[:k] / (jnp.abs(eigenvalues) + eps)
+    extra_ritz_residual = ritz_residuals[k : k + extra_k] / (
+        jnp.abs(extra_eigenvalues) + eps
+    )
 
     prev_vecs = eigen_state.eigenvectors
     eigenvectors = _align_eigenvector_rows(prev_vecs, eigenvectors)
@@ -277,6 +296,10 @@ def track_eigenstate(
         extra_alpha = alpha_all[k : k + extra_k]
         phi = phi_all[:k]
         extra_phi = phi_all[k : k + extra_k]
+        top_g_proj = g_proj[:k]
+        extra_g_proj = g_proj[k : k + extra_k]
+        top_d_proj = d_proj[:k]
+        extra_d_proj = d_proj[k : k + extra_k]
         top_alpha_valid = alpha_valid[:k]
         extra_alpha_valid = alpha_valid[k : k + extra_k]
 
@@ -302,6 +325,10 @@ def track_eigenstate(
         extra_alpha = eigen_state.extra_alpha
         phi = eigen_state.phi
         extra_phi = eigen_state.extra_phi
+        top_g_proj = eigen_state.g_proj
+        extra_g_proj = eigen_state.extra_g_proj
+        top_d_proj = eigen_state.d_proj
+        extra_d_proj = eigen_state.extra_d_proj
         top_alpha_valid = eigen_state.alpha_valid
         extra_alpha_valid = eigen_state.extra_alpha_valid
         eff_cond = jnp.array(0.0, dtype=eigenvalues.dtype)
@@ -312,6 +339,12 @@ def track_eigenstate(
         eigenvectors=eigenvectors,
         extra_eigenvalues=extra_eigenvalues,
         extra_eigenvectors=extra_eigenvectors,
+        ritz_residual=ritz_residual,
+        extra_ritz_residual=extra_ritz_residual,
+        g_proj=top_g_proj,
+        extra_g_proj=extra_g_proj,
+        d_proj=top_d_proj,
+        extra_d_proj=extra_d_proj,
         alpha=alpha,
         extra_alpha=extra_alpha,
         phi=phi,
@@ -334,7 +367,9 @@ def lanczos(
     init_v: Optional[Array] = None,
     use_light_ortho: bool = False,
     light_ortho_every: int = 4,
-) -> Tuple[Array, Array]:
+    return_residuals: bool = False,
+    max_return_vectors: Optional[int] = None,
+) -> tuple[Array, ...]:
     v0_rand = jax.random.normal(key, (dim,))
     v0_rand = v0_rand / (jnp.linalg.norm(v0_rand) + eps)
 
@@ -417,7 +452,14 @@ def lanczos(
 
     evals = evals[idx]
     evecs_t = evecs_t[:, idx]
+    residuals = jnp.abs(betas[num_iter - 1] * evecs_t[-1, :])
+
+    if max_return_vectors is not None:
+        keep = min(int(max_return_vectors), num_iter)
+        evecs_t = evecs_t[:, :keep]
 
     v_k = v_basis[:-1]
-    eigenvectors = _expand_from_basis(evecs_t.T, v_k).reshape(num_iter, dim)
+    eigenvectors = _expand_from_basis(evecs_t.T, v_k).reshape(evecs_t.shape[1], dim)
+    if return_residuals:
+        return evals, eigenvectors, residuals
     return evals, eigenvectors

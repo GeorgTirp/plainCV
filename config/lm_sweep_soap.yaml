@@ -10,7 +10,7 @@ command:
   - ${interpreter}
   - -u
   - ${program}
-  - --config=config/lm_adam.yaml
+  - --config=config/lm_soap.yaml
 
 parameters:
   # Use names that match keys in the base config YAML.
@@ -52,4 +52,4 @@ parameters:
 
   
 
-run_cap: 20
+run_cap: 16

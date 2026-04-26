@@ -40,7 +40,8 @@ rope_theta: 500000.0
 torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
-steps_budget: 12371
+steps_budget: 38147
+
 micro_batch_size: 16
 grad_accumulation_steps: 8
 
@@ -49,25 +50,27 @@ dtype: "bfloat16"
 
 optim: adam
 fused_optim: False
-lr: 3.e-4
-weight_decay: 0.1
-beta1: 0.9
-beta2: 0.95
+lr: 0.00019457109803718195
+#non scaled old lr: 0.00034171387260699556
+weight_decay: 0.027816321283115952
+beta1: 0.8598532157519392
+beta2: 0.9131686189635
 
 
 
 # --- Generic eigen tracking (works with any optimizer) ---
-eigen_tracking_enabled: false
-eigen_tracking_every: 20
-eigen_tracking_topk: 5
-eigen_tracking_extra_modes: 0
-eigen_tracking_lanczos_iters: null
+eigen_tracking_enabled: true
+eigen_tracking_every: 1536
+eigen_tracking_topk: 6
+eigen_tracking_extra_modes: 6
+eigen_tracking_curvature_batches: 8
+eigen_tracking_lanczos_iters: 12
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: null
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 
-scheduler: "warmup_cosine"
+scheduler: null
 warmup_steps: 0.05
 cooldown_steps: null
 lr_start: 0.0
@@ -81,7 +84,6 @@ use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
 wandb_run_name: "lm_fwedu_10BT"
-wandb_unique_names: True
 exp_name: "lm_fwedu_10BT"
 out_dir: "./exp/llm"
 over_write: True
