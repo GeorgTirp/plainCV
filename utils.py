@@ -447,6 +447,17 @@ def init_eigen_tracking_csv(
             "probe_acc_before",
             "probe_acc_after",
             "probe_acc_gain",
+            "grad_norm",
+            "update_norm",
+            "tracked_update_energy_frac",
+            "tracked_grad_energy_frac",
+            "tracked_update_grad_cosine",
+            "pos_update_energy_frac",
+            "neg_update_energy_frac",
+            "pos_grad_energy_frac",
+            "neg_grad_energy_frac",
+            "pos_update_grad_cosine",
+            "neg_update_grad_cosine",
         ]
         + [f"eig_{i}" for i in range(top_k)]
         + [f"extra_eig_{i}" for i in range(extra_modes)]
@@ -456,6 +467,8 @@ def init_eigen_tracking_csv(
         + [f"extra_g_proj_{i}" for i in range(extra_modes)]
         + [f"d_proj_{i}" for i in range(top_k)]
         + [f"extra_d_proj_{i}" for i in range(extra_modes)]
+        + [f"update_energy_frac_{i}" for i in range(top_k)]
+        + [f"extra_update_energy_frac_{i}" for i in range(extra_modes)]
         + [f"alpha_valid_{i}" for i in range(top_k)]
         + [f"extra_alpha_valid_{i}" for i in range(extra_modes)]
         + [f"alpha_{i}" for i in range(top_k)]
@@ -499,12 +512,25 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         extra_g_proj,
         d_proj,
         extra_d_proj,
+        update_energy_frac,
+        extra_update_energy_frac,
         alpha_valid,
         extra_alpha_valid,
         alpha,
         extra_alpha,
         phi,
         extra_phi,
+        grad_norm,
+        update_norm,
+        tracked_update_energy_frac,
+        tracked_grad_energy_frac,
+        tracked_update_grad_cosine,
+        pos_update_energy_frac,
+        neg_update_energy_frac,
+        pos_grad_energy_frac,
+        neg_grad_energy_frac,
+        pos_update_grad_cosine,
+        neg_update_grad_cosine,
     ) = jax.device_get(
         (
             tracking_state.eigenvalues,
@@ -515,12 +541,25 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             getattr(tracking_state, "extra_g_proj", ()),
             getattr(tracking_state, "d_proj", ()),
             getattr(tracking_state, "extra_d_proj", ()),
+            getattr(tracking_state, "update_energy_frac", ()),
+            getattr(tracking_state, "extra_update_energy_frac", ()),
             getattr(tracking_state, "alpha_valid", ()),
             getattr(tracking_state, "extra_alpha_valid", ()),
             tracking_state.alpha,
             getattr(tracking_state, "extra_alpha", ()),
             getattr(tracking_state, "phi", ()),
             getattr(tracking_state, "extra_phi", ()),
+            getattr(tracking_state, "grad_norm", float("nan")),
+            getattr(tracking_state, "update_norm", float("nan")),
+            getattr(tracking_state, "tracked_update_energy_frac", float("nan")),
+            getattr(tracking_state, "tracked_grad_energy_frac", float("nan")),
+            getattr(tracking_state, "tracked_update_grad_cosine", float("nan")),
+            getattr(tracking_state, "pos_update_energy_frac", float("nan")),
+            getattr(tracking_state, "neg_update_energy_frac", float("nan")),
+            getattr(tracking_state, "pos_grad_energy_frac", float("nan")),
+            getattr(tracking_state, "neg_grad_energy_frac", float("nan")),
+            getattr(tracking_state, "pos_update_grad_cosine", float("nan")),
+            getattr(tracking_state, "neg_update_grad_cosine", float("nan")),
         )
     )
 
@@ -535,6 +574,17 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             _metric("probe_acc_before"),
             _metric("probe_acc_after"),
             _metric("probe_acc_gain"),
+            float(grad_norm),
+            float(update_norm),
+            float(tracked_update_energy_frac),
+            float(tracked_grad_energy_frac),
+            float(tracked_update_grad_cosine),
+            float(pos_update_energy_frac),
+            float(neg_update_energy_frac),
+            float(pos_grad_energy_frac),
+            float(neg_grad_energy_frac),
+            float(pos_update_grad_cosine),
+            float(neg_update_grad_cosine),
         ]
         + [float(x) for x in eigenvalues]
         + [float(x) for x in extra_eigenvalues]
@@ -544,6 +594,8 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         + [float(x) for x in extra_g_proj]
         + [float(x) for x in d_proj]
         + [float(x) for x in extra_d_proj]
+        + [float(x) for x in update_energy_frac]
+        + [float(x) for x in extra_update_energy_frac]
         + [int(bool(x)) for x in alpha_valid]
         + [int(bool(x)) for x in extra_alpha_valid]
         + [float(x) for x in tracking_state.alpha]

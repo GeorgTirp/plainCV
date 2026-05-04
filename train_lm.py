@@ -729,6 +729,9 @@ def run(cfg):
             eigen_tracking_sort_by_abs = (
                 str(eigen_tracking_backend).lower() in {"hessian", "fisher"}
             )
+        eigen_tracking_signed_split_enabled = (
+            str(eigen_tracking_backend).lower() == "hessian"
+        )
         eigen_tracking_light_ortho = bool(
             getattr(cfg, "eigen_tracking_light_ortho", True)
         )
@@ -769,6 +772,7 @@ def run(cfg):
                 use_light_ortho=eigen_tracking_light_ortho,
                 light_ortho_every=eigen_tracking_light_ortho_every,
                 learning_rate=float(cfg.lr),
+                signed_split_enabled=eigen_tracking_signed_split_enabled,
             )
 
         if eigen_tracking_measurement_mode == "probe_update":

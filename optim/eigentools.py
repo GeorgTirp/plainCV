@@ -43,6 +43,8 @@ class EigenTrackingState(NamedTuple):
     extra_g_proj: Array
     d_proj: Array
     extra_d_proj: Array
+    update_energy_frac: Array
+    extra_update_energy_frac: Array
     alpha: Array
     extra_alpha: Array
     phi: Array
@@ -52,6 +54,17 @@ class EigenTrackingState(NamedTuple):
     eff_cond: Array
     rng_key: Array
     rotation_diff: Array
+    grad_norm: Array
+    update_norm: Array
+    tracked_update_energy_frac: Array
+    tracked_grad_energy_frac: Array
+    tracked_update_grad_cosine: Array
+    pos_update_energy_frac: Array
+    neg_update_energy_frac: Array
+    pos_grad_energy_frac: Array
+    neg_grad_energy_frac: Array
+    pos_update_grad_cosine: Array
+    neg_update_grad_cosine: Array
 
 
 def _project_rows(matrix: Array, vector: Array) -> Array:
@@ -107,6 +120,7 @@ def init_eigentracking(
     flat_params, _ = ravel_pytree(params)
     dim = flat_params.shape[0]
     dtype = flat_params.dtype
+    nan = jnp.asarray(jnp.nan, dtype=dtype)
     return EigenTrackingState(
         step=jnp.array(0, dtype=jnp.int32),
         eigenvalues=jnp.zeros((k,), dtype=dtype),
@@ -119,6 +133,8 @@ def init_eigentracking(
         extra_g_proj=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         d_proj=jnp.full((k,), jnp.nan, dtype=dtype),
         extra_d_proj=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
+        update_energy_frac=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_update_energy_frac=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         alpha=jnp.full((k,), jnp.nan, dtype=dtype),
         extra_alpha=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         phi=jnp.full((k,), jnp.nan, dtype=dtype),
@@ -128,6 +144,17 @@ def init_eigentracking(
         eff_cond=jnp.array(0.0, dtype=dtype),
         rng_key=jax.random.PRNGKey(seed),
         rotation_diff=jnp.array(0.0, dtype=dtype),
+        grad_norm=nan,
+        update_norm=nan,
+        tracked_update_energy_frac=nan,
+        tracked_grad_energy_frac=nan,
+        tracked_update_grad_cosine=nan,
+        pos_update_energy_frac=nan,
+        neg_update_energy_frac=nan,
+        pos_grad_energy_frac=nan,
+        neg_grad_energy_frac=nan,
+        pos_update_grad_cosine=nan,
+        neg_update_grad_cosine=nan,
     )
 
 
@@ -195,6 +222,7 @@ def track_eigenstate(
     use_light_ortho: bool = False,
     light_ortho_every: int = 4,
     learning_rate: float = 1.0,
+    signed_split_enabled: bool = False,
     eps: float = 1e-12,
     alpha_grad_tol_abs: float = 1e-10,
     alpha_grad_tol_rel: float = 1e-3,
@@ -203,13 +231,33 @@ def track_eigenstate(
     dim = flat_params.shape[0]
     grad_flat, _ = ravel_pytree(grads)
     upd_flat, _ = ravel_pytree(updates)
+    metric_dtype = grad_flat.dtype
+    nan = jnp.asarray(jnp.nan, dtype=metric_dtype)
+    grad_energy = jnp.sum(jnp.square(grad_flat))
+    update_energy = jnp.sum(jnp.square(upd_flat))
+    grad_norm = jnp.sqrt(grad_energy)
+    update_norm = jnp.sqrt(update_energy)
 
     rng_key, lanczos_key = jax.random.split(eigen_state.rng_key)
     k = eigen_state.eigenvalues.shape[0]
     extra_k = eigen_state.extra_eigenvalues.shape[0]
     total_keep = k + extra_k
     if total_keep == 0:
-        return eigen_state._replace(step=step, rng_key=rng_key)
+        return eigen_state._replace(
+            step=step,
+            rng_key=rng_key,
+            grad_norm=grad_norm,
+            update_norm=update_norm,
+            tracked_update_energy_frac=jnp.array(0.0, dtype=metric_dtype),
+            tracked_grad_energy_frac=jnp.array(0.0, dtype=metric_dtype),
+            tracked_update_grad_cosine=nan,
+            pos_update_energy_frac=nan,
+            neg_update_energy_frac=nan,
+            pos_grad_energy_frac=nan,
+            neg_grad_energy_frac=nan,
+            pos_update_grad_cosine=nan,
+            neg_update_grad_cosine=nan,
+        )
 
     lanczos_steps = max(total_keep, total_keep if num_iter is None else int(num_iter))
 
@@ -273,6 +321,52 @@ def track_eigenstate(
     if total_keep > 0:
         g_proj = _project_rows(all_eigenvectors, grad_flat)
         d_proj = _project_rows(all_eigenvectors, upd_flat)
+        g_proj_energy = jnp.sum(jnp.square(g_proj))
+        d_proj_energy = jnp.sum(jnp.square(d_proj))
+        update_energy_frac_all = jnp.square(d_proj) / (update_energy + eps)
+        tracked_update_energy_frac = d_proj_energy / (update_energy + eps)
+        tracked_grad_energy_frac = g_proj_energy / (grad_energy + eps)
+        tracked_update_grad_cosine = -jnp.sum(d_proj * g_proj) / (
+            jnp.sqrt(d_proj_energy) * jnp.sqrt(g_proj_energy) + eps
+        )
+
+        def _split_metrics(mask: Array) -> tuple[Array, Array, Array]:
+            masked_g_proj = jnp.where(mask, g_proj, 0.0)
+            masked_d_proj = jnp.where(mask, d_proj, 0.0)
+            masked_g_energy = jnp.sum(jnp.square(masked_g_proj))
+            masked_d_energy = jnp.sum(jnp.square(masked_d_proj))
+            update_frac = masked_d_energy / (update_energy + eps)
+            grad_frac = masked_g_energy / (grad_energy + eps)
+            cosine = -jnp.sum(masked_d_proj * masked_g_proj) / (
+                jnp.sqrt(masked_d_energy) * jnp.sqrt(masked_g_energy) + eps
+            )
+            has_modes = jnp.any(mask)
+            return (
+                jnp.where(has_modes, update_frac, nan),
+                jnp.where(has_modes, grad_frac, nan),
+                jnp.where(has_modes, cosine, nan),
+            )
+
+        if signed_split_enabled:
+            pos_mask = all_eigenvalues > eps
+            neg_mask = all_eigenvalues < -eps
+            (
+                pos_update_energy_frac,
+                pos_grad_energy_frac,
+                pos_update_grad_cosine,
+            ) = _split_metrics(pos_mask)
+            (
+                neg_update_energy_frac,
+                neg_grad_energy_frac,
+                neg_update_grad_cosine,
+            ) = _split_metrics(neg_mask)
+        else:
+            pos_update_energy_frac = nan
+            neg_update_energy_frac = nan
+            pos_grad_energy_frac = nan
+            neg_grad_energy_frac = nan
+            pos_update_grad_cosine = nan
+            neg_update_grad_cosine = nan
 
         # Relative threshold is taken against the largest projected gradient in
         # the tracked modes, with an absolute floor to keep near-zero ratios sane.
@@ -300,6 +394,8 @@ def track_eigenstate(
         extra_g_proj = g_proj[k : k + extra_k]
         top_d_proj = d_proj[:k]
         extra_d_proj = d_proj[k : k + extra_k]
+        top_update_energy_frac = update_energy_frac_all[:k]
+        extra_update_energy_frac = update_energy_frac_all[k : k + extra_k]
         top_alpha_valid = alpha_valid[:k]
         extra_alpha_valid = alpha_valid[k : k + extra_k]
 
@@ -329,9 +425,20 @@ def track_eigenstate(
         extra_g_proj = eigen_state.extra_g_proj
         top_d_proj = eigen_state.d_proj
         extra_d_proj = eigen_state.extra_d_proj
+        top_update_energy_frac = eigen_state.update_energy_frac
+        extra_update_energy_frac = eigen_state.extra_update_energy_frac
         top_alpha_valid = eigen_state.alpha_valid
         extra_alpha_valid = eigen_state.extra_alpha_valid
         eff_cond = jnp.array(0.0, dtype=eigenvalues.dtype)
+        tracked_update_energy_frac = eigen_state.tracked_update_energy_frac
+        tracked_grad_energy_frac = eigen_state.tracked_grad_energy_frac
+        tracked_update_grad_cosine = eigen_state.tracked_update_grad_cosine
+        pos_update_energy_frac = eigen_state.pos_update_energy_frac
+        neg_update_energy_frac = eigen_state.neg_update_energy_frac
+        pos_grad_energy_frac = eigen_state.pos_grad_energy_frac
+        neg_grad_energy_frac = eigen_state.neg_grad_energy_frac
+        pos_update_grad_cosine = eigen_state.pos_update_grad_cosine
+        neg_update_grad_cosine = eigen_state.neg_update_grad_cosine
 
     return eigen_state._replace(
         step=step,
@@ -345,6 +452,8 @@ def track_eigenstate(
         extra_g_proj=extra_g_proj,
         d_proj=top_d_proj,
         extra_d_proj=extra_d_proj,
+        update_energy_frac=top_update_energy_frac,
+        extra_update_energy_frac=extra_update_energy_frac,
         alpha=alpha,
         extra_alpha=extra_alpha,
         phi=phi,
@@ -354,6 +463,17 @@ def track_eigenstate(
         eff_cond=eff_cond,
         rng_key=rng_key,
         rotation_diff=rotation_diff,
+        grad_norm=grad_norm,
+        update_norm=update_norm,
+        tracked_update_energy_frac=tracked_update_energy_frac,
+        tracked_grad_energy_frac=tracked_grad_energy_frac,
+        tracked_update_grad_cosine=tracked_update_grad_cosine,
+        pos_update_energy_frac=pos_update_energy_frac,
+        neg_update_energy_frac=neg_update_energy_frac,
+        pos_grad_energy_frac=pos_grad_energy_frac,
+        neg_grad_energy_frac=neg_grad_energy_frac,
+        pos_update_grad_cosine=pos_update_grad_cosine,
+        neg_update_grad_cosine=neg_update_grad_cosine,
     )
 
 

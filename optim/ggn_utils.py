@@ -877,3 +877,10 @@ def make_wasserstein_metric_matvec_fn_lm(
         return jtu.tree_map(lambda x: x / scale, mv_sum)
 
     return jax.jit(wasserstein_matvec)
+
+
+def make_svgd_metric_matvec_fn(*_args, **_kwargs) -> GGNMatvecFn:
+    raise NotImplementedError(
+        "SVGD curvature backend is referenced in optim.factory, but its metric "
+        "matvec is not implemented in optim.ggn_utils.py."
+    )
