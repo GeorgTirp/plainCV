@@ -437,9 +437,27 @@ def init_eigen_tracking_csv(
     csv_path = os.path.join(exp_dir, filename)
 
     header = (
-        ["global_step", "rotation_diff", "eff_cond"]
+        [
+            "global_step",
+            "rotation_diff",
+            "eff_cond",
+            "probe_loss_before",
+            "probe_loss_after",
+            "probe_loss_reduction",
+            "probe_acc_before",
+            "probe_acc_after",
+            "probe_acc_gain",
+        ]
         + [f"eig_{i}" for i in range(top_k)]
         + [f"extra_eig_{i}" for i in range(extra_modes)]
+        + [f"ritz_resid_{i}" for i in range(top_k)]
+        + [f"extra_ritz_resid_{i}" for i in range(extra_modes)]
+        + [f"g_proj_{i}" for i in range(top_k)]
+        + [f"extra_g_proj_{i}" for i in range(extra_modes)]
+        + [f"d_proj_{i}" for i in range(top_k)]
+        + [f"extra_d_proj_{i}" for i in range(extra_modes)]
+        + [f"alpha_valid_{i}" for i in range(top_k)]
+        + [f"extra_alpha_valid_{i}" for i in range(extra_modes)]
         + [f"alpha_{i}" for i in range(top_k)]
         + [f"extra_alpha_{i}" for i in range(extra_modes)]
         + [f"phi_{i}" for i in range(top_k)]
@@ -453,21 +471,81 @@ def init_eigen_tracking_csv(
     return csv_path
 
 
-def append_eigen_tracking_row(csv_path: str, tracking_state) -> None:
-    tracking_state = jax.device_get(tracking_state)
-    extra_eigenvalues = getattr(tracking_state, "extra_eigenvalues", ())
-    extra_alpha = getattr(tracking_state, "extra_alpha", ())
-    phi = getattr(tracking_state, "phi", ())
-    extra_phi = getattr(tracking_state, "extra_phi", ())
+def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics=None) -> None:
+    measurement_metrics = measurement_metrics or {}
+
+    def _metric(name: str) -> float:
+        value = measurement_metrics.get(name, float("nan"))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    # Avoid device_get on the whole state: it contains full eigenvector matrices
+    # that can be hundreds of GiB for LM-scale models.
+    scalar_step, scalar_rotation, scalar_eff_cond = jax.device_get(
+        (
+            tracking_state.step,
+            tracking_state.rotation_diff,
+            tracking_state.eff_cond,
+        )
+    )
+    (
+        eigenvalues,
+        extra_eigenvalues,
+        ritz_residual,
+        extra_ritz_residual,
+        g_proj,
+        extra_g_proj,
+        d_proj,
+        extra_d_proj,
+        alpha_valid,
+        extra_alpha_valid,
+        alpha,
+        extra_alpha,
+        phi,
+        extra_phi,
+    ) = jax.device_get(
+        (
+            tracking_state.eigenvalues,
+            getattr(tracking_state, "extra_eigenvalues", ()),
+            getattr(tracking_state, "ritz_residual", ()),
+            getattr(tracking_state, "extra_ritz_residual", ()),
+            getattr(tracking_state, "g_proj", ()),
+            getattr(tracking_state, "extra_g_proj", ()),
+            getattr(tracking_state, "d_proj", ()),
+            getattr(tracking_state, "extra_d_proj", ()),
+            getattr(tracking_state, "alpha_valid", ()),
+            getattr(tracking_state, "extra_alpha_valid", ()),
+            tracking_state.alpha,
+            getattr(tracking_state, "extra_alpha", ()),
+            getattr(tracking_state, "phi", ()),
+            getattr(tracking_state, "extra_phi", ()),
+        )
+    )
 
     row = (
         [
-            int(tracking_state.step),
-            float(tracking_state.rotation_diff),
-            float(tracking_state.eff_cond),
+            int(scalar_step),
+            float(scalar_rotation),
+            float(scalar_eff_cond),
+            _metric("probe_loss_before"),
+            _metric("probe_loss_after"),
+            _metric("probe_loss_reduction"),
+            _metric("probe_acc_before"),
+            _metric("probe_acc_after"),
+            _metric("probe_acc_gain"),
         ]
-        + [float(x) for x in tracking_state.eigenvalues]
+        + [float(x) for x in eigenvalues]
         + [float(x) for x in extra_eigenvalues]
+        + [float(x) for x in ritz_residual]
+        + [float(x) for x in extra_ritz_residual]
+        + [float(x) for x in g_proj]
+        + [float(x) for x in extra_g_proj]
+        + [float(x) for x in d_proj]
+        + [float(x) for x in extra_d_proj]
+        + [int(bool(x)) for x in alpha_valid]
+        + [int(bool(x)) for x in extra_alpha_valid]
         + [float(x) for x in tracking_state.alpha]
         + [float(x) for x in extra_alpha]
         + [float(x) for x in phi]

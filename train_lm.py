@@ -353,6 +353,102 @@ def _make_apply_grads_fn(grad_clip: Optional[float], use_pmap: bool):
     return apply_grads
 
 
+def _make_probe_measurement_fn(
+    model,
+    tx,
+    curvature_batch,
+    grad_clip: Optional[float],
+    use_doc_mask: bool,
+):
+    probe_inputs, probe_labels, probe_attn_mask = curvature_batch
+
+    def probe_loss_acc_for_batch(params, inputs, labels, attn_mask):
+        logits = model.apply(
+            {"params": params},
+            inputs,
+            attn_mask=attn_mask if use_doc_mask else None,
+            deterministic=True,
+        )
+        return _loss_and_acc(logits, labels)
+
+    def probe_grad_for_batch(params, inputs, labels, attn_mask):
+        def loss_fn(p):
+            return probe_loss_acc_for_batch(p, inputs, labels, attn_mask)
+
+        (_loss, _acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        return grads
+
+    def probe_loss_acc(params):
+        if probe_inputs.ndim == 2:
+            return probe_loss_acc_for_batch(
+                params,
+                probe_inputs,
+                probe_labels,
+                probe_attn_mask,
+            )
+
+        num_probe_batches = int(probe_inputs.shape[0])
+        loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        acc_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        for i in range(num_probe_batches):
+            batch_attn_mask = None if probe_attn_mask is None else probe_attn_mask[i]
+            loss_i, acc_i = probe_loss_acc_for_batch(
+                params,
+                probe_inputs[i],
+                probe_labels[i],
+                batch_attn_mask,
+            )
+            loss_sum = loss_sum + loss_i
+            acc_sum = acc_sum + acc_i
+        scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+        return loss_sum / scale, acc_sum / scale
+
+    @jax.jit
+    def compute_probe_measurement(params, opt_state):
+        if probe_inputs.ndim == 2:
+            probe_grads = probe_grad_for_batch(
+                params,
+                probe_inputs,
+                probe_labels,
+                probe_attn_mask,
+            )
+        else:
+            num_probe_batches = int(probe_inputs.shape[0])
+            grads_sum = None
+            for i in range(num_probe_batches):
+                batch_attn_mask = None if probe_attn_mask is None else probe_attn_mask[i]
+                grads_i = probe_grad_for_batch(
+                    params,
+                    probe_inputs[i],
+                    probe_labels[i],
+                    batch_attn_mask,
+                )
+                grads_sum = grads_i if grads_sum is None else jtu.tree_map(
+                    lambda acc, x: acc + x,
+                    grads_sum,
+                    grads_i,
+                )
+            scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+            probe_grads = jtu.tree_map(lambda g: g / scale, grads_sum)
+
+        probe_grads = _clip_grads(probe_grads, grad_clip)
+        probe_updates, _new_opt_state = tx.update(probe_grads, opt_state, params)
+        probe_params_after = optax.apply_updates(params, probe_updates)
+        loss_before, acc_before = probe_loss_acc(params)
+        loss_after, acc_after = probe_loss_acc(probe_params_after)
+        measurement_metrics = {
+            "probe_loss_before": loss_before,
+            "probe_loss_after": loss_after,
+            "probe_loss_reduction": loss_before - loss_after,
+            "probe_acc_before": acc_before,
+            "probe_acc_after": acc_after,
+            "probe_acc_gain": acc_after - acc_before,
+        }
+        return probe_grads, probe_updates, measurement_metrics
+
+    return compute_probe_measurement
+
+
 def _merge_batches(batches):
     if len(batches) == 1:
         return batches[0]
@@ -380,6 +476,56 @@ def _next_batch(it, loader, num_batches: int = 1):
             batch = next(it)
         batches.append(batch)
     return _merge_batches(batches), it
+
+
+def _stack_optional(values):
+    if values[0] is None:
+        return None
+    return jnp.stack(values, axis=0)
+
+
+def _build_curvature_probe_batch(
+    cfg,
+    loader,
+    *,
+    seq_len: int,
+    use_doc_mask: bool,
+    grouped_batches: int,
+):
+    num_probe_batches = getattr(cfg, "eigen_tracking_curvature_batches", None)
+    if num_probe_batches is None:
+        num_probe_batches = 1
+    num_probe_batches = int(num_probe_batches)
+    if num_probe_batches <= 0:
+        raise ValueError("eigen_tracking_curvature_batches must be >= 1.")
+
+    inputs_list = []
+    labels_list = []
+    attn_mask_list = []
+    probe_iter = iter(loader)
+    for _ in range(num_probe_batches):
+        curv_raw, probe_iter = _next_batch(
+            probe_iter,
+            loader,
+            num_batches=grouped_batches,
+        )
+        curv_inputs, curv_labels, curv_attn_mask = _prepare_batch(
+            curv_raw,
+            seq_len,
+            use_doc_mask,
+        )
+        inputs_list.append(curv_inputs)
+        labels_list.append(curv_labels)
+        attn_mask_list.append(curv_attn_mask)
+
+    if num_probe_batches == 1:
+        return inputs_list[0], labels_list[0], attn_mask_list[0]
+
+    return (
+        jnp.stack(inputs_list, axis=0),
+        jnp.stack(labels_list, axis=0),
+        _stack_optional(attn_mask_list),
+    )
 
 
 def _iter_grouped_batches(loader, num_batches: int = 1):
@@ -509,13 +655,18 @@ def run(cfg):
 
     trainloader, validloader = get_dataloaders(cfg)
 
-    # Build a deterministic curvature batch (first batch) for curvature-based optimizers.
-    # This is safe for all optimizers and required for PNS/Sophia/HF-like methods.
+    # Build a deterministic fixed curvature probe for curvature-based optimizers.
+    # Multiple microbatches are averaged inside the LM GGN matvec to reduce
+    # one-batch curvature noise without changing training batches.
     curvature_batch = None
     try:
-        curv_raw, _ = _next_batch(iter(trainloader), trainloader, num_batches=grouped_batches)
-        curv_inputs, curv_labels, curv_attn_mask = _prepare_batch(curv_raw, cfg.seq_len, use_doc_mask)
-        curvature_batch = (curv_inputs, curv_labels, curv_attn_mask)
+        curvature_batch = _build_curvature_probe_batch(
+            cfg,
+            trainloader,
+            seq_len=cfg.seq_len,
+            use_doc_mask=use_doc_mask,
+            grouped_batches=grouped_batches,
+        )
     except Exception as exc:
         # If an optimizer needs curvature, it'll raise later with a clearer message.
         print(f"Warning: could not build curvature_batch: {exc}")
@@ -529,9 +680,19 @@ def run(cfg):
     if use_pmap:
         state = flax_jax_utils.replicate(state)
 
+    grad_clip = getattr(cfg, "grad_clip", None)
     eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
     eigen_tracking_state = None
     eigen_tracking_csv_path = None
+    eigen_tracking_measurement_mode = str(
+        getattr(cfg, "eigen_tracking_measurement_mode", "actual_update")
+    ).lower()
+    if eigen_tracking_measurement_mode not in {"actual_update", "probe_update"}:
+        raise ValueError(
+            "eigen_tracking_measurement_mode must be one of "
+            "{'actual_update', 'probe_update'}."
+        )
+    compute_probe_measurement = None
     if eigen_tracking_enabled:
         if curvature_batch is None:
             raise ValueError(
@@ -610,6 +771,15 @@ def run(cfg):
                 learning_rate=float(cfg.lr),
             )
 
+        if eigen_tracking_measurement_mode == "probe_update":
+            compute_probe_measurement = _make_probe_measurement_fn(
+                model,
+                tx,
+                curvature_batch,
+                grad_clip=grad_clip,
+                use_doc_mask=use_doc_mask,
+            )
+
     compute_grads, eval_step = _make_train_fns(
         model,
         cfg.vocab_size,
@@ -622,7 +792,6 @@ def run(cfg):
     log_every = int(getattr(cfg, "log_every_steps", 10))
     eval_every = getattr(cfg, "eval_every_steps", None)
     eval_every = int(eval_every) if eval_every is not None else None
-    grad_clip = getattr(cfg, "grad_clip", None)
     world_size = int(jax.process_count()) * int(n_devices)
     tokens_per_step = (
         int(cfg.seq_len)
@@ -663,21 +832,37 @@ def run(cfg):
 
         grads_accum = jtu.tree_map(lambda g: g / grad_accum_steps, grads_accum)
         params_before = _unwrap_replicated(state.params, use_pmap) if eigen_tracking_enabled else None
+        opt_state_before = (
+            _unwrap_replicated(state.opt_state, use_pmap)
+            if eigen_tracking_enabled and eigen_tracking_measurement_mode == "probe_update"
+            else None
+        )
         state, updates = apply_grads(state, grads_accum)
 
         global_step += 1
 
         if eigen_tracking_enabled and _should_run_eigen_tracking_for_step(cfg, global_step):
+            measurement_metrics = None
+            if eigen_tracking_measurement_mode == "probe_update":
+                tracking_grads, tracking_updates, measurement_metrics = compute_probe_measurement(
+                    params_before,
+                    opt_state_before,
+                )
+            else:
+                tracking_grads = _unwrap_replicated(grads_accum, use_pmap)
+                tracking_updates = _unwrap_replicated(updates, use_pmap)
+
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
-                _unwrap_replicated(grads_accum, use_pmap),
-                _unwrap_replicated(updates, use_pmap),
+                tracking_grads,
+                tracking_updates,
                 _unwrap_replicated(state.step, use_pmap),
                 eigen_tracking_state,
             )
             append_eigen_tracking_row(
                 eigen_tracking_csv_path,
                 eigen_tracking_state,
+                measurement_metrics=measurement_metrics,
             )
 
         if global_step % log_every == 0:

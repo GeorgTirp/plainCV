@@ -135,22 +135,80 @@ def make_ggn_matvec_fn_lm(
             return _single_batch_ggn_matvec(params, vec_pytree, input_ids, labels, attn_mask)
 
         num_probe_batches = int(input_ids.shape[0])
-        hvps = []
+        hvp_sum = None
         for i in range(num_probe_batches):
             batch_attn_mask = None if attn_mask is None else attn_mask[i]
-            hvps.append(
-                _single_batch_ggn_matvec(
-                    params,
-                    vec_pytree,
-                    input_ids[i],
-                    labels[i],
-                    batch_attn_mask,
-                )
+            hvp_i = _single_batch_ggn_matvec(
+                params,
+                vec_pytree,
+                input_ids[i],
+                labels[i],
+                batch_attn_mask,
+            )
+            hvp_sum = hvp_i if hvp_sum is None else jtu.tree_map(
+                lambda acc, x: acc + x,
+                hvp_sum,
+                hvp_i,
             )
         scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
-        return jtu.tree_map(lambda *xs: sum(xs) / scale, *hvps)
+        return jtu.tree_map(lambda x: x / scale, hvp_sum)
 
     return jax.jit(ggn_matvec)
+
+
+def make_hessian_matvec_fn_lm(
+    model_def: Any,
+    curvature_batch: Tuple[Array, Array, Optional[Array]],
+    batch_stats: Optional[PyTree] = None,
+) -> HessianMatvecFn:
+    """Build a signed Hessian matvec for a Flax causal LM."""
+    input_ids, labels, attn_mask = curvature_batch
+
+    def _single_batch_loss(
+        params: Params,
+        batch_input_ids: Array,
+        batch_labels: Array,
+        batch_attn_mask: Optional[Array],
+    ) -> Array:
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        out = model_def.apply(
+            variables,
+            batch_input_ids,
+            attn_mask=batch_attn_mask,
+            deterministic=True,
+        )
+        logits = _extract_logits(out).astype(jnp.float32)
+        return optax.softmax_cross_entropy_with_integer_labels(logits, batch_labels).mean()
+
+    def loss_fn(params: Params) -> Array:
+        if input_ids.ndim == 2:
+            return _single_batch_loss(params, input_ids, labels, attn_mask)
+
+        num_probe_batches = int(input_ids.shape[0])
+        loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        for i in range(num_probe_batches):
+            batch_attn_mask = None if attn_mask is None else attn_mask[i]
+            loss_sum = loss_sum + _single_batch_loss(
+                params,
+                input_ids[i],
+                labels[i],
+                batch_attn_mask,
+            )
+        return loss_sum / jnp.asarray(num_probe_batches, dtype=jnp.float32)
+
+    def hvp_fn(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        del rng_key
+        _, hvp = jax.jvp(
+            jax.grad(loss_fn),
+            (params,),
+            (vec_pytree,),
+        )
+        return hvp
+
+    return jax.jit(hvp_fn)
 
 
 def make_ggn_matvec_fn(
@@ -583,163 +641,239 @@ def make_wasserstein_metric_matvec_fn(
     return jax.jit(gw_matvec)
 
 
-def make_svgd_metric_matvec_fn(
+def _softmax_jacobian_vec_from_probs(p: Array, v: Array) -> Array:
+    """Apply S(p)v = (diag(p) - pp^T)v."""
+    inner = jnp.sum(p * v, axis=-1, keepdims=True)
+    return p * (v - inner)
+
+
+def _build_local_embedding_laplacian(
+    p: Array,
+    embeds: Array,
+    *,
+    graph_temp: float,
+    graph_eps: float,
+) -> Array:
+    """Build K x K probability-weighted graph Laplacian on top-k token support."""
+    p = p.astype(jnp.float32)
+    embeds = embeds.astype(jnp.float32)
+
+    diffs = embeds[:, None, :] - embeds[None, :, :]
+    dist2 = jnp.sum(diffs * diffs, axis=-1)
+
+    if graph_temp <= 0.0:
+        tau = jnp.maximum(jnp.mean(dist2), graph_eps)
+    else:
+        tau = jnp.asarray(graph_temp, dtype=jnp.float32)
+
+    A = jnp.exp(-dist2 / tau)
+    K = A.shape[0]
+    A = A * (1.0 - jnp.eye(K, dtype=A.dtype))
+
+    # Mobility choice: arithmetic mean of endpoint masses.
+    W = A * 0.5 * (p[:, None] + p[None, :])
+
+    degree = jnp.sum(W, axis=-1)
+    L = jnp.diag(degree) - W
+    return L
+
+
+def _solve_laplacian_symmetric_gauge(
+    L: Array,
+    b: Array,
+    *,
+    ridge: float,
+) -> Array:
+    """
+    Symmetric gauge-fixed approximation to L^dagger b.
+
+    We solve:
+        (L + ridge I + 11^T/K) x = b,
+    then remove the mean of x.
+    """
+    K = L.shape[0]
+    dtype = L.dtype
+
+    b = b - jnp.mean(b)
+
+    I = jnp.eye(K, dtype=dtype)
+    gauge = jnp.ones((K, K), dtype=dtype) / jnp.asarray(K, dtype=dtype)
+
+    A = L + jnp.asarray(ridge, dtype=dtype) * I + gauge
+    x = jnp.linalg.solve(A, b)
+    x = x - jnp.mean(x)
+    return x
+
+
+def make_wasserstein_metric_matvec_fn_lm(
     model_def: Any,
-    curvature_batch: Tuple[Array, Array],
+    curvature_batch: Tuple[Array, Array, Optional[Array]],
+    token_embedding_matrix: Array,
     batch_stats: Optional[PyTree] = None,
     *,
-    kernel_bandwidth: float = 1.0,
-    kernel_scale: float = 1.0,
-    feature: str = "logits",  # "logits" or "probs"
+    top_k: int = 128,
+    graph_temp: float = 0.0,
+    graph_eps: float = 1e-6,
+    laplacian_ridge: float = 1e-4,
+    ignore_label: int = -100,
 ) -> GGNMatvecFn:
     """
-    Build an SVGD-style kernel metric matvec H v for the training loss
-    on a fixed curvature_batch (images, labels).
+    Build a matrix-vector product for the Wasserstein/Otto pullback metric.
 
-    We approximate a PSD operator of the form
-
-        H(θ) v ≈ (1/B^2) Σ_{i,j} k(z_i, z_j) g_j (g_i^T v),
+    Operator:
+        W(θ) v =
+            J_z^T S(p)^T L(p)^dagger S(p) J_z v
 
     where:
-      - g_i  = ∇_θ ℓ_i(θ) is the per-example gradient (softmax CE),
-      - z_i  are per-example features (logits or probabilities),
-      - k(·,·) is an RBF kernel in feature space.
+      - z are LM logits,
+      - p is the restricted top-k softmax distribution,
+      - S(p) = diag(p) - pp^T,
+      - L(p) is a probability-weighted graph Laplacian over top-k token embeddings.
+
+    This is not a loss Hessian. It is a Wasserstein pullback metric-vector product,
+    suitable for Lanczos exactly like your GGN/Hessian matvecs.
 
     Args:
-      model_def: Flax Linen Module (classifier).
-      curvature_batch: (images, labels) used for the metric estimation.
-      batch_stats: BatchNorm stats PyTree or None.
-      kernel_bandwidth: RBF kernel bandwidth σ (k = exp(-||z_i - z_j||^2 / (2 σ^2))).
-      kernel_scale: extra multiplicative factor on the kernel.
-      feature: "logits" or "probs" (what to use as z_i).
+      model_def: Flax LM module.
+      curvature_batch: (input_ids, labels, attn_mask).
+        input_ids: (B, T) or (P, B, T)
+        labels: (B, T) or (P, B, T), used only for masking ignore_label.
+        attn_mask: optional attention mask, matching your model.
+      token_embedding_matrix: (V, D) token embeddings defining ground geometry.
+      top_k: vocabulary support size per token position.
+      graph_temp: RBF temperature for token graph. If <= 0, uses mean pairwise dist2.
+      graph_eps: numerical epsilon for graph temperature.
+      laplacian_ridge: ridge used in symmetric gauge-fixed Laplacian solve.
+      ignore_label: labels equal to this are excluded from the average.
 
     Returns:
-      svgd_matvec(params, vec_pytree, rng) -> PyTree with same structure as params.
+      wasserstein_matvec(params, vec_pytree, rng_key) -> PyTree like params.
     """
-    images, labels = curvature_batch
-    batch_size = images.shape[0]
+    input_ids, labels, attn_mask = curvature_batch
+    token_embedding_matrix = token_embedding_matrix.astype(jnp.float32)
 
-    # ---- 1. Per-example loss + feature ----
-
-    def loss_and_feat_single(
+    def _single_batch_matvec(
         params: Params,
-        image: Array,
-        label: Array,
-        rng: Array,
-    ) -> Tuple[Array, Array]:
-        """Single-example NLL + feature vector z_i."""
-        variables = {"params": params}
-        if batch_stats is not None:
-            variables["batch_stats"] = batch_stats
+        vec_pytree: PyTree,
+        batch_input_ids: Array,
+        batch_labels: Array,
+        batch_attn_mask: Optional[Array],
+    ) -> PyTree:
 
-        out = model_def.apply(
-            variables,
-            image[None, ...],        # add batch dim
-            mutable=False,
-            train=False,
-            rngs={"dropout": rng},   # safe even if model has no dropout
-        )
+        def logits_fn(p: Params) -> Array:
+            variables = {"params": p}
+            if batch_stats is not None:
+                variables["batch_stats"] = batch_stats
 
-        # Extract logits robustly if model returns a tuple
-        if isinstance(out, tuple):
-            logits = out[0]          # (1, C)
-        else:
-            logits = out             # (1, C)
+            out = model_def.apply(
+                variables,
+                batch_input_ids,
+                attn_mask=batch_attn_mask,
+                deterministic=True,
+            )
+            return _extract_logits(out)
 
-        logits = logits[0]           # (C,)
-        num_classes = logits.shape[-1]
+        logits, jvp_logits = jax.jvp(
+            logits_fn,
+            (params,),
+            (vec_pytree,),
+        )  # (B, T, V)
 
-        one_hot = jax.nn.one_hot(label, num_classes=num_classes)  # (C,)
-        # optax expects (..., C) with batch dimension
-        xent = optax.softmax_cross_entropy(
-            logits[None, :],
-            one_hot[None, :],
-        ).mean()  # scalar
+        B, T, V = logits.shape
+        N = B * T
 
-        if feature == "probs":
-            z = jax.nn.softmax(logits, axis=-1)     # (C,)
-        elif feature == "logits":
-            z = logits                              # (C,)
-        else:
-            raise ValueError(f"Unknown feature type: {feature}")
+        logits2 = logits.reshape(N, V).astype(jnp.float32)
+        jvp2 = jvp_logits.reshape(N, V).astype(jnp.float32)
+        labels2 = batch_labels.reshape(N)
 
-        return xent, z
+        valid = (labels2 != ignore_label).astype(jnp.float32)  # (N,)
+        denom = jnp.maximum(jnp.sum(valid), 1.0)
 
-    # value_and_grad: returns ((loss, z), grad)
-    loss_and_feat_grad = jax.value_and_grad(
-        loss_and_feat_single,
-        argnums=0,
-        has_aux=True,
-    )
+        # Top-k predictive support per token position.
+        top_vals, top_idx = jax.lax.top_k(logits2, top_k)  # (N, K), (N, K)
+        dz_top = jnp.take_along_axis(jvp2, top_idx, axis=-1)  # (N, K)
 
-    def per_example_grads_and_feats(params: Params, rng: Array):
-        """Compute (g_i, z_i) for all examples in curvature_batch."""
-        rngs = jax.random.split(rng, batch_size)
+        # Restricted simplex probabilities.
+        p_top = jax.nn.softmax(top_vals, axis=-1)  # (N, K)
 
-        def one_example(image, label, rng_i):
-            (loss_i, z_i), g_i = loss_and_feat_grad(params, image, label, rng_i)
-            return g_i, z_i
+        def apply_one(p_i: Array, dz_i: Array, idx_i: Array, valid_i: Array) -> Array:
+            # δp = S(p) J_z v
+            dp_i = _softmax_jacobian_vec_from_probs(p_i, dz_i)
 
-        grads, feats = jax.vmap(
-            one_example,
-            in_axes=(0, 0, 0),
-        )(images, labels, rngs)
-        # grads: PyTree with leading batch dim (B, ...)
-        # feats: (B, D)
-        return grads, feats
+            embeds_i = token_embedding_matrix[idx_i]  # (K, D)
 
-    # ---- 2. RBF kernel in feature space ----
+            L_i = _build_local_embedding_laplacian(
+                p_i,
+                embeds_i,
+                graph_temp=graph_temp,
+                graph_eps=graph_eps,
+            )
 
-    def rbf_kernel(feats: Array) -> Array:
-        """
-        Compute RBF kernel matrix K_ij = scale * exp(-||z_i - z_j||^2 / (2 σ^2)).
+            # φ = L(p)^dagger δp
+            phi_i = _solve_laplacian_symmetric_gauge(
+                L_i,
+                dp_i,
+                ridge=laplacian_ridge,
+            )
 
-        feats: (B, D)
-        returns: (B, B)
-        """
-        # Pairwise squared distances
-        diffs = feats[:, None, :] - feats[None, :, :]   # (B, B, D)
-        sqdist = jnp.sum(diffs * diffs, axis=-1)        # (B, B)
+            # S(p)^T φ = S(p)φ since S is symmetric.
+            az_i = _softmax_jacobian_vec_from_probs(p_i, phi_i)
 
-        sigma2 = kernel_bandwidth ** 2 + 1e-12
-        K = jnp.exp(-sqdist / (2.0 * sigma2))
-        return kernel_scale * K
+            return valid_i * az_i
 
-    # ---- 3. SVGD-style matvec: H v ----
+        az_top = jax.vmap(apply_one, in_axes=(0, 0, 0, 0))(
+            p_top,
+            dz_top,
+            top_idx,
+            valid,
+        )  # (N, K)
 
-    def svgd_matvec(params: Params, vec_pytree: PyTree, rng: Array) -> PyTree:
-        """
-        H(θ) v ≈ (1/B^2) Σ_{i,j} k(z_i,z_j) g_j (g_i^T v).
-        """
-        grads, feats = per_example_grads_and_feats(params, rng)
-        K = rbf_kernel(feats)  # (B, B)
+        # Scatter top-k cotangents back to full vocab logits.
+        az_full = jnp.zeros_like(logits2)
+        az_full = az_full.at[
+            jnp.arange(N)[:, None],
+            top_idx,
+        ].add(az_top)
 
-        # a) α_i = <g_i, v>
-        def per_leaf_dot(g_leaf: Array, v_leaf: Array) -> Array:
-            # g_leaf: (B, ...), v_leaf: (...,)
-            # result: (B,)
-            return jnp.einsum("i..., ...->i", g_leaf, v_leaf)
+        # Match mean-over-valid-token scaling.
+        az_full = az_full / denom
+        az_full = az_full.reshape(B, T, V).astype(logits.dtype)
 
-        per_leaf_dots = jax.tree_util.tree_map(per_leaf_dot, grads, vec_pytree)
-        alphas = functools.reduce(
-            lambda acc, x: acc + x,
-            jax.tree_util.tree_leaves(per_leaf_dots),
-            jnp.zeros((batch_size,), dtype=images.dtype),
-        )  # shape (B,)
+        _, vjp_fun = jax.vjp(logits_fn, params)
+        out_params, = vjp_fun(az_full)
+        return out_params
 
-        # b) β_j = Σ_i K_{ij} α_i  (we use K^T @ α)
-        betas = K.T @ alphas  # (B,)
+    def wasserstein_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        del rng_key
 
-        # c) H v = (1/B^2) Σ_j β_j g_j   (same pattern as empirical Fisher but with β)
-        scale = 1.0 / (batch_size ** 2)
+        if input_ids.ndim == 2:
+            return _single_batch_matvec(
+                params,
+                vec_pytree,
+                input_ids,
+                labels,
+                attn_mask,
+            )
 
-        def combine_leaf(g_leaf: Array) -> Array:
-            # g_leaf: (B, ...)
-            return scale * jnp.einsum("i, i...->...", betas, g_leaf)
+        num_probe_batches = int(input_ids.shape[0])
+        mv_sum = None
 
-        hv = jax.tree_util.tree_map(combine_leaf, grads)
-        return hv
+        for i in range(num_probe_batches):
+            batch_attn_mask = None if attn_mask is None else attn_mask[i]
+            mv_i = _single_batch_matvec(
+                params,
+                vec_pytree,
+                input_ids[i],
+                labels[i],
+                batch_attn_mask,
+            )
+            mv_sum = mv_i if mv_sum is None else jtu.tree_map(
+                lambda a, b: a + b,
+                mv_sum,
+                mv_i,
+            )
 
-    # JIT for repeated use in Lanczos, etc.
-    svgd_matvec_jit = jax.jit(svgd_matvec)
-    return svgd_matvec_jit
+        scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+        return jtu.tree_map(lambda x: x / scale, mv_sum)
+
+    return jax.jit(wasserstein_matvec)
