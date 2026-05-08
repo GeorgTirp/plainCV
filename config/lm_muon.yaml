@@ -62,13 +62,14 @@ muon_adaptive: false
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
-eigen_tracking_every: 1536
+eigen_tracking_every: 768
+eigen_tracking_measurement_mode: actual_update
 eigen_tracking_topk: 6
 eigen_tracking_extra_modes: 6
-eigen_tracking_curvature_batches: 8
+eigen_tracking_curvature_batches: 1
 eigen_tracking_lanczos_iters: 12
-eigen_tracking_backend: ggn
-eigen_tracking_sort_by_abs: null
+eigen_tracking_backend: hessian
+eigen_tracking_sort_by_abs: true
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 

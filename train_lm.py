@@ -63,7 +63,7 @@ from data.lm_loader import get_dataloaders
 from data.datasets.data_prep_utils import intra_doc_causal_mask
 from models.LM.constructor import construct_model
 from optim.eigentools import init_eigentracking, track_eigenstate
-from optim.factory import get_optimizer, build_curvature_matvec_fn
+from optim.factory import get_optimizer, build_lm_dynamic_curvature_matvec_fn
 from utils import (
     load_config,
     maybe_make_dir,
@@ -484,6 +484,16 @@ def _stack_optional(values):
     return jnp.stack(values, axis=0)
 
 
+def _stack_curvature_microbatches(inputs_list, labels_list, attn_mask_list):
+    if len(inputs_list) == 1:
+        return inputs_list[0], labels_list[0], attn_mask_list[0]
+    return (
+        jnp.stack(inputs_list, axis=0),
+        jnp.stack(labels_list, axis=0),
+        _stack_optional(attn_mask_list),
+    )
+
+
 def _build_curvature_probe_batch(
     cfg,
     loader,
@@ -694,9 +704,13 @@ def run(cfg):
         )
     compute_probe_measurement = None
     if eigen_tracking_enabled:
-        if curvature_batch is None:
+        if (
+            eigen_tracking_measurement_mode == "probe_update"
+            and curvature_batch is None
+        ):
             raise ValueError(
-                "eigen_tracking_enabled=True requires a valid curvature_batch."
+                "eigen_tracking_measurement_mode='probe_update' requires a "
+                "valid curvature_batch."
             )
 
         eigen_tracking_topk = int(
@@ -738,10 +752,9 @@ def run(cfg):
         eigen_tracking_light_ortho_every = int(
             getattr(cfg, "eigen_tracking_light_ortho_every", 4)
         )
-        eigen_tracking_matvec_fn = build_curvature_matvec_fn(
+        eigen_tracking_matvec_fn = build_lm_dynamic_curvature_matvec_fn(
             cfg,
             model_def=model,
-            curvature_batch=curvature_batch,
             batch_stats=None,
             backend=eigen_tracking_backend,
         )
@@ -759,7 +772,22 @@ def run(cfg):
         )
 
         @jax.jit
-        def run_eigen_tracking(params, grads, updates, step, tracking_state):
+        def run_eigen_tracking(
+            params,
+            grads,
+            updates,
+            step,
+            tracking_state,
+            tracking_curvature_batch,
+        ):
+            def matvec_fn(matvec_params, vec_pytree, rng_key):
+                return eigen_tracking_matvec_fn(
+                    matvec_params,
+                    vec_pytree,
+                    rng_key,
+                    tracking_curvature_batch,
+                )
+
             return track_eigenstate(
                 params=params,
                 grads=grads,
@@ -810,12 +838,34 @@ def run(cfg):
     start_time = time.time()
 
     while global_step < steps_budget:
+        tracking_this_step = (
+            eigen_tracking_enabled
+            and _should_run_eigen_tracking_for_step(cfg, global_step + 1)
+        )
+        tracking_inputs_list = (
+            []
+            if tracking_this_step
+            and eigen_tracking_measurement_mode == "actual_update"
+            else None
+        )
+        tracking_labels_list = [] if tracking_inputs_list is not None else None
+        tracking_attn_mask_list = [] if tracking_inputs_list is not None else None
         grads_accum = None
         loss_accum = None
         acc_accum = None
 
         for _ in range(grad_accum_steps):
             batch, train_iter = _next_batch(train_iter, trainloader, num_batches=grouped_batches)
+            if tracking_inputs_list is not None:
+                curv_inputs, curv_labels, curv_attn_mask = _prepare_batch(
+                    batch,
+                    cfg.seq_len,
+                    use_doc_mask,
+                )
+                tracking_inputs_list.append(curv_inputs)
+                tracking_labels_list.append(curv_labels)
+                tracking_attn_mask_list.append(curv_attn_mask)
+
             inputs, labels, attn_mask = _prepare_batch_for_devices(
                 batch,
                 cfg.seq_len,
@@ -845,16 +895,25 @@ def run(cfg):
 
         global_step += 1
 
-        if eigen_tracking_enabled and _should_run_eigen_tracking_for_step(cfg, global_step):
+        if tracking_this_step:
             measurement_metrics = None
             if eigen_tracking_measurement_mode == "probe_update":
                 tracking_grads, tracking_updates, measurement_metrics = compute_probe_measurement(
                     params_before,
                     opt_state_before,
                 )
+                tracking_curvature_batch = curvature_batch
             else:
-                tracking_grads = _unwrap_replicated(grads_accum, use_pmap)
+                tracking_grads = _clip_grads(
+                    _unwrap_replicated(grads_accum, use_pmap),
+                    grad_clip,
+                )
                 tracking_updates = _unwrap_replicated(updates, use_pmap)
+                tracking_curvature_batch = _stack_curvature_microbatches(
+                    tracking_inputs_list,
+                    tracking_labels_list,
+                    tracking_attn_mask_list,
+                )
 
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
@@ -862,6 +921,7 @@ def run(cfg):
                 tracking_updates,
                 _unwrap_replicated(state.step, use_pmap),
                 eigen_tracking_state,
+                tracking_curvature_batch,
             )
             append_eigen_tracking_row(
                 eigen_tracking_csv_path,

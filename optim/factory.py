@@ -14,6 +14,9 @@ from .pns_eigenadam import pns_eigenadam
 from .ggn_utils import (
     make_ggn_matvec_fn,
     make_ggn_matvec_fn_lm,
+    make_ggn_matvec_fn_lm_dynamic,
+    make_hessian_matvec_fn_lm,
+    make_hessian_matvec_fn_lm_dynamic,
     make_hessian_matvec_fn,
     make_fisher_matvec_fn,
     make_wasserstein_metric_matvec_fn,
@@ -120,10 +123,10 @@ def build_curvature_matvec_fn(
     selected_backend = (backend or getattr(cfg, "pns_curvature_backend", "ggn")).lower()
     is_lm = _is_lm_model(cfg)
 
-    if is_lm and selected_backend != "ggn":
+    if is_lm and selected_backend not in {"ggn", "hessian"}:
         raise ValueError(
             f"curvature backend '{selected_backend}' is not wired for LM yet. "
-            "Use 'ggn' for transformer models."
+            "Use 'ggn' or 'hessian' for transformer models."
         )
 
     if selected_backend == "ggn":
@@ -140,6 +143,12 @@ def build_curvature_matvec_fn(
         )
 
     if selected_backend == "hessian":
+        if is_lm:
+            return make_hessian_matvec_fn_lm(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+            )
         return make_hessian_matvec_fn(
             model_def=model_def,
             curvature_batch=curvature_batch,
@@ -175,6 +184,38 @@ def build_curvature_matvec_fn(
         )
 
     raise ValueError(f"Unknown curvature backend: {selected_backend}")
+
+
+def build_lm_dynamic_curvature_matvec_fn(
+    cfg,
+    *,
+    model_def: Any,
+    batch_stats: Any = None,
+    backend: Optional[str] = None,
+):
+    if model_def is None:
+        raise ValueError("model_def is required to build a curvature matvec.")
+
+    selected_backend = (backend or getattr(cfg, "pns_curvature_backend", "ggn")).lower()
+    if not _is_lm_model(cfg):
+        raise ValueError("Dynamic curvature batches are only wired for LM models.")
+
+    if selected_backend == "ggn":
+        return make_ggn_matvec_fn_lm_dynamic(
+            model_def=model_def,
+            batch_stats=batch_stats,
+        )
+
+    if selected_backend == "hessian":
+        return make_hessian_matvec_fn_lm_dynamic(
+            model_def=model_def,
+            batch_stats=batch_stats,
+        )
+
+    raise ValueError(
+        f"curvature backend '{selected_backend}' is not wired for dynamic LM "
+        "curvature batches. Use 'ggn' or 'hessian'."
+    )
 
 
 def get_optimizer(

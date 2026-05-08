@@ -14,6 +14,8 @@ PyTree = Any
 # Type: matvec callable (params, vec_pytree, rng_key) -> vec_pytree
 GGNMatvecFn = Callable[[Params, PyTree, Array], PyTree]
 HessianMatvecFn = Callable[[Params, PyTree, Array], PyTree]
+LMCurvatureBatch = Tuple[Array, Array, Optional[Array]]
+DynamicLMMatvecFn = Callable[[Params, PyTree, Array, LMCurvatureBatch], PyTree]
 
 
 def softmax_cross_entropy_hessian_vec(
@@ -66,26 +68,10 @@ def _extract_logits(output: Any) -> Array:
     return output
 
 
-def make_ggn_matvec_fn_lm(
+def _make_single_batch_ggn_matvec_lm(
     model_def: Any,
-    curvature_batch: Tuple[Array, Array, Optional[Array]],
     batch_stats: Optional[PyTree] = None,
-) -> GGNMatvecFn:
-    """Build a GGN matvec function for a Flax causal LM with softmax CE.
-
-    The LM logits are (B, T, V) and labels are (B, T).
-    We flatten (B, T) into a single batch dimension for the Hessian.
-
-    Args:
-      model_def: Flax Linen Module for LM.
-      curvature_batch: (input_ids, labels, attn_mask).
-        input_ids: (B, T) int32
-        labels: (B, T) int32
-        attn_mask: (B, T, T) bool/additive or None
-      batch_stats: optional BatchNorm state (typically None for LM).
-    """
-    input_ids, labels, attn_mask = curvature_batch
-
+) -> Callable[[Params, PyTree, Array, Array, Optional[Array]], PyTree]:
     def _single_batch_ggn_matvec(
         params: Params,
         vec_pytree: PyTree,
@@ -129,7 +115,26 @@ def make_ggn_matvec_fn_lm(
         hv_params, = vjp_fun(hv_logits)
         return hv_params
 
-    def ggn_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+    return _single_batch_ggn_matvec
+
+
+def make_ggn_matvec_fn_lm_dynamic(
+    model_def: Any,
+    batch_stats: Optional[PyTree] = None,
+) -> DynamicLMMatvecFn:
+    """Build a GGN matvec for an LM with the curvature batch passed at call time."""
+    _single_batch_ggn_matvec = _make_single_batch_ggn_matvec_lm(
+        model_def,
+        batch_stats=batch_stats,
+    )
+
+    def ggn_matvec(
+        params: Params,
+        vec_pytree: PyTree,
+        rng_key: Array,
+        curvature_batch: LMCurvatureBatch,
+    ) -> PyTree:
+        input_ids, labels, attn_mask = curvature_batch
         del rng_key
         if input_ids.ndim == 2:
             return _single_batch_ggn_matvec(params, vec_pytree, input_ids, labels, attn_mask)
@@ -156,14 +161,39 @@ def make_ggn_matvec_fn_lm(
     return jax.jit(ggn_matvec)
 
 
-def make_hessian_matvec_fn_lm(
+def make_ggn_matvec_fn_lm(
     model_def: Any,
-    curvature_batch: Tuple[Array, Array, Optional[Array]],
+    curvature_batch: LMCurvatureBatch,
     batch_stats: Optional[PyTree] = None,
-) -> HessianMatvecFn:
-    """Build a signed Hessian matvec for a Flax causal LM."""
-    input_ids, labels, attn_mask = curvature_batch
+) -> GGNMatvecFn:
+    """Build a GGN matvec function for a Flax causal LM with softmax CE.
 
+    The LM logits are (B, T, V) and labels are (B, T).
+    We flatten (B, T) into a single batch dimension for the Hessian.
+
+    Args:
+      model_def: Flax Linen Module for LM.
+      curvature_batch: (input_ids, labels, attn_mask).
+        input_ids: (B, T) int32
+        labels: (B, T) int32
+        attn_mask: (B, T, T) bool/additive or None
+      batch_stats: optional BatchNorm state (typically None for LM).
+    """
+    dynamic_matvec = make_ggn_matvec_fn_lm_dynamic(
+        model_def,
+        batch_stats=batch_stats,
+    )
+
+    def ggn_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        return dynamic_matvec(params, vec_pytree, rng_key, curvature_batch)
+
+    return ggn_matvec
+
+
+def _make_single_batch_loss_lm(
+    model_def: Any,
+    batch_stats: Optional[PyTree] = None,
+) -> Callable[[Params, Array, Array, Optional[Array]], Array]:
     def _single_batch_loss(
         params: Params,
         batch_input_ids: Array,
@@ -183,24 +213,44 @@ def make_hessian_matvec_fn_lm(
         logits = _extract_logits(out).astype(jnp.float32)
         return optax.softmax_cross_entropy_with_integer_labels(logits, batch_labels).mean()
 
-    def loss_fn(params: Params) -> Array:
-        if input_ids.ndim == 2:
-            return _single_batch_loss(params, input_ids, labels, attn_mask)
+    return _single_batch_loss
 
-        num_probe_batches = int(input_ids.shape[0])
-        loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
-        for i in range(num_probe_batches):
-            batch_attn_mask = None if attn_mask is None else attn_mask[i]
-            loss_sum = loss_sum + _single_batch_loss(
-                params,
-                input_ids[i],
-                labels[i],
-                batch_attn_mask,
-            )
-        return loss_sum / jnp.asarray(num_probe_batches, dtype=jnp.float32)
 
-    def hvp_fn(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+def make_hessian_matvec_fn_lm_dynamic(
+    model_def: Any,
+    batch_stats: Optional[PyTree] = None,
+) -> DynamicLMMatvecFn:
+    """Build a signed LM Hessian matvec with the curvature batch passed at call time."""
+    _single_batch_loss = _make_single_batch_loss_lm(
+        model_def,
+        batch_stats=batch_stats,
+    )
+
+    def hvp_fn(
+        params: Params,
+        vec_pytree: PyTree,
+        rng_key: Array,
+        curvature_batch: LMCurvatureBatch,
+    ) -> PyTree:
+        input_ids, labels, attn_mask = curvature_batch
         del rng_key
+
+        def loss_fn(params: Params) -> Array:
+            if input_ids.ndim == 2:
+                return _single_batch_loss(params, input_ids, labels, attn_mask)
+
+            num_probe_batches = int(input_ids.shape[0])
+            loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+            for i in range(num_probe_batches):
+                batch_attn_mask = None if attn_mask is None else attn_mask[i]
+                loss_sum = loss_sum + _single_batch_loss(
+                    params,
+                    input_ids[i],
+                    labels[i],
+                    batch_attn_mask,
+                )
+            return loss_sum / jnp.asarray(num_probe_batches, dtype=jnp.float32)
+
         _, hvp = jax.jvp(
             jax.grad(loss_fn),
             (params,),
@@ -209,6 +259,23 @@ def make_hessian_matvec_fn_lm(
         return hvp
 
     return jax.jit(hvp_fn)
+
+
+def make_hessian_matvec_fn_lm(
+    model_def: Any,
+    curvature_batch: LMCurvatureBatch,
+    batch_stats: Optional[PyTree] = None,
+) -> HessianMatvecFn:
+    """Build a signed Hessian matvec for a Flax causal LM."""
+    dynamic_matvec = make_hessian_matvec_fn_lm_dynamic(
+        model_def,
+        batch_stats=batch_stats,
+    )
+
+    def hvp_fn(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        return dynamic_matvec(params, vec_pytree, rng_key, curvature_batch)
+
+    return hvp_fn
 
 
 def make_ggn_matvec_fn(
