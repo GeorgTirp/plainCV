@@ -61,13 +61,13 @@ shampoo_beta2: 0.9496977646795652
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
 eigen_tracking_every: 768
-eigen_tracking_measurement_mode: actual_update
+eigen_tracking_measurement_mode: probe_update
 eigen_tracking_post_soap_refresh: true
 eigen_tracking_topk: 6
 eigen_tracking_extra_modes: 6
 eigen_tracking_curvature_batches: 1
 eigen_tracking_lanczos_iters: 12
-eigen_tracking_backend: hessian
+eigen_tracking_backend: fisher
 eigen_tracking_sort_by_abs: true
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
