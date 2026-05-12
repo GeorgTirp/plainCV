@@ -22,6 +22,8 @@ from .ggn_utils import (
     make_fisher_matvec_fn_lm,
     make_fisher_matvec_fn_lm_dynamic,
     make_wasserstein_metric_matvec_fn,
+    make_wasserstein_metric_matvec_fn_lm,
+    make_wasserstein_metric_matvec_fn_lm_dynamic,
     make_svgd_metric_matvec_fn,
 )
 from .muon import build_muon_dim_numbers
@@ -109,6 +111,31 @@ def _is_lm_model(cfg) -> bool:
     return model_name == "transformer" or model_name.startswith("pythia")
 
 
+def _lm_wasserstein_kwargs(cfg) -> dict[str, Any]:
+    top_k = getattr(
+        cfg,
+        "wasserstein_lm_top_k",
+        getattr(cfg, "wasserstein_top_k", getattr(cfg, "wasserstein_topk", 128)),
+    )
+    max_positions = getattr(
+        cfg,
+        "wasserstein_lm_max_positions",
+        getattr(cfg, "wasserstein_max_positions", None),
+    )
+    return {
+        "top_k": int(top_k),
+        "max_positions": (
+            None if max_positions is None else int(max_positions)
+        ),
+        "graph_temp": float(getattr(cfg, "wasserstein_graph_temp", 0.0)),
+        "graph_eps": float(getattr(cfg, "wasserstein_graph_eps", 1e-6)),
+        "laplacian_ridge": float(
+            getattr(cfg, "wasserstein_laplacian_ridge", 1e-4)
+        ),
+        "ignore_label": int(getattr(cfg, "ignore_label", -100)),
+    }
+
+
 def build_curvature_matvec_fn(
     cfg,
     *,
@@ -125,10 +152,10 @@ def build_curvature_matvec_fn(
     selected_backend = (backend or getattr(cfg, "pns_curvature_backend", "ggn")).lower()
     is_lm = _is_lm_model(cfg)
 
-    if is_lm and selected_backend not in {"ggn", "hessian", "fisher"}:
+    if is_lm and selected_backend not in {"ggn", "hessian", "fisher", "wasserstein"}:
         raise ValueError(
             f"curvature backend '{selected_backend}' is not wired for LM yet. "
-            "Use 'ggn', 'hessian', or 'fisher' for transformer models."
+            "Use 'ggn', 'hessian', 'fisher', or 'wasserstein' for transformer models."
         )
 
     if selected_backend == "ggn":
@@ -172,7 +199,12 @@ def build_curvature_matvec_fn(
 
     if selected_backend == "wasserstein":
         if is_lm:
-            raise ValueError("Wasserstein curvature backend is not wired for LM.")
+            return make_wasserstein_metric_matvec_fn_lm(
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=batch_stats,
+                **_lm_wasserstein_kwargs(cfg),
+            )
         return make_wasserstein_metric_matvec_fn(
             model_def=model_def,
             curvature_batch=curvature_batch,
@@ -226,9 +258,16 @@ def build_lm_dynamic_curvature_matvec_fn(
             batch_stats=batch_stats,
         )
 
+    if selected_backend == "wasserstein":
+        return make_wasserstein_metric_matvec_fn_lm_dynamic(
+            model_def=model_def,
+            batch_stats=batch_stats,
+            **_lm_wasserstein_kwargs(cfg),
+        )
+
     raise ValueError(
         f"curvature backend '{selected_backend}' is not wired for dynamic LM "
-        "curvature batches. Use 'ggn', 'hessian', or 'fisher'."
+        "curvature batches. Use 'ggn', 'hessian', 'fisher', or 'wasserstein'."
     )
 
 

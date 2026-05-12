@@ -1,4 +1,5 @@
 # optim/ggn_utils.py
+from collections.abc import Mapping
 import functools
 from typing import Any, Callable, Tuple, Optional
 
@@ -235,28 +236,45 @@ def make_hessian_matvec_fn_lm_dynamic(
         input_ids, labels, attn_mask = curvature_batch
         del rng_key
 
-        def loss_fn(params: Params) -> Array:
-            if input_ids.ndim == 2:
-                return _single_batch_loss(params, input_ids, labels, attn_mask)
-
-            num_probe_batches = int(input_ids.shape[0])
-            loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
-            for i in range(num_probe_batches):
-                batch_attn_mask = None if attn_mask is None else attn_mask[i]
-                loss_sum = loss_sum + _single_batch_loss(
-                    params,
-                    input_ids[i],
-                    labels[i],
+        def single_hvp(
+            batch_input_ids: Array,
+            batch_labels: Array,
+            batch_attn_mask: Optional[Array],
+        ) -> PyTree:
+            def loss_fn(p: Params) -> Array:
+                return _single_batch_loss(
+                    p,
+                    batch_input_ids,
+                    batch_labels,
                     batch_attn_mask,
                 )
-            return loss_sum / jnp.asarray(num_probe_batches, dtype=jnp.float32)
 
-        _, hvp = jax.jvp(
-            jax.grad(loss_fn),
-            (params,),
-            (vec_pytree,),
+            _, hvp = jax.jvp(
+                jax.grad(loss_fn),
+                (params,),
+                (vec_pytree,),
+            )
+            return hvp
+
+        if input_ids.ndim == 2:
+            return single_hvp(input_ids, labels, attn_mask)
+
+        num_probe_batches = int(input_ids.shape[0])
+        hvp_zero = jtu.tree_map(jnp.zeros_like, params)
+
+        def body_fun(i: int, hvp_sum: PyTree) -> PyTree:
+            batch_attn_mask = None if attn_mask is None else attn_mask[i]
+            hvp_i = single_hvp(input_ids[i], labels[i], batch_attn_mask)
+            return jtu.tree_map(lambda acc, x: acc + x, hvp_sum, hvp_i)
+
+        hvp_sum = jax.lax.fori_loop(
+            0,
+            num_probe_batches,
+            body_fun,
+            hvp_zero,
         )
-        return hvp
+        scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+        return jtu.tree_map(lambda x: x / scale, hvp_sum)
 
     return jax.jit(hvp_fn)
 
@@ -276,6 +294,147 @@ def make_hessian_matvec_fn_lm(
         return dynamic_matvec(params, vec_pytree, rng_key, curvature_batch)
 
     return hvp_fn
+
+
+def _tree_vdot(x_tree: PyTree, y_tree: PyTree) -> Array:
+    leaves = jax.tree_util.tree_leaves(
+        jtu.tree_map(lambda x, y: jnp.vdot(x, y), x_tree, y_tree)
+    )
+    return functools.reduce(lambda acc, x: acc + x, leaves)
+
+
+def _make_single_sequence_loss_lm(
+    model_def: Any,
+    batch_stats: Optional[PyTree] = None,
+) -> Callable[[Params, Array, Array, Optional[Array]], Array]:
+    def _single_sequence_loss(
+        params: Params,
+        input_ids: Array,
+        labels: Array,
+        attn_mask: Optional[Array],
+    ) -> Array:
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+
+        batch_attn_mask = None if attn_mask is None else attn_mask[None, ...]
+        out = model_def.apply(
+            variables,
+            input_ids[None, ...],
+            attn_mask=batch_attn_mask,
+            deterministic=True,
+        )
+        logits = _extract_logits(out).astype(jnp.float32)[0]
+        return optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+
+    return _single_sequence_loss
+
+
+def make_fisher_matvec_fn_lm_dynamic(
+    model_def: Any,
+    batch_stats: Optional[PyTree] = None,
+) -> DynamicLMMatvecFn:
+    """Build a streaming empirical-Fisher matvec for LM sequence losses.
+
+    The empirical FIM here is formed from per-sequence gradients:
+      F v = mean_i g_i <g_i, v>
+    where g_i is the gradient of the mean token loss for sequence i.
+    """
+    _single_sequence_loss = _make_single_sequence_loss_lm(
+        model_def,
+        batch_stats=batch_stats,
+    )
+
+    def fisher_matvec_for_batch(
+        params: Params,
+        vec_pytree: PyTree,
+        batch_input_ids: Array,
+        batch_labels: Array,
+        batch_attn_mask: Optional[Array],
+    ) -> PyTree:
+        batch_size = int(batch_input_ids.shape[0])
+        fisher_zero = jtu.tree_map(jnp.zeros_like, params)
+
+        def body_fun(i: int, fisher_sum: PyTree) -> PyTree:
+            seq_attn_mask = None if batch_attn_mask is None else batch_attn_mask[i]
+
+            def loss_fn(p: Params) -> Array:
+                return _single_sequence_loss(
+                    p,
+                    batch_input_ids[i],
+                    batch_labels[i],
+                    seq_attn_mask,
+                )
+
+            grad_i = jax.grad(loss_fn)(params)
+            alpha_i = _tree_vdot(grad_i, vec_pytree)
+            return jtu.tree_map(
+                lambda acc, g: acc + alpha_i.astype(g.dtype) * g,
+                fisher_sum,
+                grad_i,
+            )
+
+        fisher_sum = jax.lax.fori_loop(
+            0,
+            batch_size,
+            body_fun,
+            fisher_zero,
+        )
+        scale = jnp.asarray(batch_size, dtype=jnp.float32)
+        return jtu.tree_map(lambda x: x / scale, fisher_sum)
+
+    def fisher_matvec(
+        params: Params,
+        vec_pytree: PyTree,
+        rng_key: Array,
+        curvature_batch: LMCurvatureBatch,
+    ) -> PyTree:
+        input_ids, labels, attn_mask = curvature_batch
+        del rng_key
+        if input_ids.ndim == 2:
+            return fisher_matvec_for_batch(params, vec_pytree, input_ids, labels, attn_mask)
+
+        num_probe_batches = int(input_ids.shape[0])
+        fisher_zero = jtu.tree_map(jnp.zeros_like, params)
+
+        def body_fun(i: int, fisher_sum: PyTree) -> PyTree:
+            batch_attn_mask = None if attn_mask is None else attn_mask[i]
+            fisher_i = fisher_matvec_for_batch(
+                params,
+                vec_pytree,
+                input_ids[i],
+                labels[i],
+                batch_attn_mask,
+            )
+            return jtu.tree_map(lambda acc, x: acc + x, fisher_sum, fisher_i)
+
+        fisher_sum = jax.lax.fori_loop(
+            0,
+            num_probe_batches,
+            body_fun,
+            fisher_zero,
+        )
+        scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+        return jtu.tree_map(lambda x: x / scale, fisher_sum)
+
+    return jax.jit(fisher_matvec)
+
+
+def make_fisher_matvec_fn_lm(
+    model_def: Any,
+    curvature_batch: LMCurvatureBatch,
+    batch_stats: Optional[PyTree] = None,
+) -> GGNMatvecFn:
+    """Build a fixed-batch empirical-Fisher matvec for LM sequence losses."""
+    dynamic_matvec = make_fisher_matvec_fn_lm_dynamic(
+        model_def,
+        batch_stats=batch_stats,
+    )
+
+    def fisher_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        return dynamic_matvec(params, vec_pytree, rng_key, curvature_batch)
+
+    return fisher_matvec
 
 
 def make_ggn_matvec_fn(
@@ -772,52 +931,108 @@ def _solve_laplacian_symmetric_gauge(
     return x
 
 
-def make_wasserstein_metric_matvec_fn_lm(
+def _iter_named_leaves(tree: PyTree, prefix=()):
+    if isinstance(tree, Mapping):
+        for key, value in tree.items():
+            yield from _iter_named_leaves(value, prefix + (str(key),))
+    else:
+        yield prefix, tree
+
+
+def _resolve_lm_token_embedding_matrix(
+    params: Params,
+    token_embedding_matrix: Optional[Array],
+    *,
+    vocab_size: int,
+) -> Array:
+    if token_embedding_matrix is not None:
+        matrix = token_embedding_matrix
+        if matrix.ndim != 2:
+            raise ValueError(
+                "token_embedding_matrix must have rank 2 for Wasserstein LM curvature."
+            )
+        if matrix.shape[0] == vocab_size:
+            return matrix.astype(jnp.float32)
+        if matrix.shape[1] == vocab_size:
+            return matrix.T.astype(jnp.float32)
+        raise ValueError(
+            "token_embedding_matrix must have one dimension matching the LM vocab size "
+            f"({vocab_size}); got shape {matrix.shape}."
+        )
+
+    candidates = []
+    for path, leaf in _iter_named_leaves(params):
+        shape = getattr(leaf, "shape", None)
+        if shape is None or len(shape) != 2:
+            continue
+
+        path_str = "/".join(path).lower()
+        if any(name in path_str for name in ("position", "pos_embedding", "pos_embed")):
+            continue
+
+        direct = shape[0] == vocab_size
+        transposed = shape[1] == vocab_size
+        if not (direct or transposed):
+            continue
+
+        score = 0
+        if "embed_tokens" in path_str or "wte" in path_str:
+            score += 100
+        if "embedding" in path_str or "embed" in path_str:
+            score += 40
+        if "lm_head" in path_str:
+            score += 10
+        if transposed:
+            score -= 5
+        candidates.append((score, path_str, leaf if direct else leaf.T))
+
+    if not candidates:
+        raise ValueError(
+            "Could not infer the LM token embedding matrix for Wasserstein curvature. "
+            "Expected a rank-2 params leaf with one dimension equal to vocab size "
+            f"{vocab_size}, such as params['embed_tokens']['embedding']."
+        )
+
+    _, _, matrix = max(candidates, key=lambda item: item[0])
+    return matrix.astype(jnp.float32)
+
+
+def _evenly_spaced_position_ids(
+    total_positions: int,
+    max_positions: Optional[int],
+) -> Optional[Array]:
+    if max_positions is None:
+        return None
+
+    max_positions = int(max_positions)
+    if max_positions <= 0 or max_positions >= total_positions:
+        return None
+
+    # Pick one representative from each equal-width bin. This keeps the sampled
+    # curvature batch deterministic and spread across the full sequence.
+    ids = (jnp.arange(max_positions, dtype=jnp.float32) + 0.5)
+    ids = jnp.floor(ids * float(total_positions) / float(max_positions))
+    return ids.astype(jnp.int32)
+
+
+def _make_single_batch_wasserstein_matvec_lm(
     model_def: Any,
-    curvature_batch: Tuple[Array, Array, Optional[Array]],
-    token_embedding_matrix: Array,
     batch_stats: Optional[PyTree] = None,
     *,
+    token_embedding_matrix: Optional[Array] = None,
     top_k: int = 128,
+    max_positions: Optional[int] = None,
     graph_temp: float = 0.0,
     graph_eps: float = 1e-6,
     laplacian_ridge: float = 1e-4,
     ignore_label: int = -100,
-) -> GGNMatvecFn:
-    """
-    Build a matrix-vector product for the Wasserstein/Otto pullback metric.
-
-    Operator:
-        W(θ) v =
-            J_z^T S(p)^T L(p)^dagger S(p) J_z v
-
-    where:
-      - z are LM logits,
-      - p is the restricted top-k softmax distribution,
-      - S(p) = diag(p) - pp^T,
-      - L(p) is a probability-weighted graph Laplacian over top-k token embeddings.
-
-    This is not a loss Hessian. It is a Wasserstein pullback metric-vector product,
-    suitable for Lanczos exactly like your GGN/Hessian matvecs.
-
-    Args:
-      model_def: Flax LM module.
-      curvature_batch: (input_ids, labels, attn_mask).
-        input_ids: (B, T) or (P, B, T)
-        labels: (B, T) or (P, B, T), used only for masking ignore_label.
-        attn_mask: optional attention mask, matching your model.
-      token_embedding_matrix: (V, D) token embeddings defining ground geometry.
-      top_k: vocabulary support size per token position.
-      graph_temp: RBF temperature for token graph. If <= 0, uses mean pairwise dist2.
-      graph_eps: numerical epsilon for graph temperature.
-      laplacian_ridge: ridge used in symmetric gauge-fixed Laplacian solve.
-      ignore_label: labels equal to this are excluded from the average.
-
-    Returns:
-      wasserstein_matvec(params, vec_pytree, rng_key) -> PyTree like params.
-    """
-    input_ids, labels, attn_mask = curvature_batch
-    token_embedding_matrix = token_embedding_matrix.astype(jnp.float32)
+) -> Callable[[Params, PyTree, Array, Array, Optional[Array]], PyTree]:
+    if top_k <= 0:
+        raise ValueError("top_k must be >= 1 for Wasserstein LM curvature.")
+    if max_positions is not None and int(max_positions) <= 0:
+        raise ValueError(
+            "max_positions must be positive or None for Wasserstein LM curvature."
+        )
 
     def _single_batch_matvec(
         params: Params,
@@ -848,26 +1063,42 @@ def make_wasserstein_metric_matvec_fn_lm(
 
         B, T, V = logits.shape
         N = B * T
+        support_size = min(int(top_k), int(V))
+        position_ids = _evenly_spaced_position_ids(N, max_positions)
+        token_embeddings = _resolve_lm_token_embedding_matrix(
+            params,
+            token_embedding_matrix,
+            vocab_size=int(V),
+        )
 
         logits2 = logits.reshape(N, V).astype(jnp.float32)
         jvp2 = jvp_logits.reshape(N, V).astype(jnp.float32)
         labels2 = batch_labels.reshape(N)
 
-        valid = (labels2 != ignore_label).astype(jnp.float32)  # (N,)
+        if position_ids is not None:
+            logits_for_graph = logits2[position_ids]
+            jvp_for_graph = jvp2[position_ids]
+            labels_for_graph = labels2[position_ids]
+        else:
+            logits_for_graph = logits2
+            jvp_for_graph = jvp2
+            labels_for_graph = labels2
+
+        valid = (labels_for_graph != ignore_label).astype(jnp.float32)
         denom = jnp.maximum(jnp.sum(valid), 1.0)
 
         # Top-k predictive support per token position.
-        top_vals, top_idx = jax.lax.top_k(logits2, top_k)  # (N, K), (N, K)
-        dz_top = jnp.take_along_axis(jvp2, top_idx, axis=-1)  # (N, K)
+        top_vals, top_idx = jax.lax.top_k(logits_for_graph, support_size)  # (P, K)
+        dz_top = jnp.take_along_axis(jvp_for_graph, top_idx, axis=-1)  # (P, K)
 
         # Restricted simplex probabilities.
-        p_top = jax.nn.softmax(top_vals, axis=-1)  # (N, K)
+        p_top = jax.nn.softmax(top_vals, axis=-1)  # (P, K)
 
         def apply_one(p_i: Array, dz_i: Array, idx_i: Array, valid_i: Array) -> Array:
             # δp = S(p) J_z v
             dp_i = _softmax_jacobian_vec_from_probs(p_i, dz_i)
 
-            embeds_i = token_embedding_matrix[idx_i]  # (K, D)
+            embeds_i = token_embeddings[idx_i]  # (K, D)
 
             L_i = _build_local_embedding_laplacian(
                 p_i,
@@ -893,16 +1124,19 @@ def make_wasserstein_metric_matvec_fn_lm(
             dz_top,
             top_idx,
             valid,
-        )  # (N, K)
+        )  # (P, K)
 
         # Scatter top-k cotangents back to full vocab logits.
         az_full = jnp.zeros_like(logits2)
+        scatter_rows = (
+            jnp.arange(logits_for_graph.shape[0]) if position_ids is None else position_ids
+        )
         az_full = az_full.at[
-            jnp.arange(N)[:, None],
+            scatter_rows[:, None],
             top_idx,
         ].add(az_top)
 
-        # Match mean-over-valid-token scaling.
+        # Approximate the mean-over-valid-token operator on the sampled positions.
         az_full = az_full / denom
         az_full = az_full.reshape(B, T, V).astype(logits.dtype)
 
@@ -910,8 +1144,42 @@ def make_wasserstein_metric_matvec_fn_lm(
         out_params, = vjp_fun(az_full)
         return out_params
 
-    def wasserstein_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+    return _single_batch_matvec
+
+
+def make_wasserstein_metric_matvec_fn_lm_dynamic(
+    model_def: Any,
+    batch_stats: Optional[PyTree] = None,
+    *,
+    token_embedding_matrix: Optional[Array] = None,
+    top_k: int = 128,
+    max_positions: Optional[int] = None,
+    graph_temp: float = 0.0,
+    graph_eps: float = 1e-6,
+    laplacian_ridge: float = 1e-4,
+    ignore_label: int = -100,
+) -> DynamicLMMatvecFn:
+    """Build a dynamic-batch Wasserstein/Otto pullback metric matvec for an LM."""
+    _single_batch_matvec = _make_single_batch_wasserstein_matvec_lm(
+        model_def,
+        batch_stats=batch_stats,
+        token_embedding_matrix=token_embedding_matrix,
+        top_k=top_k,
+        max_positions=max_positions,
+        graph_temp=graph_temp,
+        graph_eps=graph_eps,
+        laplacian_ridge=laplacian_ridge,
+        ignore_label=ignore_label,
+    )
+
+    def dynamic_wasserstein_matvec(
+        params: Params,
+        vec_pytree: PyTree,
+        rng_key: Array,
+        curvature_batch: LMCurvatureBatch,
+    ) -> PyTree:
         del rng_key
+        input_ids, labels, attn_mask = curvature_batch
 
         if input_ids.ndim == 2:
             return _single_batch_matvec(
@@ -923,9 +1191,10 @@ def make_wasserstein_metric_matvec_fn_lm(
             )
 
         num_probe_batches = int(input_ids.shape[0])
-        mv_sum = None
 
-        for i in range(num_probe_batches):
+        mv_zero = jtu.tree_map(jnp.zeros_like, params)
+
+        def body_fun(i: int, mv_sum: PyTree) -> PyTree:
             batch_attn_mask = None if attn_mask is None else attn_mask[i]
             mv_i = _single_batch_matvec(
                 params,
@@ -934,16 +1203,66 @@ def make_wasserstein_metric_matvec_fn_lm(
                 labels[i],
                 batch_attn_mask,
             )
-            mv_sum = mv_i if mv_sum is None else jtu.tree_map(
-                lambda a, b: a + b,
-                mv_sum,
-                mv_i,
-            )
+            return jtu.tree_map(lambda acc, x: acc + x, mv_sum, mv_i)
+
+        mv_sum = jax.lax.fori_loop(
+            0,
+            num_probe_batches,
+            body_fun,
+            mv_zero,
+        )
 
         scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
         return jtu.tree_map(lambda x: x / scale, mv_sum)
 
-    return jax.jit(wasserstein_matvec)
+    return jax.jit(dynamic_wasserstein_matvec)
+
+
+def make_wasserstein_metric_matvec_fn_lm(
+    model_def: Any,
+    curvature_batch: Tuple[Array, Array, Optional[Array]],
+    token_embedding_matrix: Optional[Array] = None,
+    batch_stats: Optional[PyTree] = None,
+    *,
+    top_k: int = 128,
+    max_positions: Optional[int] = None,
+    graph_temp: float = 0.0,
+    graph_eps: float = 1e-6,
+    laplacian_ridge: float = 1e-4,
+    ignore_label: int = -100,
+) -> GGNMatvecFn:
+    """
+    Build a matrix-vector product for the Wasserstein/Otto pullback metric.
+
+    Operator:
+        W(θ) v =
+            J_z^T S(p)^T L(p)^dagger S(p) J_z v
+
+    where:
+      - z are LM logits,
+      - p is the restricted top-k softmax distribution,
+      - S(p) = diag(p) - pp^T,
+      - L(p) is a probability-weighted graph Laplacian over top-k token embeddings.
+
+    This is not a loss Hessian. It is a Wasserstein pullback metric-vector product,
+    suitable for Lanczos exactly like your GGN/Hessian matvecs.
+    """
+    dynamic_matvec = make_wasserstein_metric_matvec_fn_lm_dynamic(
+        model_def,
+        batch_stats=batch_stats,
+        token_embedding_matrix=token_embedding_matrix,
+        top_k=top_k,
+        max_positions=max_positions,
+        graph_temp=graph_temp,
+        graph_eps=graph_eps,
+        laplacian_ridge=laplacian_ridge,
+        ignore_label=ignore_label,
+    )
+
+    def wasserstein_matvec(params: Params, vec_pytree: PyTree, rng_key: Array) -> PyTree:
+        return dynamic_matvec(params, vec_pytree, rng_key, curvature_batch)
+
+    return wasserstein_matvec
 
 
 def make_svgd_metric_matvec_fn(*_args, **_kwargs) -> GGNMatvecFn:
