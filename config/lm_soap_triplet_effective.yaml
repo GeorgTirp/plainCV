@@ -1,0 +1,105 @@
+## SOAP LM config for phase triplet + effective-curvature tracking.
+
+deterministic: False
+seed: 0
+force_cpu: False
+matmul_precision: "highest"
+
+trainset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/train"
+validset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/valid"
+seq_len: 2048
+vocab_size: 50257
+
+intra_doc_masking: True
+sampler: "sequential"
+sampler_seed: 0
+num_workers: 0
+
+eval: True
+valid_tokens: 200000
+eval_every_steps: 100
+
+model: "transformer"
+d_model: 768
+mlp_class: "glu"
+expand: "8/3"
+n_layers: 12
+n_heads: 12
+rms_norm: True
+tie_embeddings: False
+rope_theta: 500000.0
+torch_compile: False
+
+steps_budget: 12700
+micro_batch_size: 8
+grad_accumulation_steps: 8
+
+dtype: "bfloat16"
+
+optim: soap
+fused_optim: False
+lr: 0.0003712309167902025
+weight_decay: 0.02946913648450978
+beta1: 0.8928004631097273
+beta2: 0.9831582493142336
+eps: 9.44658692677875e-8
+
+precondition_frequency: 32
+shampoo_beta2: 0.9496977646795652
+
+# Track fresh/mid/stale SOAP basis phases:
+# first cycle is completed steps 34, 50, 65 for precondition_frequency=32.
+eigen_tracking_enabled: true
+eigen_tracking_schedule: soap_phases
+eigen_tracking_every: 576
+eigen_tracking_cycle_stride: 576
+eigen_tracking_phase_offsets: [0, 16, 31]
+eigen_tracking_measurement_mode: probe_update
+eigen_tracking_post_soap_refresh: false
+eigen_tracking_topk: 6
+eigen_tracking_extra_modes: 6
+eigen_tracking_curvature_batches: 1
+eigen_tracking_lanczos_iters: 12
+eigen_tracking_backend: wasserstein
+eigen_tracking_sort_by_abs: false
+wasserstein_lm_top_k: 256
+wasserstein_lm_max_positions: 512
+wasserstein_graph_temp: 0.0
+wasserstein_graph_eps: 1.e-6
+wasserstein_laplacian_ridge: 1.e-4
+eigen_tracking_light_ortho: false
+eigen_tracking_light_ortho_every: 4
+
+# Empirical effective curvature in the optimizer-induced update geometry.
+effective_curvature_tracking_enabled: true
+effective_curvature_transform_base: zero
+effective_curvature_direction_scale: 1.0
+effective_curvature_normalize_lr: true
+effective_curvature_gram_ridge: 1.e-8
+
+scheduler: "warmup_cosine"
+warmup_steps: 0.05
+cooldown_steps: null
+lr_start: 0.0
+lr_end: 1.e-5
+lr_end_pct: null
+
+log_every_steps: 25
+print_progress: True
+
+use_wandb: False
+wandb_project: "llm"
+wandb_dir: "./exp/llm/wandb"
+wandb_run_name: "LAPLACIAN_soap_triplet_effective"
+wandb_unique_names: True
+exp_name: "LAPLACIAN_soap_triplet_effective"
+out_dir: "./exp/llm"
+over_write: True
+
+resume: False
+resume_step: null
+resume_exp_name: null
+
+save_last_checkpoint: False
+save_intermediate_checkpoints: False
+save_every_steps: null

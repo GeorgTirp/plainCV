@@ -65,6 +65,14 @@ class EigenTrackingState(NamedTuple):
     neg_grad_energy_frac: Array
     pos_update_grad_cosine: Array
     neg_update_grad_cosine: Array
+    effective_curvature_cond: Array
+    actual_update_rayleigh: Array
+    effective_curvature_eigenvalues: Array
+    extra_effective_curvature_eigenvalues: Array
+    damped_effective_curvature_eigenvalues: Array
+    extra_damped_effective_curvature_eigenvalues: Array
+    preconditioned_dir_gain: Array
+    extra_preconditioned_dir_gain: Array
 
 
 def _project_rows(matrix: Array, vector: Array) -> Array:
@@ -155,6 +163,18 @@ def init_eigentracking(
         neg_grad_energy_frac=nan,
         pos_update_grad_cosine=nan,
         neg_update_grad_cosine=nan,
+        effective_curvature_cond=nan,
+        actual_update_rayleigh=nan,
+        effective_curvature_eigenvalues=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_effective_curvature_eigenvalues=jnp.full(
+            (extra_modes,), jnp.nan, dtype=dtype
+        ),
+        damped_effective_curvature_eigenvalues=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_damped_effective_curvature_eigenvalues=jnp.full(
+            (extra_modes,), jnp.nan, dtype=dtype
+        ),
+        preconditioned_dir_gain=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_preconditioned_dir_gain=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
     )
 
 
@@ -209,6 +229,82 @@ def _align_eigenvector_rows(
     return new_vecs * sign
 
 
+def _condition_number_from_abs(values: Array, eps: float, nan: Array) -> Array:
+    abs_values = jnp.abs(values)
+    valid = jnp.logical_and(jnp.isfinite(abs_values), abs_values > eps)
+    max_abs = jnp.max(jnp.where(valid, abs_values, 0.0))
+    min_abs = jnp.min(jnp.where(valid, abs_values, jnp.inf))
+    return jnp.where(jnp.any(valid), max_abs / jnp.maximum(min_abs, eps), nan)
+
+
+def _sort_desc(values: Array) -> Array:
+    return values[jnp.argsort(values)[::-1]]
+
+
+def _effective_curvature_metrics(
+    basis_rows: Array,
+    update_flat: Array,
+    *,
+    matvec_flat: Callable[[Array], Array],
+    effective_transform_flat: Callable[[Array], Array],
+    eps: float,
+    gram_ridge: float,
+) -> Tuple[Array, Array, Array, Array, Array]:
+    """Measure curvature after pushing tracked directions through an update map.
+
+    Returns:
+      generalized_eigs: eigenvalues of K a = mu G a, where
+        K_ij = z_i^T H z_j and G_ij = z_i^T z_j.
+      damped_eigs: eigenvalues of K itself, retaining update-map scale.
+      gains: ||z_i|| for each raw tracked direction.
+      effective_cond: abs-condition number of generalized_eigs.
+      update_rayleigh: u^T H u / ||u||^2 for the actual/probe update.
+    """
+    metric_dtype = basis_rows.dtype
+    nan = jnp.asarray(jnp.nan, dtype=metric_dtype)
+    n = basis_rows.shape[0]
+
+    def transform_row(row: Array) -> Array:
+        return effective_transform_flat(row).astype(metric_dtype)
+
+    z_rows = jax.lax.map(transform_row, basis_rows)
+    hz_rows = jax.lax.map(matvec_flat, z_rows)
+    gains = jnp.sqrt(jnp.sum(jnp.square(z_rows), axis=1))
+
+    gram = z_rows @ z_rows.T
+    curv = z_rows @ hz_rows.T
+    gram = 0.5 * (gram + gram.T)
+    curv = 0.5 * (curv + curv.T)
+
+    eye = jnp.eye(n, dtype=metric_dtype)
+    gram_scale = jnp.maximum(jnp.mean(jnp.diag(gram)), eps)
+    ridge = jnp.asarray(gram_ridge, dtype=metric_dtype) * gram_scale
+    gram_reg = gram + ridge * eye
+
+    # Symmetric generalized eigensolve via whitening.  This is intentionally
+    # ridge-stabilized because sign-like optimizers can collapse directions.
+    chol = jnp.linalg.cholesky(gram_reg)
+    whitened_left = jnp.linalg.solve(chol, curv)
+    whitened = jnp.linalg.solve(chol, whitened_left.T).T
+    whitened = 0.5 * (whitened + whitened.T)
+
+    generalized_eigs = _sort_desc(jnp.linalg.eigvalsh(whitened))
+    damped_eigs = _sort_desc(jnp.linalg.eigvalsh(curv))
+    effective_cond = _condition_number_from_abs(generalized_eigs, eps, nan)
+
+    hu_flat = matvec_flat(update_flat)
+    update_energy = jnp.sum(jnp.square(update_flat))
+    update_rayleigh = jnp.vdot(update_flat, hu_flat) / (update_energy + eps)
+
+    return (
+        generalized_eigs,
+        damped_eigs,
+        gains,
+        effective_cond,
+        update_rayleigh,
+    )
+
+
 def track_eigenstate(
     params: Params,
     grads: PyTree,
@@ -226,6 +322,8 @@ def track_eigenstate(
     eps: float = 1e-12,
     alpha_grad_tol_abs: float = 1e-10,
     alpha_grad_tol_rel: float = 1e-3,
+    effective_transform_fn: Optional[Callable[[PyTree], PyTree]] = None,
+    effective_curvature_gram_ridge: float = 1e-8,
 ) -> EigenTrackingState:
     flat_params, unravel_params = ravel_pytree(params)
     dim = flat_params.shape[0]
@@ -257,6 +355,8 @@ def track_eigenstate(
             neg_grad_energy_frac=nan,
             pos_update_grad_cosine=nan,
             neg_update_grad_cosine=nan,
+            effective_curvature_cond=nan,
+            actual_update_rayleigh=nan,
         )
 
     lanczos_steps = max(total_keep, total_keep if num_iter is None else int(num_iter))
@@ -317,6 +417,36 @@ def track_eigenstate(
 
     all_eigenvalues = jnp.concatenate([eigenvalues, extra_eigenvalues], axis=0)
     all_eigenvectors = jnp.concatenate([eigenvectors, extra_eigenvectors], axis=0)
+
+    effective_curvature_cond = nan
+    actual_update_rayleigh = nan
+    effective_curvature_eigs_all = jnp.full((total_keep,), jnp.nan, dtype=metric_dtype)
+    damped_effective_curvature_eigs_all = jnp.full(
+        (total_keep,), jnp.nan, dtype=metric_dtype
+    )
+    preconditioned_dir_gain_all = jnp.full((total_keep,), jnp.nan, dtype=metric_dtype)
+
+    if effective_transform_fn is not None:
+
+        def effective_transform_flat(v_flat: Array) -> Array:
+            z_pytree = effective_transform_fn(unravel_params(v_flat))
+            z_flat, _ = ravel_pytree(z_pytree)
+            return z_flat
+
+        (
+            effective_curvature_eigs_all,
+            damped_effective_curvature_eigs_all,
+            preconditioned_dir_gain_all,
+            effective_curvature_cond,
+            actual_update_rayleigh,
+        ) = _effective_curvature_metrics(
+            all_eigenvectors,
+            upd_flat,
+            matvec_flat=matvec_flat,
+            effective_transform_flat=effective_transform_flat,
+            eps=eps,
+            gram_ridge=effective_curvature_gram_ridge,
+        )
 
     if total_keep > 0:
         g_proj = _project_rows(all_eigenvectors, grad_flat)
@@ -474,6 +604,18 @@ def track_eigenstate(
         neg_grad_energy_frac=neg_grad_energy_frac,
         pos_update_grad_cosine=pos_update_grad_cosine,
         neg_update_grad_cosine=neg_update_grad_cosine,
+        effective_curvature_cond=effective_curvature_cond,
+        actual_update_rayleigh=actual_update_rayleigh,
+        effective_curvature_eigenvalues=effective_curvature_eigs_all[:k],
+        extra_effective_curvature_eigenvalues=effective_curvature_eigs_all[
+            k : k + extra_k
+        ],
+        damped_effective_curvature_eigenvalues=damped_effective_curvature_eigs_all[:k],
+        extra_damped_effective_curvature_eigenvalues=damped_effective_curvature_eigs_all[
+            k : k + extra_k
+        ],
+        preconditioned_dir_gain=preconditioned_dir_gain_all[:k],
+        extra_preconditioned_dir_gain=preconditioned_dir_gain_all[k : k + extra_k],
     )
 
 

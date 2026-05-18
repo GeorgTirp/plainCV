@@ -1,0 +1,27 @@
+universe   = vanilla
+initialdir = /lustre/home/gtirpitz/plainCV
+
+executable = nc_train_lm.sh
+config = config/lm_soap_triplet_effective.yaml
+exp_name = laplacian_soap_triplet_effective_job_$(Cluster)_$(Process)
+arguments = $(config) $(exp_name)
+
+output = job_outputs/lm_soap_triplet_effective.$(Cluster).$(Process).out
+error  = job_outputs/lm_soap_triplet_effective.$(Cluster).$(Process).err
+log    = job_outputs/lm_soap_triplet_effective.$(Cluster).log
+
+request_cpus   = 4
+request_memory = 80000
+request_gpus   = 2
+min_gpu_mem_mb = 60000
+requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb))
+
+getenv = True
+
++JobBatchName = "lm-soap-triplet-effective"
+MaxTime = 259200
+
+periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+queue 1

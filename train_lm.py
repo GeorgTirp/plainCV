@@ -7,9 +7,7 @@ from functools import partial
 from typing import Iterable, Tuple, Optional
 import yaml
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 
@@ -59,8 +57,6 @@ from flax import jax_utils as flax_jax_utils
 from flax.training import train_state
 from jax import tree_util as jtu
 
-from data.lm_loader import get_dataloaders
-from data.datasets.data_prep_utils import intra_doc_causal_mask
 from models.LM.constructor import construct_model
 from optim.eigentools import init_eigentracking, track_eigenstate
 from optim.factory import get_optimizer, build_lm_dynamic_curvature_matvec_fn
@@ -105,6 +101,8 @@ def _trim_last_token(doc_boundaries):
 
 
 def _build_attn_mask(batch, seq_len: int) -> jnp.ndarray:
+    from data.datasets.data_prep_utils import intra_doc_causal_mask
+
     docs_lengths = batch.get("docs_lengths", None)
     if docs_lengths is None:
         raise ValueError("intra_doc_masking=True but docs_lengths not found in batch.")
@@ -449,6 +447,56 @@ def _make_probe_measurement_fn(
     return compute_probe_measurement
 
 
+def _make_effective_update_transform_fn(
+    tx,
+    params,
+    opt_state,
+    base_grads,
+    *,
+    base_mode: str,
+    direction_scale: float,
+    normalize_lr: bool,
+    learning_rate: float,
+):
+    if base_mode == "zero":
+        reference_grads = jtu.tree_map(jnp.zeros_like, base_grads)
+    elif base_mode == "grad":
+        reference_grads = base_grads
+    else:
+        raise ValueError(
+            "effective_curvature_transform_base must be one of {'zero', 'grad'}."
+        )
+
+    reference_updates, _ = tx.update(reference_grads, opt_state, params)
+
+    lr_scale = 1.0
+    if normalize_lr:
+        lr_scale = max(abs(float(learning_rate)), 1e-30)
+    denom = float(direction_scale) * lr_scale
+
+    def transform(direction):
+        if base_mode == "zero":
+            probe_grads = jtu.tree_map(
+                lambda d: direction_scale * d,
+                direction,
+            )
+        else:
+            probe_grads = jtu.tree_map(
+                lambda g, d: g + direction_scale * d,
+                base_grads,
+                direction,
+            )
+
+        probe_updates, _ = tx.update(probe_grads, opt_state, params)
+        return jtu.tree_map(
+            lambda probe, reference: (probe - reference) / denom,
+            probe_updates,
+            reference_updates,
+        )
+
+    return transform
+
+
 def _merge_batches(batches):
     if len(batches) == 1:
         return batches[0]
@@ -562,12 +610,77 @@ def _unwrap_replicated(x, use_pmap: bool):
 
 def _should_run_eigen_tracking_for_step(cfg, completed_step: int) -> bool:
     """Return whether eigen tracking should run after the completed train step."""
+    should_run, _phase_offset, _phase_index, _phase_frac = _eigen_tracking_phase_info(
+        cfg,
+        completed_step,
+    )
+    return should_run
+
+
+def _eigen_tracking_phase_info(cfg, completed_step: int) -> tuple[bool, float, float, float]:
+    """Return tracking decision plus optional SOAP-staleness phase metadata."""
+    schedule = str(getattr(cfg, "eigen_tracking_schedule", "regular")).lower()
     eigen_tracking_every = int(getattr(cfg, "eigen_tracking_every", 100))
     if eigen_tracking_every <= 0:
         raise ValueError("eigen_tracking_every must be >= 1 when tracking is enabled.")
 
+    if schedule in {"soap_phases", "soap_phase", "soap_triplet", "soap_triplets"}:
+        if str(getattr(cfg, "optim", "")).lower() != "soap":
+            raise ValueError("eigen_tracking_schedule='soap_phases' requires optim='soap'.")
+
+        precondition_frequency = int(getattr(cfg, "precondition_frequency", 0))
+        if precondition_frequency <= 0:
+            raise ValueError(
+                "eigen_tracking_schedule='soap_phases' requires "
+                "precondition_frequency >= 1."
+            )
+
+        cycle_stride = int(
+            getattr(cfg, "eigen_tracking_cycle_stride", eigen_tracking_every)
+        )
+        if cycle_stride <= 0:
+            raise ValueError("eigen_tracking_cycle_stride must be >= 1.")
+        if cycle_stride % precondition_frequency != 0:
+            raise ValueError(
+                "For eigen_tracking_schedule='soap_phases', "
+                "eigen_tracking_cycle_stride must be a multiple of "
+                "precondition_frequency."
+            )
+
+        phase_offsets = getattr(cfg, "eigen_tracking_phase_offsets", None)
+        if phase_offsets is None:
+            phase_offsets = [0, precondition_frequency // 2, precondition_frequency - 1]
+        phase_offsets = [int(offset) for offset in phase_offsets]
+        for offset in phase_offsets:
+            if offset < 0 or offset >= precondition_frequency:
+                raise ValueError(
+                    "SOAP phase offsets must be in "
+                    f"[0, precondition_frequency - 1], got {offset}."
+                )
+
+        # SOAP's first update initializes the basis and returns a zero update.
+        # A QR refresh then occurs after step_new % precondition_frequency == 0;
+        # the first completed training step that uses that refreshed basis is +1.
+        first_post_refresh_step = precondition_frequency + 2
+        rel_step = completed_step - first_post_refresh_step
+        if rel_step < 0:
+            return False, float("nan"), float("nan"), float("nan")
+
+        for phase_index, phase_offset in enumerate(phase_offsets):
+            if rel_step >= phase_offset and (
+                (rel_step - phase_offset) % cycle_stride
+            ) == 0:
+                phase_frac = phase_offset / max(1, precondition_frequency - 1)
+                return True, float(phase_offset), float(phase_index), float(phase_frac)
+
+        return False, float("nan"), float("nan"), float("nan")
+
+    if schedule not in {"regular", "default", "post_refresh"}:
+        raise ValueError(f"Unknown eigen_tracking_schedule: {schedule}")
+
     if not bool(getattr(cfg, "eigen_tracking_post_soap_refresh", False)):
-        return (completed_step % eigen_tracking_every) == 0
+        should_run = (completed_step % eigen_tracking_every) == 0
+        return should_run, float("nan"), float("nan"), float("nan")
 
     if str(getattr(cfg, "optim", "")).lower() != "soap":
         raise ValueError(
@@ -592,7 +705,7 @@ def _should_run_eigen_tracking_for_step(cfg, completed_step: int) -> bool:
     return (
         completed_step >= first_post_refresh_step
         and ((completed_step - first_post_refresh_step) % eigen_tracking_every) == 0
-    )
+    ), 0.0, 0.0, 0.0
 
 
 def _probe_pmap_collectives(n_devices: int) -> tuple[bool, Optional[str]]:
@@ -606,6 +719,10 @@ def _probe_pmap_collectives(n_devices: int) -> tuple[bool, Optional[str]]:
         return False, None
 
     try:
+        print(
+            "train_lm pmap collective probe | "
+            f"torch_imported={'torch' in sys.modules}"
+        )
         test = jnp.arange(n_devices, dtype=jnp.float32)
 
         @partial(jax.pmap, axis_name="data")
@@ -663,6 +780,8 @@ def run(cfg):
 
     maybe_make_dir(cfg)
 
+    from data.lm_loader import get_dataloaders
+
     trainloader, validloader = get_dataloaders(cfg)
 
     # Build a deterministic fixed curvature probe for curvature-based optimizers.
@@ -692,6 +811,38 @@ def run(cfg):
 
     grad_clip = getattr(cfg, "grad_clip", None)
     eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
+    effective_curvature_enabled = bool(
+        getattr(
+            cfg,
+            "effective_curvature_tracking_enabled",
+            getattr(cfg, "eigen_tracking_effective_curvature", False),
+        )
+    )
+    effective_curvature_transform_base = str(
+        getattr(cfg, "effective_curvature_transform_base", "zero")
+    ).lower()
+    if effective_curvature_transform_base not in {"zero", "grad"}:
+        raise ValueError(
+            "effective_curvature_transform_base must be one of {'zero', 'grad'}."
+        )
+    effective_curvature_direction_scale = float(
+        getattr(cfg, "effective_curvature_direction_scale", 1.0)
+    )
+    if effective_curvature_direction_scale <= 0.0:
+        raise ValueError("effective_curvature_direction_scale must be > 0.")
+    effective_curvature_normalize_lr = bool(
+        getattr(cfg, "effective_curvature_normalize_lr", True)
+    )
+    effective_curvature_gram_ridge = float(
+        getattr(cfg, "effective_curvature_gram_ridge", 1e-8)
+    )
+    if effective_curvature_gram_ridge < 0.0:
+        raise ValueError("effective_curvature_gram_ridge must be >= 0.")
+    if effective_curvature_enabled and not eigen_tracking_enabled:
+        raise ValueError(
+            "effective_curvature_tracking_enabled=True requires "
+            "eigen_tracking_enabled=True."
+        )
     eigen_tracking_state = None
     eigen_tracking_csv_path = None
     eigen_tracking_measurement_mode = str(
@@ -774,6 +925,7 @@ def run(cfg):
         @jax.jit
         def run_eigen_tracking(
             params,
+            opt_state,
             grads,
             updates,
             step,
@@ -788,19 +940,34 @@ def run(cfg):
                     tracking_curvature_batch,
                 )
 
+            effective_transform_fn = None
+            if effective_curvature_enabled:
+                effective_transform_fn = _make_effective_update_transform_fn(
+                    tx,
+                    params,
+                    opt_state,
+                    grads,
+                    base_mode=effective_curvature_transform_base,
+                    direction_scale=effective_curvature_direction_scale,
+                    normalize_lr=effective_curvature_normalize_lr,
+                    learning_rate=float(cfg.lr),
+                )
+
             return track_eigenstate(
                 params=params,
                 grads=grads,
                 updates=updates,
                 step=step,
                 eigen_state=tracking_state,
-                matvec_fn=eigen_tracking_matvec_fn,
+                matvec_fn=matvec_fn,
                 num_iter=eigen_tracking_iters,
                 sort_by_abs=eigen_tracking_sort_by_abs,
                 use_light_ortho=eigen_tracking_light_ortho,
                 light_ortho_every=eigen_tracking_light_ortho_every,
                 learning_rate=float(cfg.lr),
                 signed_split_enabled=eigen_tracking_signed_split_enabled,
+                effective_transform_fn=effective_transform_fn,
+                effective_curvature_gram_ridge=effective_curvature_gram_ridge,
             )
 
         if eigen_tracking_measurement_mode == "probe_update":
@@ -888,7 +1055,11 @@ def run(cfg):
         params_before = _unwrap_replicated(state.params, use_pmap) if eigen_tracking_enabled else None
         opt_state_before = (
             _unwrap_replicated(state.opt_state, use_pmap)
-            if eigen_tracking_enabled and eigen_tracking_measurement_mode == "probe_update"
+            if eigen_tracking_enabled
+            and (
+                effective_curvature_enabled
+                or eigen_tracking_measurement_mode == "probe_update"
+            )
             else None
         )
         state, updates = apply_grads(state, grads_accum)
@@ -917,11 +1088,24 @@ def run(cfg):
 
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
+                opt_state_before if effective_curvature_enabled else (),
                 tracking_grads,
                 tracking_updates,
                 _unwrap_replicated(state.step, use_pmap),
                 eigen_tracking_state,
                 tracking_curvature_batch,
+            )
+            should_track_now, phase_offset, phase_index, phase_frac = (
+                _eigen_tracking_phase_info(cfg, global_step)
+            )
+            del should_track_now
+            measurement_metrics = dict(measurement_metrics or {})
+            measurement_metrics.update(
+                {
+                    "tracking_phase_offset": phase_offset,
+                    "tracking_phase_index": phase_index,
+                    "tracking_phase_frac": phase_frac,
+                }
             )
             append_eigen_tracking_row(
                 eigen_tracking_csv_path,

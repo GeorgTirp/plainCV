@@ -439,8 +439,13 @@ def init_eigen_tracking_csv(
     header = (
         [
             "global_step",
+            "tracking_phase_offset",
+            "tracking_phase_index",
+            "tracking_phase_frac",
             "rotation_diff",
             "eff_cond",
+            "effective_curvature_cond",
+            "actual_update_rayleigh",
             "probe_loss_before",
             "probe_loss_after",
             "probe_loss_reduction",
@@ -475,6 +480,12 @@ def init_eigen_tracking_csv(
         + [f"extra_alpha_{i}" for i in range(extra_modes)]
         + [f"phi_{i}" for i in range(top_k)]
         + [f"extra_phi_{i}" for i in range(extra_modes)]
+        + [f"eff_curv_eig_{i}" for i in range(top_k)]
+        + [f"extra_eff_curv_eig_{i}" for i in range(extra_modes)]
+        + [f"damped_eff_curv_eig_{i}" for i in range(top_k)]
+        + [f"extra_damped_eff_curv_eig_{i}" for i in range(extra_modes)]
+        + [f"precond_dir_gain_{i}" for i in range(top_k)]
+        + [f"extra_precond_dir_gain_{i}" for i in range(extra_modes)]
     )
 
     with open(csv_path, "w", newline="") as f:
@@ -531,6 +542,14 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         neg_grad_energy_frac,
         pos_update_grad_cosine,
         neg_update_grad_cosine,
+        effective_curvature_cond,
+        actual_update_rayleigh,
+        effective_curvature_eigenvalues,
+        extra_effective_curvature_eigenvalues,
+        damped_effective_curvature_eigenvalues,
+        extra_damped_effective_curvature_eigenvalues,
+        preconditioned_dir_gain,
+        extra_preconditioned_dir_gain,
     ) = jax.device_get(
         (
             tracking_state.eigenvalues,
@@ -560,14 +579,27 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             getattr(tracking_state, "neg_grad_energy_frac", float("nan")),
             getattr(tracking_state, "pos_update_grad_cosine", float("nan")),
             getattr(tracking_state, "neg_update_grad_cosine", float("nan")),
+            getattr(tracking_state, "effective_curvature_cond", float("nan")),
+            getattr(tracking_state, "actual_update_rayleigh", float("nan")),
+            getattr(tracking_state, "effective_curvature_eigenvalues", ()),
+            getattr(tracking_state, "extra_effective_curvature_eigenvalues", ()),
+            getattr(tracking_state, "damped_effective_curvature_eigenvalues", ()),
+            getattr(tracking_state, "extra_damped_effective_curvature_eigenvalues", ()),
+            getattr(tracking_state, "preconditioned_dir_gain", ()),
+            getattr(tracking_state, "extra_preconditioned_dir_gain", ()),
         )
     )
 
     row = (
         [
             int(scalar_step),
+            _metric("tracking_phase_offset"),
+            _metric("tracking_phase_index"),
+            _metric("tracking_phase_frac"),
             float(scalar_rotation),
             float(scalar_eff_cond),
+            float(effective_curvature_cond),
+            float(actual_update_rayleigh),
             _metric("probe_loss_before"),
             _metric("probe_loss_after"),
             _metric("probe_loss_reduction"),
@@ -598,10 +630,16 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         + [float(x) for x in extra_update_energy_frac]
         + [int(bool(x)) for x in alpha_valid]
         + [int(bool(x)) for x in extra_alpha_valid]
-        + [float(x) for x in tracking_state.alpha]
+        + [float(x) for x in alpha]
         + [float(x) for x in extra_alpha]
         + [float(x) for x in phi]
         + [float(x) for x in extra_phi]
+        + [float(x) for x in effective_curvature_eigenvalues]
+        + [float(x) for x in extra_effective_curvature_eigenvalues]
+        + [float(x) for x in damped_effective_curvature_eigenvalues]
+        + [float(x) for x in extra_damped_effective_curvature_eigenvalues]
+        + [float(x) for x in preconditioned_dir_gain]
+        + [float(x) for x in extra_preconditioned_dir_gain]
     )
 
     with open(csv_path, "a", newline="") as f:
