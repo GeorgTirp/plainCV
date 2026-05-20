@@ -157,6 +157,55 @@ def _reshape_for_pmap(x: Optional[jnp.ndarray], n_devices: int):
     return x.reshape((n_devices, per_device) + x.shape[1:])
 
 
+def _shard_batch_axis_for_pmap(x: Optional[jnp.ndarray], n_devices: int):
+    if x is None:
+        return None
+    return _reshape_for_pmap(x, n_devices)
+
+
+def _shard_probe_axis_batch_for_pmap(x: Optional[jnp.ndarray], n_devices: int):
+    """Shard arrays shaped (num_probe_batches, global_batch, ...)."""
+    if x is None:
+        return None
+    num_probe_batches = x.shape[0]
+    global_batch = x.shape[1]
+    if global_batch % n_devices != 0:
+        raise ValueError(
+            "Probe batch dimension "
+            f"{global_batch} is not divisible by n_devices={n_devices}."
+        )
+    per_device = global_batch // n_devices
+    reshaped = x.reshape(
+        (num_probe_batches, n_devices, per_device) + x.shape[2:]
+    )
+    return jnp.swapaxes(reshaped, 0, 1)
+
+
+def _shard_curvature_batch_for_pmap(curvature_batch, n_devices: int):
+    input_ids, labels, attn_mask = curvature_batch
+    if n_devices <= 1:
+        return curvature_batch
+    if input_ids.ndim == 2:
+        return (
+            _shard_batch_axis_for_pmap(input_ids, n_devices),
+            _shard_batch_axis_for_pmap(labels, n_devices),
+            _shard_batch_axis_for_pmap(attn_mask, n_devices),
+        )
+    if input_ids.ndim == 3:
+        return (
+            _shard_probe_axis_batch_for_pmap(input_ids, n_devices),
+            _shard_probe_axis_batch_for_pmap(labels, n_devices),
+            _shard_probe_axis_batch_for_pmap(attn_mask, n_devices),
+        )
+    if input_ids.ndim >= 4 and input_ids.shape[0] == n_devices:
+        return curvature_batch
+    raise ValueError(
+        "Expected LM curvature input_ids to have shape (batch, seq), "
+        "(num_probe_batches, batch, seq), or already-sharded leading device "
+        f"axis; got {input_ids.shape}."
+    )
+
+
 def _prepare_batch_for_devices(batch, seq_len: int, use_doc_mask: bool, n_devices: int):
     inputs, labels, attn_mask = _prepare_batch(batch, seq_len, use_doc_mask)
     if n_devices <= 1:
@@ -357,6 +406,8 @@ def _make_probe_measurement_fn(
     curvature_batch,
     grad_clip: Optional[float],
     use_doc_mask: bool,
+    use_pmap: bool = False,
+    n_devices: int = 1,
 ):
     probe_inputs, probe_labels, probe_attn_mask = curvature_batch
 
@@ -375,6 +426,123 @@ def _make_probe_measurement_fn(
 
         (_loss, _acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         return grads
+
+    if use_pmap:
+        sharded_probe_inputs, sharded_probe_labels, sharded_probe_attn_mask = (
+            _shard_curvature_batch_for_pmap(curvature_batch, n_devices)
+        )
+
+        @partial(jax.pmap, axis_name="data")
+        def compute_probe_measurement_pmapped(
+            params,
+            opt_state,
+            local_probe_inputs,
+            local_probe_labels,
+            local_probe_attn_mask,
+        ):
+            if local_probe_inputs.ndim == 2:
+                local_grads = probe_grad_for_batch(
+                    params,
+                    local_probe_inputs,
+                    local_probe_labels,
+                    local_probe_attn_mask,
+                )
+                local_loss_before, local_acc_before = probe_loss_acc_for_batch(
+                    params,
+                    local_probe_inputs,
+                    local_probe_labels,
+                    local_probe_attn_mask,
+                )
+            else:
+                num_probe_batches = int(local_probe_inputs.shape[0])
+                grads_sum = None
+                loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+                acc_sum = jnp.asarray(0.0, dtype=jnp.float32)
+                for i in range(num_probe_batches):
+                    batch_attn_mask = (
+                        None if local_probe_attn_mask is None else local_probe_attn_mask[i]
+                    )
+                    grads_i = probe_grad_for_batch(
+                        params,
+                        local_probe_inputs[i],
+                        local_probe_labels[i],
+                        batch_attn_mask,
+                    )
+                    loss_i, acc_i = probe_loss_acc_for_batch(
+                        params,
+                        local_probe_inputs[i],
+                        local_probe_labels[i],
+                        batch_attn_mask,
+                    )
+                    grads_sum = grads_i if grads_sum is None else jtu.tree_map(
+                        lambda acc, x: acc + x,
+                        grads_sum,
+                        grads_i,
+                    )
+                    loss_sum = loss_sum + loss_i
+                    acc_sum = acc_sum + acc_i
+
+                scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+                local_grads = jtu.tree_map(lambda g: g / scale, grads_sum)
+                local_loss_before = loss_sum / scale
+                local_acc_before = acc_sum / scale
+
+            probe_grads = jax.lax.pmean(local_grads, axis_name="data")
+            probe_grads = _clip_grads(probe_grads, grad_clip)
+            probe_updates, _new_opt_state = tx.update(probe_grads, opt_state, params)
+            probe_params_after = optax.apply_updates(params, probe_updates)
+
+            if local_probe_inputs.ndim == 2:
+                local_loss_after, local_acc_after = probe_loss_acc_for_batch(
+                    probe_params_after,
+                    local_probe_inputs,
+                    local_probe_labels,
+                    local_probe_attn_mask,
+                )
+            else:
+                num_probe_batches = int(local_probe_inputs.shape[0])
+                loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+                acc_sum = jnp.asarray(0.0, dtype=jnp.float32)
+                for i in range(num_probe_batches):
+                    batch_attn_mask = (
+                        None if local_probe_attn_mask is None else local_probe_attn_mask[i]
+                    )
+                    loss_i, acc_i = probe_loss_acc_for_batch(
+                        probe_params_after,
+                        local_probe_inputs[i],
+                        local_probe_labels[i],
+                        batch_attn_mask,
+                    )
+                    loss_sum = loss_sum + loss_i
+                    acc_sum = acc_sum + acc_i
+                scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
+                local_loss_after = loss_sum / scale
+                local_acc_after = acc_sum / scale
+
+            loss_before = jax.lax.pmean(local_loss_before, axis_name="data")
+            acc_before = jax.lax.pmean(local_acc_before, axis_name="data")
+            loss_after = jax.lax.pmean(local_loss_after, axis_name="data")
+            acc_after = jax.lax.pmean(local_acc_after, axis_name="data")
+            measurement_metrics = {
+                "probe_loss_before": loss_before,
+                "probe_loss_after": loss_after,
+                "probe_loss_reduction": loss_before - loss_after,
+                "probe_acc_before": acc_before,
+                "probe_acc_after": acc_after,
+                "probe_acc_gain": acc_after - acc_before,
+            }
+            return probe_grads, probe_updates, measurement_metrics
+
+        def compute_probe_measurement(params, opt_state):
+            return compute_probe_measurement_pmapped(
+                params,
+                opt_state,
+                sharded_probe_inputs,
+                sharded_probe_labels,
+                sharded_probe_attn_mask,
+            )
+
+        return compute_probe_measurement
 
     def probe_loss_acc(params):
         if probe_inputs.ndim == 2:
@@ -606,6 +774,12 @@ def _unwrap_replicated(x, use_pmap: bool):
     if not use_pmap:
         return x
     return flax_jax_utils.unreplicate(x)
+
+
+def _unwrap_measurement_metrics(metrics, use_pmap: bool):
+    if not use_pmap or metrics is None:
+        return metrics
+    return {key: flax_jax_utils.unreplicate(value) for key, value in metrics.items()}
 
 
 def _should_run_eigen_tracking_for_step(cfg, completed_step: int) -> bool:
@@ -916,59 +1090,114 @@ def run(cfg):
             extra_modes=eigen_tracking_extra_modes,
             seed=int(getattr(cfg, "seed", 0)),
         )
+        if use_pmap:
+            eigen_tracking_state = flax_jax_utils.replicate(eigen_tracking_state)
         eigen_tracking_csv_path = init_eigen_tracking_csv(
             cfg,
             eigen_tracking_topk,
             extra_modes=eigen_tracking_extra_modes,
         )
 
-        @jax.jit
-        def run_eigen_tracking(
-            params,
-            opt_state,
-            grads,
-            updates,
-            step,
-            tracking_state,
-            tracking_curvature_batch,
-        ):
-            def matvec_fn(matvec_params, vec_pytree, rng_key):
-                return eigen_tracking_matvec_fn(
-                    matvec_params,
-                    vec_pytree,
-                    rng_key,
-                    tracking_curvature_batch,
-                )
+        if use_pmap:
 
-            effective_transform_fn = None
-            if effective_curvature_enabled:
-                effective_transform_fn = _make_effective_update_transform_fn(
-                    tx,
-                    params,
-                    opt_state,
-                    grads,
-                    base_mode=effective_curvature_transform_base,
-                    direction_scale=effective_curvature_direction_scale,
-                    normalize_lr=effective_curvature_normalize_lr,
+            @partial(jax.pmap, axis_name="data")
+            def run_eigen_tracking(
+                params,
+                opt_state,
+                grads,
+                updates,
+                step,
+                tracking_state,
+                tracking_curvature_batch,
+            ):
+                def matvec_fn(matvec_params, vec_pytree, rng_key):
+                    local_mv = eigen_tracking_matvec_fn(
+                        matvec_params,
+                        vec_pytree,
+                        rng_key,
+                        tracking_curvature_batch,
+                    )
+                    return jax.lax.pmean(local_mv, axis_name="data")
+
+                effective_transform_fn = None
+                if effective_curvature_enabled:
+                    effective_transform_fn = _make_effective_update_transform_fn(
+                        tx,
+                        params,
+                        opt_state,
+                        grads,
+                        base_mode=effective_curvature_transform_base,
+                        direction_scale=effective_curvature_direction_scale,
+                        normalize_lr=effective_curvature_normalize_lr,
+                        learning_rate=float(cfg.lr),
+                    )
+
+                return track_eigenstate(
+                    params=params,
+                    grads=grads,
+                    updates=updates,
+                    step=step,
+                    eigen_state=tracking_state,
+                    matvec_fn=matvec_fn,
+                    num_iter=eigen_tracking_iters,
+                    sort_by_abs=eigen_tracking_sort_by_abs,
+                    use_light_ortho=eigen_tracking_light_ortho,
+                    light_ortho_every=eigen_tracking_light_ortho_every,
                     learning_rate=float(cfg.lr),
+                    signed_split_enabled=eigen_tracking_signed_split_enabled,
+                    effective_transform_fn=effective_transform_fn,
+                    effective_curvature_gram_ridge=effective_curvature_gram_ridge,
                 )
 
-            return track_eigenstate(
-                params=params,
-                grads=grads,
-                updates=updates,
-                step=step,
-                eigen_state=tracking_state,
-                matvec_fn=matvec_fn,
-                num_iter=eigen_tracking_iters,
-                sort_by_abs=eigen_tracking_sort_by_abs,
-                use_light_ortho=eigen_tracking_light_ortho,
-                light_ortho_every=eigen_tracking_light_ortho_every,
-                learning_rate=float(cfg.lr),
-                signed_split_enabled=eigen_tracking_signed_split_enabled,
-                effective_transform_fn=effective_transform_fn,
-                effective_curvature_gram_ridge=effective_curvature_gram_ridge,
-            )
+        else:
+
+            @jax.jit
+            def run_eigen_tracking(
+                params,
+                opt_state,
+                grads,
+                updates,
+                step,
+                tracking_state,
+                tracking_curvature_batch,
+            ):
+                def matvec_fn(matvec_params, vec_pytree, rng_key):
+                    return eigen_tracking_matvec_fn(
+                        matvec_params,
+                        vec_pytree,
+                        rng_key,
+                        tracking_curvature_batch,
+                    )
+
+                effective_transform_fn = None
+                if effective_curvature_enabled:
+                    effective_transform_fn = _make_effective_update_transform_fn(
+                        tx,
+                        params,
+                        opt_state,
+                        grads,
+                        base_mode=effective_curvature_transform_base,
+                        direction_scale=effective_curvature_direction_scale,
+                        normalize_lr=effective_curvature_normalize_lr,
+                        learning_rate=float(cfg.lr),
+                    )
+
+                return track_eigenstate(
+                    params=params,
+                    grads=grads,
+                    updates=updates,
+                    step=step,
+                    eigen_state=tracking_state,
+                    matvec_fn=matvec_fn,
+                    num_iter=eigen_tracking_iters,
+                    sort_by_abs=eigen_tracking_sort_by_abs,
+                    use_light_ortho=eigen_tracking_light_ortho,
+                    light_ortho_every=eigen_tracking_light_ortho_every,
+                    learning_rate=float(cfg.lr),
+                    signed_split_enabled=eigen_tracking_signed_split_enabled,
+                    effective_transform_fn=effective_transform_fn,
+                    effective_curvature_gram_ridge=effective_curvature_gram_ridge,
+                )
 
         if eigen_tracking_measurement_mode == "probe_update":
             compute_probe_measurement = _make_probe_measurement_fn(
@@ -977,6 +1206,8 @@ def run(cfg):
                 curvature_batch,
                 grad_clip=grad_clip,
                 use_doc_mask=use_doc_mask,
+                use_pmap=use_pmap,
+                n_devices=n_devices,
             )
 
     compute_grads, eval_step = _make_train_fns(
@@ -1052,16 +1283,8 @@ def run(cfg):
             acc_accum = acc if acc_accum is None else acc_accum + acc
 
         grads_accum = jtu.tree_map(lambda g: g / grad_accum_steps, grads_accum)
-        params_before = _unwrap_replicated(state.params, use_pmap) if eigen_tracking_enabled else None
-        opt_state_before = (
-            _unwrap_replicated(state.opt_state, use_pmap)
-            if eigen_tracking_enabled
-            and (
-                effective_curvature_enabled
-                or eigen_tracking_measurement_mode == "probe_update"
-            )
-            else None
-        )
+        params_before = state.params if eigen_tracking_enabled else None
+        opt_state_before = state.opt_state if eigen_tracking_enabled else None
         state, updates = apply_grads(state, grads_accum)
 
         global_step += 1
@@ -1073,25 +1296,40 @@ def run(cfg):
                     params_before,
                     opt_state_before,
                 )
-                tracking_curvature_batch = curvature_batch
-            else:
-                tracking_grads = _clip_grads(
-                    _unwrap_replicated(grads_accum, use_pmap),
-                    grad_clip,
+                tracking_curvature_batch = (
+                    _shard_curvature_batch_for_pmap(curvature_batch, n_devices)
+                    if use_pmap
+                    else curvature_batch
                 )
-                tracking_updates = _unwrap_replicated(updates, use_pmap)
+            else:
+                if use_pmap:
+                    tracking_grads = flax_jax_utils.replicate(
+                        _clip_grads(
+                            _unwrap_replicated(grads_accum, True),
+                            grad_clip,
+                        )
+                    )
+                    tracking_updates = updates
+                else:
+                    tracking_grads = _clip_grads(grads_accum, grad_clip)
+                    tracking_updates = updates
                 tracking_curvature_batch = _stack_curvature_microbatches(
                     tracking_inputs_list,
                     tracking_labels_list,
                     tracking_attn_mask_list,
                 )
+                if use_pmap:
+                    tracking_curvature_batch = _shard_curvature_batch_for_pmap(
+                        tracking_curvature_batch,
+                        n_devices,
+                    )
 
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
-                opt_state_before if effective_curvature_enabled else (),
+                opt_state_before,
                 tracking_grads,
                 tracking_updates,
-                _unwrap_replicated(state.step, use_pmap),
+                state.step,
                 eigen_tracking_state,
                 tracking_curvature_batch,
             )
@@ -1099,7 +1337,9 @@ def run(cfg):
                 _eigen_tracking_phase_info(cfg, global_step)
             )
             del should_track_now
-            measurement_metrics = dict(measurement_metrics or {})
+            measurement_metrics = dict(
+                _unwrap_measurement_metrics(measurement_metrics, use_pmap) or {}
+            )
             measurement_metrics.update(
                 {
                     "tracking_phase_offset": phase_offset,
@@ -1109,7 +1349,7 @@ def run(cfg):
             )
             append_eigen_tracking_row(
                 eigen_tracking_csv_path,
-                eigen_tracking_state,
+                _unwrap_replicated(eigen_tracking_state, use_pmap),
                 measurement_metrics=measurement_metrics,
             )
 

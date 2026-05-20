@@ -1,0 +1,32 @@
+universe   = vanilla
+initialdir = /lustre/home/gtirpitz/plainCV
+
+executable = nc_train_ggn.sh
+backend = GGN
+exp_name = $(backend)_$(optimizer)_job_$(Cluster)_$(Process)
+arguments = $(config) $(exp_name)
+
+output = job_outputs/lm_$(optimizer)_$(backend).$(Cluster).$(Process).out
+error  = job_outputs/lm_$(optimizer)_$(backend).$(Cluster).$(Process).err
+log    = job_outputs/lm_$(optimizer)_$(backend).$(Cluster).log
+
+request_cpus   = 4
+request_memory = $(memory)
+request_gpus   = $(gpus)
+requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb))
+
+getenv = True
+
++JobBatchName = "lm-ggn-eigentracking"
+MaxTime = $(max_time)
+
+periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+queue optimizer, config, gpus, memory, min_gpu_mem_mb, max_time from (
+  adam   config/lm_adam.yaml   2 12288 80000 129600
+  muon   config/lm_muon.yaml   2 12288 80000 129600
+  signum config/lm_signum.yaml 2 12288 80000 129600
+  soap   config/lm_soap.yaml   2 12288 60000 259200
+  sgd    config/lm_sgd.yaml    2 12288 80000 129600
+)
