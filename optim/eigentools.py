@@ -49,8 +49,15 @@ class EigenTrackingState(NamedTuple):
     extra_alpha: Array
     phi: Array
     extra_phi: Array
+    eos_rho: Array
+    extra_eos_rho: Array
     alpha_valid: Array
     extra_alpha_valid: Array
+    topk_eos_rho_max: Array
+    topk_eos_rho_mean: Array
+    topk_eos_rho_update_weighted: Array
+    topk_eos_rho_over_2_max: Array
+    topk_eos_rho_over_2_update_weighted: Array
     eff_cond: Array
     rng_key: Array
     rotation_diff: Array
@@ -147,8 +154,15 @@ def init_eigentracking(
         extra_alpha=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         phi=jnp.full((k,), jnp.nan, dtype=dtype),
         extra_phi=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
+        eos_rho=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_eos_rho=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         alpha_valid=jnp.zeros((k,), dtype=bool),
         extra_alpha_valid=jnp.zeros((extra_modes,), dtype=bool),
+        topk_eos_rho_max=nan,
+        topk_eos_rho_mean=nan,
+        topk_eos_rho_update_weighted=nan,
+        topk_eos_rho_over_2_max=nan,
+        topk_eos_rho_over_2_update_weighted=nan,
         eff_cond=jnp.array(0.0, dtype=dtype),
         rng_key=jax.random.PRNGKey(seed),
         rotation_diff=jnp.array(0.0, dtype=dtype),
@@ -349,6 +363,11 @@ def track_eigenstate(
             tracked_update_energy_frac=jnp.array(0.0, dtype=metric_dtype),
             tracked_grad_energy_frac=jnp.array(0.0, dtype=metric_dtype),
             tracked_update_grad_cosine=nan,
+            topk_eos_rho_max=nan,
+            topk_eos_rho_mean=nan,
+            topk_eos_rho_update_weighted=nan,
+            topk_eos_rho_over_2_max=nan,
+            topk_eos_rho_over_2_update_weighted=nan,
             pos_update_energy_frac=nan,
             neg_update_energy_frac=nan,
             pos_grad_energy_frac=nan,
@@ -515,11 +534,15 @@ def track_eigenstate(
         safe_lr = jnp.where(jnp.abs(lr) > eps, lr, jnp.nan)
         phi_raw = alpha_raw * all_eigenvalues / safe_lr
         phi_all = jnp.where(alpha_valid, phi_raw, jnp.nan)
+        eos_rho_raw = jnp.abs(alpha_raw * all_eigenvalues)
+        eos_rho_all = jnp.where(alpha_valid, eos_rho_raw, jnp.nan)
 
         alpha = alpha_all[:k]
         extra_alpha = alpha_all[k : k + extra_k]
         phi = phi_all[:k]
         extra_phi = phi_all[k : k + extra_k]
+        eos_rho = eos_rho_all[:k]
+        extra_eos_rho = eos_rho_all[k : k + extra_k]
         top_g_proj = g_proj[:k]
         extra_g_proj = g_proj[k : k + extra_k]
         top_d_proj = d_proj[:k]
@@ -528,6 +551,35 @@ def track_eigenstate(
         extra_update_energy_frac = update_energy_frac_all[k : k + extra_k]
         top_alpha_valid = alpha_valid[:k]
         extra_alpha_valid = alpha_valid[k : k + extra_k]
+
+        valid_top_rho = jnp.logical_and(
+            top_alpha_valid,
+            jnp.isfinite(eos_rho),
+        )
+        top_rho_count = jnp.sum(valid_top_rho.astype(metric_dtype))
+        top_rho_sum = jnp.sum(jnp.where(valid_top_rho, eos_rho, 0.0))
+        topk_eos_rho_mean = jnp.where(
+            top_rho_count > 0.0,
+            top_rho_sum / jnp.maximum(top_rho_count, 1.0),
+            nan,
+        )
+        topk_eos_rho_max = jnp.where(
+            jnp.any(valid_top_rho),
+            jnp.max(jnp.where(valid_top_rho, eos_rho, 0.0)),
+            nan,
+        )
+        rho_weights = jnp.where(valid_top_rho, top_update_energy_frac, 0.0)
+        rho_weight_sum = jnp.sum(rho_weights)
+        topk_eos_rho_update_weighted = jnp.where(
+            rho_weight_sum > eps,
+            jnp.sum(rho_weights * jnp.where(valid_top_rho, eos_rho, 0.0))
+            / rho_weight_sum,
+            nan,
+        )
+        topk_eos_rho_over_2_max = topk_eos_rho_max / 2.0
+        topk_eos_rho_over_2_update_weighted = (
+            topk_eos_rho_update_weighted / 2.0
+        )
 
         phi_abs = jnp.abs(jnp.where(top_alpha_valid, phi_raw[:k], 0.0))
         valid_for_cond = jnp.logical_and(top_alpha_valid, phi_abs > eps)
@@ -551,6 +603,8 @@ def track_eigenstate(
         extra_alpha = eigen_state.extra_alpha
         phi = eigen_state.phi
         extra_phi = eigen_state.extra_phi
+        eos_rho = eigen_state.eos_rho
+        extra_eos_rho = eigen_state.extra_eos_rho
         top_g_proj = eigen_state.g_proj
         extra_g_proj = eigen_state.extra_g_proj
         top_d_proj = eigen_state.d_proj
@@ -559,6 +613,13 @@ def track_eigenstate(
         extra_update_energy_frac = eigen_state.extra_update_energy_frac
         top_alpha_valid = eigen_state.alpha_valid
         extra_alpha_valid = eigen_state.extra_alpha_valid
+        topk_eos_rho_max = eigen_state.topk_eos_rho_max
+        topk_eos_rho_mean = eigen_state.topk_eos_rho_mean
+        topk_eos_rho_update_weighted = eigen_state.topk_eos_rho_update_weighted
+        topk_eos_rho_over_2_max = eigen_state.topk_eos_rho_over_2_max
+        topk_eos_rho_over_2_update_weighted = (
+            eigen_state.topk_eos_rho_over_2_update_weighted
+        )
         eff_cond = jnp.array(0.0, dtype=eigenvalues.dtype)
         tracked_update_energy_frac = eigen_state.tracked_update_energy_frac
         tracked_grad_energy_frac = eigen_state.tracked_grad_energy_frac
@@ -588,8 +649,15 @@ def track_eigenstate(
         extra_alpha=extra_alpha,
         phi=phi,
         extra_phi=extra_phi,
+        eos_rho=eos_rho,
+        extra_eos_rho=extra_eos_rho,
         alpha_valid=top_alpha_valid,
         extra_alpha_valid=extra_alpha_valid,
+        topk_eos_rho_max=topk_eos_rho_max,
+        topk_eos_rho_mean=topk_eos_rho_mean,
+        topk_eos_rho_update_weighted=topk_eos_rho_update_weighted,
+        topk_eos_rho_over_2_max=topk_eos_rho_over_2_max,
+        topk_eos_rho_over_2_update_weighted=topk_eos_rho_over_2_update_weighted,
         eff_cond=eff_cond,
         rng_key=rng_key,
         rotation_diff=rotation_diff,

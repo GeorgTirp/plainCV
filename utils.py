@@ -446,6 +446,11 @@ def init_eigen_tracking_csv(
             "eff_cond",
             "effective_curvature_cond",
             "actual_update_rayleigh",
+            "topk_eos_rho_max",
+            "topk_eos_rho_mean",
+            "topk_eos_rho_update_weighted",
+            "topk_eos_rho_over_2_max",
+            "topk_eos_rho_over_2_update_weighted",
             "probe_loss_before",
             "probe_loss_after",
             "probe_loss_reduction",
@@ -480,6 +485,8 @@ def init_eigen_tracking_csv(
         + [f"extra_alpha_{i}" for i in range(extra_modes)]
         + [f"phi_{i}" for i in range(top_k)]
         + [f"extra_phi_{i}" for i in range(extra_modes)]
+        + [f"eos_rho_{i}" for i in range(top_k)]
+        + [f"extra_eos_rho_{i}" for i in range(extra_modes)]
         + [f"eff_curv_eig_{i}" for i in range(top_k)]
         + [f"extra_eff_curv_eig_{i}" for i in range(extra_modes)]
         + [f"damped_eff_curv_eig_{i}" for i in range(top_k)]
@@ -531,6 +538,8 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         extra_alpha,
         phi,
         extra_phi,
+        eos_rho,
+        extra_eos_rho,
         grad_norm,
         update_norm,
         tracked_update_energy_frac,
@@ -544,6 +553,11 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         neg_update_grad_cosine,
         effective_curvature_cond,
         actual_update_rayleigh,
+        topk_eos_rho_max,
+        topk_eos_rho_mean,
+        topk_eos_rho_update_weighted,
+        topk_eos_rho_over_2_max,
+        topk_eos_rho_over_2_update_weighted,
         effective_curvature_eigenvalues,
         extra_effective_curvature_eigenvalues,
         damped_effective_curvature_eigenvalues,
@@ -568,6 +582,8 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             getattr(tracking_state, "extra_alpha", ()),
             getattr(tracking_state, "phi", ()),
             getattr(tracking_state, "extra_phi", ()),
+            getattr(tracking_state, "eos_rho", ()),
+            getattr(tracking_state, "extra_eos_rho", ()),
             getattr(tracking_state, "grad_norm", float("nan")),
             getattr(tracking_state, "update_norm", float("nan")),
             getattr(tracking_state, "tracked_update_energy_frac", float("nan")),
@@ -581,6 +597,15 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             getattr(tracking_state, "neg_update_grad_cosine", float("nan")),
             getattr(tracking_state, "effective_curvature_cond", float("nan")),
             getattr(tracking_state, "actual_update_rayleigh", float("nan")),
+            getattr(tracking_state, "topk_eos_rho_max", float("nan")),
+            getattr(tracking_state, "topk_eos_rho_mean", float("nan")),
+            getattr(tracking_state, "topk_eos_rho_update_weighted", float("nan")),
+            getattr(tracking_state, "topk_eos_rho_over_2_max", float("nan")),
+            getattr(
+                tracking_state,
+                "topk_eos_rho_over_2_update_weighted",
+                float("nan"),
+            ),
             getattr(tracking_state, "effective_curvature_eigenvalues", ()),
             getattr(tracking_state, "extra_effective_curvature_eigenvalues", ()),
             getattr(tracking_state, "damped_effective_curvature_eigenvalues", ()),
@@ -600,6 +625,11 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             float(scalar_eff_cond),
             float(effective_curvature_cond),
             float(actual_update_rayleigh),
+            float(topk_eos_rho_max),
+            float(topk_eos_rho_mean),
+            float(topk_eos_rho_update_weighted),
+            float(topk_eos_rho_over_2_max),
+            float(topk_eos_rho_over_2_update_weighted),
             _metric("probe_loss_before"),
             _metric("probe_loss_after"),
             _metric("probe_loss_reduction"),
@@ -634,6 +664,8 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         + [float(x) for x in extra_alpha]
         + [float(x) for x in phi]
         + [float(x) for x in extra_phi]
+        + [float(x) for x in eos_rho]
+        + [float(x) for x in extra_eos_rho]
         + [float(x) for x in effective_curvature_eigenvalues]
         + [float(x) for x in extra_effective_curvature_eigenvalues]
         + [float(x) for x in damped_effective_curvature_eigenvalues]

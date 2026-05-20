@@ -1,0 +1,777 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{placeins}
+
+\title{Curvature Backend Comparison for LLM Optimizer Measurements}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+This note summarizes the optimizer comparison from the three curvature
+measurement backends:
+\begin{itemize}
+    \item \textbf{GGN}: generalized Gauss--Newton curvature, using the complete
+    \texttt{GGN\_} prefix runs and excluding the shorter \texttt{GGN\_INC\_*}
+    runs.
+    \item \textbf{EFISHER}: empirical Fisher curvature, using the complete
+    \texttt{EFISHER\_} prefix runs. For this backend, the same plotting rule as
+    before is used: top-k modes with persistent
+    $|\lambda_i| / |\lambda_0| < 0.1$ are moved into the extra/bulk group.
+    \item \textbf{OT}: optimal-transport curvature from the graph Laplacian,
+    using the complete \texttt{OT\_} prefix runs.
+\end{itemize}
+
+All reported loss metrics are measured from the probe update saved in
+\texttt{eigen\_tracking.csv}. Means are taken over the available measurement
+checkpoints for each run. The number of checkpoints is not identical across all
+backends: GGN and OT have 22 measurements per optimizer, EFISHER has 49 for
+Signum, Muon, and Adam, and 29 for SOAP.
+
+The plot folders are:
+\begin{itemize}
+    \item \texttt{figures/eigen\_tracking\_ggn\_prefix\_grouped}
+    \item \texttt{figures/eigen\_tracking\_fisher\_prefix\_grouped}
+    \item \texttt{figures/eigen\_tracking\_ot\_prefix\_grouped}
+\end{itemize}
+
+\paragraph{Important caveat.}
+Eigenvalue magnitudes are comparable within a curvature backend, but not as
+absolute quantities across different backends. GGN, EFISHER, and OT define
+different curvature objects. In addition, the exponent-style normalization
+index
+\[
+    \nu_i = 1 - \frac{\log |\phi_i|}{\log |\lambda_i|}
+\]
+is most stable when $|\lambda_i|$ is clearly separated from $1$. For EFISHER
+and especially OT, many eigenvalues are near or below $1$, so raw $\nu$ values
+can become numerically and semantically fragile.
+
+\section{Definitions of the Measured Quantities}
+
+At a measurement checkpoint $t$, let $\theta_t$ denote the current model
+parameters and let $g_t = \nabla_\theta \mathcal{L}(\theta_t)$ be the gradient
+on the measurement/probe batch. The optimizer proposes an update
+$\Delta_t$, so the probe step evaluates the loss and accuracy before and after
+applying $\Delta_t$ to the same measured state. In these experiments,
+$\Delta_t$ is the actual Optax parameter delta produced by the optimizer
+state, not an idealized Newton or SGD step.
+
+\subsection{Curvature Operators}
+
+Each backend defines a symmetric positive-semidefinite or approximately
+positive-semidefinite curvature operator $C_t$ around the current model state.
+The Lanczos procedure only needs matrix-vector products $v \mapsto C_t v$.
+The tracked eigenpairs are
+\[
+    C_t v_i = \lambda_i v_i,
+\]
+where $\lambda_i$ is the measured curvature magnitude in direction $v_i$.
+Large $\lambda_i$ means the loss, output distribution, or transport geometry
+is locally sensitive to motion in that parameter direction.
+
+\paragraph{GGN.}
+The generalized Gauss--Newton backend measures curvature induced by the model
+outputs and the loss. Informally, it asks: if parameters are perturbed in
+direction $v$, how much does the loss curvature induced by the network's
+output map penalize that perturbation? This is the backend that most closely
+matches the classical sharp-direction/preconditioning intuition.
+
+\paragraph{EFISHER.}
+The empirical Fisher backend uses outer products of gradients on the measured
+data. It measures directions where sample gradients have high squared
+projection. It is therefore tied to gradient covariance and gradient-energy
+structure rather than only to second-order loss geometry. In these runs it
+captures a large fraction of the gradient energy, which is why the tracked
+subspace cosines are often close to one.
+
+\paragraph{OT graph Laplacian.}
+The OT backend builds a graph Laplacian on the token-probability support and
+uses it to define an optimal-transport-like output geometry. It asks how
+parameter perturbations move probability mass across the output-token graph.
+The implemented version is sparsified by restricting to a top-$k$ token support
+and a maximum number of positions, so that the graph-Laplacian solve remains
+tractable.
+
+\subsection{Top-k and Extra Directions}
+
+Lanczos returns a retained set of curvature modes. The first group is called
+``top-k'' and the second group is called ``extra.'' The top-k directions are
+the dominant tracked curvature directions under the backend's sorting rule.
+The extra directions provide a small view into the lower-curvature or bulk
+part of the measured spectrum.
+
+For EFISHER, some nominal top-k modes can be much smaller than the leading
+mode. To avoid calling such directions ``top'' merely because they are early
+Lanczos outputs, we use a relative bulk rule: if a top-k direction satisfies
+$|\lambda_i|/|\lambda_0| < 0.1$ regularly across checkpoints, it is counted as
+extra/bulk in the plots and summary statistics.
+
+\subsection{Probe Loss Reduction and Accuracy Gain}
+
+The probe loss reduction is
+\[
+    \Delta \mathcal{L}_{\mathrm{probe}}
+    = \mathcal{L}(\theta_t) - \mathcal{L}(\theta_t + \Delta_t).
+\]
+The relative probe loss reduction is
+\[
+    \frac{\Delta \mathcal{L}_{\mathrm{probe}}}{\mathcal{L}(\theta_t)}.
+\]
+This is the main per-checkpoint performance quantity in the tables. Positive
+values mean that the measured optimizer step reduced loss on the probe batch.
+The accuracy gain is defined analogously as
+\[
+    \mathrm{Acc}(\theta_t + \Delta_t) - \mathrm{Acc}(\theta_t).
+\]
+
+\subsection{Gradient and Update Projections}
+
+For each tracked eigenvector $v_i$, we record the gradient projection
+\[
+    g_i = \langle g_t, v_i \rangle
+\]
+and the update projection
+\[
+    d_i = \langle \Delta_t, v_i \rangle.
+\]
+These projections describe how much the gradient and the optimizer update
+point along each measured curvature direction. If an optimizer strongly avoids
+the tracked sharp subspace, then $d_i$ and the aggregate update energy in the
+tracked subspace will be small.
+
+\subsection{Directional Step Coefficient, \texorpdfstring{$\phi$}{phi}, and \texorpdfstring{$\nu$}{nu}}
+
+The directional step coefficient compares the optimizer update to the negative
+gradient along eigenvector $v_i$:
+\[
+    \alpha_i = -\frac{d_i}{g_i}.
+\]
+If the optimizer behaved like plain gradient descent with learning rate
+$\eta$, then roughly $\alpha_i \approx \eta$. If it behaved like a Newton-like
+curvature normalizer in direction $i$, then roughly
+$\alpha_i \approx \eta / \lambda_i$.
+
+The logged quantity
+\[
+    \phi_i = \frac{\alpha_i \lambda_i}{\eta}
+\]
+measures how much curvature remains after the optimizer's directional scaling,
+relative to the base learning rate. From this we define the exponent-style
+normalization index
+\[
+    \nu_i = 1 - \frac{\log |\phi_i|}{\log |\lambda_i|}.
+\]
+Equivalently, when $|\lambda_i|>1$ and the formula is well-conditioned,
+$\nu_i$ is an exponent describing how much of the curvature scale is removed
+by the optimizer:
+\[
+    \alpha_i \approx \eta \lambda_i^{-\nu_i}.
+\]
+Thus $\nu_i \approx 0$ is SGD-like scaling, $\nu_i \approx 1$ is
+Newton-like inverse-curvature scaling, and $\nu_i < 0$ means the realized
+directional step is larger than nominal learning-rate-scaled gradient descent
+in that direction. Negative $\nu$ is therefore not automatically a bug; it can
+reflect optimizer scale amplification.
+
+\subsection{DAO \texorpdfstring{$\nu$}{nu}: Direction-Alignment-Only Normalization}
+
+The standard $\nu$ includes both direction and scale. To remove global update
+scale, the direction-alignment-only diagnostic normalizes the full gradient
+and update before computing directional coefficients:
+\[
+    \hat{g}_t = \frac{g_t}{\|g_t\|}, \qquad
+    \hat{\Delta}_t = \frac{\Delta_t}{\|\Delta_t\|}.
+\]
+For each eigenvector,
+\[
+    \alpha_i^{\mathrm{DAO}}
+    = -\frac{\langle \hat{\Delta}_t, v_i\rangle}
+            {\langle \hat{g}_t, v_i\rangle},
+\qquad
+    \phi_i^{\mathrm{DAO}}
+    = \alpha_i^{\mathrm{DAO}} \lambda_i,
+\]
+and
+\[
+    \nu_i^{\mathrm{DAO}}
+    = 1 - \frac{\log |\phi_i^{\mathrm{DAO}}|}{\log |\lambda_i|}.
+\]
+DAO $\nu$ asks whether the optimizer's direction alone looks curvature
+normalized, independent of how large the update is.
+
+\subsection{Energy-Weighted Mean \texorpdfstring{$\nu$}{nu}}
+
+For aggregate top-k normalization, we often weight each directional $\nu_i$ by
+how much update energy lies in that direction:
+\[
+    w_i = \frac{d_i^2}{\sum_j d_j^2 + \epsilon},
+\qquad
+    \overline{\nu}_{\mathrm{EW}}
+    = \sum_i w_i \nu_i.
+\]
+This emphasizes the curvature directions that the optimizer actually uses.
+The same energy-weighting is used for DAO $\nu$.
+
+\subsection{Effective Curvature Measurement Protocol}
+
+The effective-curvature diagnostic is an empirical measurement of the local
+optimizer update map at the measured training state. It is not assumed to be a
+closed-form preconditioner, and it is not used as a replacement for the raw
+curvature backend. Instead, it asks what curvature the tracked directions see
+after they are passed through the optimizer's current update rule.
+
+Let $U_t(g; \theta_t, s_t)$ denote the Optax update produced from gradient
+input $g$, current parameters $\theta_t$, and frozen optimizer state $s_t$.
+For each tracked curvature direction $v_i$, the code constructs an
+optimizer-transformed direction
+\[
+    z_i =
+    \frac{
+        U_t(r_t + \epsilon_{\mathrm{dir}} v_i; \theta_t, s_t)
+        - U_t(r_t; \theta_t, s_t)
+    }{\epsilon_{\mathrm{dir}} \eta},
+\]
+when learning-rate normalization is enabled. Here $r_t$ is either zero
+(\texttt{effective\_curvature\_transform\_base=zero}) or the measured gradient
+$g_t$ (\texttt{effective\_curvature\_transform\_base=grad}), and
+$\epsilon_{\mathrm{dir}}$ is the configured
+\texttt{effective\_curvature\_direction\_scale}. The optimizer state is not
+advanced during this probe. The measurement therefore isolates the local
+response of the current optimizer state.
+
+Given the transformed directions $z_i$, the code forms
+\[
+    G_{ij} = \langle z_i, z_j\rangle,
+    \qquad
+    K_{ij} = \langle z_i, C_t z_j\rangle.
+\]
+The logged effective-curvature eigenvalues solve the small generalized
+eigenproblem
+\[
+    K a = \mu G a,
+\]
+with a small ridge added to $G$ for numerical stability. These eigenvalues are
+the measured curvature of the optimizer-transformed tracked subspace. The
+diagnostic also logs the eigenvalues of $K$ itself, which preserve the scale
+of the update-map transformation, the transformed-direction gains
+$\|z_i\|$, the generalized effective-curvature condition number, and the
+Rayleigh quotient of the actual measured update,
+\[
+    \frac{\Delta_t^\top C_t \Delta_t}{\|\Delta_t\|^2+\epsilon}.
+\]
+
+This protocol is most reliable as a local, within-backend comparison. It is
+especially useful for testing whether an optimizer that lives in high raw
+curvature has nevertheless reduced the curvature seen by its update map. It
+should be treated carefully when the update map is nonsmooth or nearly
+piecewise constant, when the transformed Gram matrix is nearly singular, or
+when the result changes substantially with
+\texttt{effective\_curvature\_direction\_scale}. Sign-like optimizers, QR
+refreshes, and stale preconditioner phases can all make this finite-difference
+linearization less smooth. A good robustness check is to repeat the diagnostic
+with different direction scales and, for SOAP, at different preconditioner
+phases.
+
+\subsection{Edge-of-Stability Diagnostic}
+
+The simplest edge-of-stability scalar uses the already logged directional
+step coefficient:
+\[
+    \rho_i = |\alpha_i \lambda_i|
+           = \eta |\phi_i|.
+\]
+For gradient descent on a quadratic direction, $\alpha_i=\eta$, so
+\[
+    \rho_i = \eta |\lambda_i|.
+\]
+The classical one-dimensional stability boundary is roughly
+$\eta\lambda_i \lesssim 2$ for positive curvature. Thus $\rho_i/2$ is a
+dimensionless ``distance to the gradient-descent edge'' for the measured
+direction. For adaptive or preconditioned optimizers, $\rho_i$ is not a full
+stability theorem, but it is the direct realized counterpart of
+$\eta\lambda_i$: it measures how much raw curvature remains after the
+optimizer's actual directional scaling on the probe update.
+
+The CSV now records per-direction \texttt{eos\_rho\_i} and
+\texttt{extra\_eos\_rho\_i}, along with the top-k summaries
+\[
+    \max_i \rho_i,\qquad
+    \frac{1}{k}\sum_i \rho_i,\qquad
+    \sum_i
+    \frac{d_i^2}{\sum_j d_j^2+\epsilon}\rho_i,
+\]
+and the corresponding max and update-energy-weighted values divided by $2$.
+The update-energy-weighted version emphasizes the directions that the
+optimizer actually uses inside the tracked top-k subspace.
+
+This diagnostic separates two possible mechanisms. If SOAP has high raw
+$\lambda_i$ but controlled $\rho_i$ or low effective-curvature eigenvalues,
+that supports a shifted-edge interpretation: SOAP can tolerate sharper raw
+curvature because its preconditioner lowers the curvature experienced by the
+update. If Muon has low raw $\lambda_i$, very small tracked update energy, and
+small top-k $\rho_i$, that supports an avoidance interpretation: Muon is not
+primarily surviving at a high raw-GGN edge, but steering away from the raw
+sharp subspace.
+
+\subsection{Tracked Subspace Energy Fractions}
+
+Let $V$ be the matrix whose columns are all retained tracked eigenvectors,
+including both top-k and extra modes. The tracked update energy fraction is
+\[
+    \frac{\|V^\top \Delta_t\|^2}{\|\Delta_t\|^2 + \epsilon}.
+\]
+The tracked gradient energy fraction is
+\[
+    \frac{\|V^\top g_t\|^2}{\|g_t\|^2 + \epsilon}.
+\]
+These quantities answer different questions. The update energy fraction asks
+how much of the optimizer step actually lives in the measured curvature
+subspace. The gradient energy fraction asks how much of the local gradient is
+explained by that same measured subspace.
+
+\subsection{Tracked Update-Gradient Cosine}
+
+Inside the tracked subspace, the descent alignment is
+\[
+    \cos_{\mathrm{tracked}}
+    =
+    \frac{\langle V^\top \Delta_t, -V^\top g_t \rangle}
+         {\|V^\top \Delta_t\| \, \|V^\top g_t\| + \epsilon}.
+\]
+Positive values mean that the part of the update inside the measured curvature
+subspace points in a descent-gradient direction. Values near one mean strong
+descent alignment in that subspace, but this does not guarantee a large loss
+reduction if very little update energy lies in the subspace or if the relevant
+performance change comes from directions outside it.
+
+\subsection{Loss Correlations}
+
+The loss-correlation tables report pooled Pearson correlations across all
+measurement checkpoints and optimizers for a given backend. For example, a
+positive correlation between DAO $\nu$ and relative loss reduction means that
+checkpoints with stronger direction-only normalization tend to have larger
+probe loss improvement. A negative correlation between tracked update energy
+and loss reduction means that placing more update energy in the tracked top
+curvature subspace tends to coincide with worse probe improvement.
+
+\section{Cross-Backend Comparison}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Backend & Muon & SOAP & Adam & Signum \\
+\midrule
+GGN & 0.184 & 0.108 & 0.103 & 0.068 \\
+EFISHER & 0.141 & 0.092 & 0.073 & 0.048 \\
+OT & 0.184 & 0.105 & 0.100 & 0.069 \\
+\bottomrule
+\end{tabular}
+\caption{Mean relative probe loss reduction, defined as probe loss reduction divided by probe loss before the measured update. The optimizer ordering is stable across all three curvature backends: Muon is best, followed by SOAP, Adam, and Signum.}
+\label{tab:cross-loss-ranking}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Backend & SOAP & Signum & Muon & Adam \\
+\midrule
+GGN & 65.73 & 9.68 & 6.82 & 16.13 \\
+EFISHER & 2.44 & 0.95 & 0.24 & 0.67 \\
+OT & 1.06 & 0.58 & 0.16 & 0.45 \\
+\bottomrule
+\end{tabular}
+\caption{Mean magnitude of the tracked top-k eigenvalues for each optimizer and curvature backend. Absolute scale should only be compared within a backend. The robust within-backend pattern is that SOAP occupies the sharpest measured regions and Muon occupies the flattest measured regions.}
+\label{tab:cross-top-eigs}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Backend & SOAP & Signum & Muon & Adam \\
+\midrule
+GGN & 0.81 & 0.63 & 2.93 & 0.73 \\
+EFISHER & 1.43 & -4.86 & -2.03 & -0.04 \\
+OT & -1.67 & -2.89 & -1.43 & -0.33 \\
+\bottomrule
+\end{tabular}
+\caption{Energy-weighted direction-alignment-only top-k normalization index, DAO $\nu$, averaged over measurement checkpoints. DAO $\nu$ removes global update scale by using normalized update and gradient directions. GGN shows strong positive DAO normalization for Muon, EFISHER favors SOAP, and OT shows no optimizer with clearly positive DAO normalization.}
+\label{tab:cross-dao-nu}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Backend & EW top-k $\nu$ & EW DAO $\nu$ & Tracked cosine & Update energy & Grad energy \\
+\midrule
+GGN & 0.33 & 0.86 & -0.17 & -0.31 & 0.04 \\
+EFISHER & -0.10 & 0.06 & -0.48 & -0.73 & 0.40 \\
+OT & -0.12 & 0.06 & -0.49 & -0.39 & -0.11 \\
+\bottomrule
+\end{tabular}
+\caption{Pooled Pearson correlations between each diagnostic and relative probe loss reduction. EW denotes energy-weighted over top-k directions. GGN is the only backend where DAO normalization strongly correlates with loss reduction. EFISHER and OT instead show that more update energy in the tracked top curvature subspace correlates with worse loss reduction.}
+\label{tab:cross-correlations}
+\end{table}
+
+The most stable result is not that one optimizer has universally larger
+$\nu$. Instead, the stable result is that Muon gets the best measured probe
+update while occupying much lower-curvature regions across all three curvature
+objects. SOAP often shows explicit normalization or preconditioning behavior,
+but it tends to operate in sharper measured regions. Adam is usually
+intermediate. Signum frequently has good subspace descent alignment but weaker
+loss reduction.
+
+\section{GGN Backend}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ggn_prefix_grouped/all_optimizers/mean_nu_topk_by_optimizer.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ggn_prefix_grouped/all_optimizers/mean_nu_extra_by_optimizer.png} \\
+\end{tabular}
+\caption{GGN mean $\nu$ trajectories. The left panel averages over top-k directions and the right panel averages over extra directions, with one curve per optimizer.}
+\label{fig:ggn-nu-top-extra}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ggn_prefix_grouped/all_optimizers/mean_nu_DAO_topk_by_optimizer.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ggn_prefix_grouped/all_optimizers/mean_nu_DAO_extra_by_optimizer.png} \\
+\end{tabular}
+\caption{GGN mean DAO $\nu$ trajectories. The left panel averages the direction-alignment-only normalization index over top-k directions and the right panel averages it over extra directions.}
+\label{fig:ggn-dao-nu-top-extra}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ggn_prefix_grouped/all_optimizers/mean_topk_eig_magnitude_by_direction.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ggn_prefix_grouped/all_optimizers/mean_extra_eig_magnitude_by_direction.png} \\
+\end{tabular}
+\caption{GGN training-mean eigenvalue magnitudes by direction. The left panel compares top-k directions across optimizers and the right panel compares extra directions across optimizers.}
+\label{fig:ggn-eig-bars-top-extra}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+Optimizer & Rel. loss red. & Acc. gain & Top-k eig. & Extra eig. & Final top-k eig. & DAO top-k $\nu$ \\
+\midrule
+SOAP & 0.108 & 0.0498 & 65.73 & 13.77 & 44.13 & 0.81 \\
+Signum & 0.068 & 0.0318 & 9.68 & 1.93 & 10.82 & 0.63 \\
+Muon & 0.184 & 0.0804 & 6.82 & 1.38 & 5.95 & 2.93 \\
+Adam & 0.103 & 0.0467 & 16.13 & 3.18 & 23.66 & 0.73 \\
+\bottomrule
+\end{tabular}
+\caption{GGN backend summary. Relative loss reduction and accuracy gain are measured on the probe update. Top-k and extra eigenvalue columns report mean eigenvalue magnitudes over the run, while final top-k eigenvalue reports the final-checkpoint mean top-k magnitude. DAO top-k $\nu$ is the energy-weighted direction-only normalization index.}
+\label{tab:ggn-summary}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Optimizer & EW top-k $\nu$ & EW DAO $\nu$ & Update energy & Grad energy & Tracked cosine \\
+\midrule
+SOAP & -1.19 & 0.81 & $1.11{\times}10^{-4}$ & 0.105 & 0.703 \\
+Signum & -3.69 & 0.63 & $2.51{\times}10^{-3}$ & 0.044 & 0.933 \\
+Muon & -2.39 & 2.93 & $5.75{\times}10^{-6}$ & 0.075 & 0.808 \\
+Adam & -2.47 & 0.73 & $2.35{\times}10^{-3}$ & 0.058 & 0.767 \\
+\bottomrule
+\end{tabular}
+\caption{GGN normalization and subspace-alignment diagnostics. EW top-k $\nu$ is the realized, scale-sensitive normalization index. EW DAO $\nu$ is computed from normalized update and gradient directions. Update and gradient energy are fractions of full-vector energy inside the tracked curvature subspace. Tracked cosine measures descent alignment inside that subspace.}
+\label{tab:ggn-normalization}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+Diagnostic correlated with relative loss reduction & Pearson $r$ \\
+\midrule
+Energy-weighted top-k $\nu$ & 0.33 \\
+DAO energy-weighted top-k $\nu$ & 0.86 \\
+Mean top-k $\nu$ & 0.41 \\
+Mean DAO top-k $\nu$ & 0.86 \\
+Tracked update-gradient cosine & -0.17 \\
+Tracked update energy fraction & -0.31 \\
+Tracked gradient energy fraction & 0.04 \\
+\bottomrule
+\end{tabular}
+\caption{GGN pooled loss-correlation diagnostics. The strongest signal is the positive correlation between DAO normalization and relative probe loss reduction. This makes GGN the clearest backend for the optimizer-normalization story.}
+\label{tab:ggn-correlations}
+\end{table}
+
+\paragraph{GGN interpretation.}
+GGN gives the cleanest normalization story. The scale-sensitive $\nu$ values are
+negative for all optimizers, which means the realized directional step can be
+larger than the nominal learning-rate-scaled gradient in those directions.
+After removing update scale with DAO $\nu$, the pattern changes: Muon is the
+strongest directional normalizer of the tracked GGN top-k directions, while
+SOAP, Adam, and Signum remain positive but weaker.
+
+The curvature-location story is also strong. SOAP has by far the largest GGN
+top-k eigenvalues, while Muon has the smallest. Muon's best probe loss
+reduction therefore appears to come from two effects: it avoids the sharpest
+GGN regions, and the tiny component of its update that does enter the tracked
+GGN subspace is directionally well-normalized.
+
+\FloatBarrier
+
+\section{EFISHER Backend}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_fisher_prefix_grouped/all_optimizers/mean_nu_topk_by_optimizer.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_fisher_prefix_grouped/all_optimizers/mean_nu_extra_by_optimizer.png} \\
+\end{tabular}
+\caption{EFISHER mean $\nu$ trajectories. The left panel averages over top-k directions and the right panel averages over extra directions, after applying the relative bulk reassignment rule.}
+\label{fig:efisher-nu-top-extra}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_fisher_prefix_grouped/all_optimizers/mean_nu_DAO_topk_by_optimizer.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_fisher_prefix_grouped/all_optimizers/mean_nu_DAO_extra_by_optimizer.png} \\
+\end{tabular}
+\caption{EFISHER mean DAO $\nu$ trajectories. The left panel averages the direction-alignment-only normalization index over top-k directions and the right panel averages it over extra directions.}
+\label{fig:efisher-dao-nu-top-extra}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_fisher_prefix_grouped/all_optimizers/mean_topk_eig_magnitude_by_direction.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_fisher_prefix_grouped/all_optimizers/mean_extra_eig_magnitude_by_direction.png} \\
+\end{tabular}
+\caption{EFISHER training-mean eigenvalue magnitudes by direction. The left panel compares top-k directions across optimizers and the right panel compares extra directions across optimizers, with the relative bulk reassignment rule already applied.}
+\label{fig:efisher-eig-bars-top-extra}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+Optimizer & Rel. loss red. & Acc. gain & Top-k eig. & Extra eig. & Final top-k eig. & DAO top-k $\nu$ \\
+\midrule
+SOAP & 0.092 & 0.0420 & 2.44 & 0.582 & 1.65 & 1.43 \\
+Signum & 0.048 & 0.0214 & 0.95 & 0.349 & 0.76 & -4.86 \\
+Muon & 0.141 & 0.0604 & 0.24 & 0.085 & 0.21 & -2.03 \\
+Adam & 0.073 & 0.0323 & 0.67 & 0.251 & 0.58 & -0.04 \\
+\bottomrule
+\end{tabular}
+\caption{EFISHER backend summary. Relative loss reduction and accuracy gain are probe-update measurements. Top-k modes use the relative bulk reassignment rule, so persistent modes with $|\lambda_i|/|\lambda_0|<0.1$ are counted as extra. DAO top-k $\nu$ is the energy-weighted direction-only normalization index.}
+\label{tab:efisher-summary}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Optimizer & EW top-k $\nu$ & EW DAO $\nu$ & Update energy & Grad energy & Tracked cosine \\
+\midrule
+SOAP & -8.24 & 1.43 & 0.099 & 1.000 & 0.992 \\
+Signum & 43.39 & -4.86 & 0.117 & 0.753 & 0.999 \\
+Muon & 4.67 & -2.03 & 0.005 & 0.874 & 0.989 \\
+Adam & -3.05 & -0.04 & 0.175 & 0.804 & 0.997 \\
+\bottomrule
+\end{tabular}
+\caption{EFISHER normalization and subspace-alignment diagnostics. EFISHER captures a large fraction of gradient energy, so tracked cosines are nearly saturated. This makes cosine less discriminative than in GGN or OT. DAO $\nu$ suggests SOAP is the cleanest EFISHER directional normalizer, Adam is near neutral, and Muon/Signum are negative.}
+\label{tab:efisher-normalization}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+Diagnostic correlated with relative loss reduction & Pearson $r$ \\
+\midrule
+Energy-weighted top-k $\nu$ & -0.10 \\
+DAO energy-weighted top-k $\nu$ & 0.06 \\
+Mean top-k $\nu$ & -0.13 \\
+Mean DAO top-k $\nu$ & 0.08 \\
+Tracked update-gradient cosine & -0.48 \\
+Tracked update energy fraction & -0.73 \\
+Tracked gradient energy fraction & 0.40 \\
+\bottomrule
+\end{tabular}
+\caption{EFISHER pooled loss-correlation diagnostics. Normalization indices do not explain loss reduction in this backend. The strongest signal is negative: more update energy in the tracked EFISHER top subspace correlates with worse relative loss reduction.}
+\label{tab:efisher-correlations}
+\end{table}
+
+\paragraph{EFISHER interpretation.}
+EFISHER changes the story. The tracked subspace contains much more gradient
+energy than GGN or OT, and the tracked update-gradient cosine is nearly one for
+all optimizers. That makes EFISHER less useful for separating optimizers by
+descent alignment: the cosine is almost saturated.
+
+By DAO $\nu$, SOAP is the strongest EFISHER directional normalizer, Adam is
+approximately neutral, and Muon and Signum are negative. Yet Muon still has the
+best probe loss reduction and the smallest EFISHER top-k eigenvalues. This
+again points toward a curvature-avoidance explanation for Muon rather than a
+simple ``higher normalization index is better'' explanation.
+
+The EFISHER correlations are especially important: update energy in the tracked
+EFISHER top subspace is strongly negatively correlated with loss reduction.
+This suggests that spending update energy in the top empirical-Fisher
+directions is not beneficial in these measurements.
+
+\FloatBarrier
+
+\section{OT Graph-Laplacian Backend}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ot_prefix_grouped/all_optimizers/mean_nu_topk_by_optimizer.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ot_prefix_grouped/all_optimizers/mean_nu_extra_by_optimizer.png} \\
+\end{tabular}
+\caption{OT graph-Laplacian mean $\nu$ trajectories. The left panel averages over top-k directions and the right panel averages over extra directions, with one curve per optimizer.}
+\label{fig:ot-nu-top-extra}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ot_prefix_grouped/all_optimizers/mean_nu_DAO_topk_by_optimizer.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ot_prefix_grouped/all_optimizers/mean_nu_DAO_extra_by_optimizer.png} \\
+\end{tabular}
+\caption{OT graph-Laplacian mean DAO $\nu$ trajectories. The left panel averages the direction-alignment-only normalization index over top-k directions and the right panel averages it over extra directions.}
+\label{fig:ot-dao-nu-top-extra}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tabular}{@{}cc@{}}
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ot_prefix_grouped/all_optimizers/mean_topk_eig_magnitude_by_direction.png} &
+\includegraphics[width=0.48\textwidth]{../figures/eigen_tracking_ot_prefix_grouped/all_optimizers/mean_extra_eig_magnitude_by_direction.png} \\
+\end{tabular}
+\caption{OT graph-Laplacian training-mean eigenvalue magnitudes by direction. The left panel compares top-k directions across optimizers and the right panel compares extra directions across optimizers.}
+\label{fig:ot-eig-bars-top-extra}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+Optimizer & Rel. loss red. & Acc. gain & Top-k eig. & Extra eig. & Final top-k eig. & DAO top-k $\nu$ \\
+\midrule
+SOAP & 0.105 & 0.0475 & 1.06 & 0.208 & 1.11 & -1.67 \\
+Signum & 0.069 & 0.0320 & 0.58 & 0.101 & 0.78 & -2.89 \\
+Muon & 0.184 & 0.0799 & 0.16 & 0.027 & 0.10 & -1.43 \\
+Adam & 0.100 & 0.0459 & 0.45 & 0.078 & 0.47 & -0.33 \\
+\bottomrule
+\end{tabular}
+\caption{OT graph-Laplacian backend summary. Relative loss reduction and accuracy gain are probe-update measurements. Top-k and extra eigenvalue columns report mean eigenvalue magnitudes over the run, while final top-k eigenvalue reports the final-checkpoint mean top-k magnitude.}
+\label{tab:ot-summary}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Optimizer & EW top-k $\nu$ & EW DAO $\nu$ & Update energy & Grad energy & Tracked cosine \\
+\midrule
+SOAP & -2.33 & -1.67 & $1.76{\times}10^{-4}$ & 0.085 & 0.571 \\
+Signum & 22.69 & -2.89 & $5.91{\times}10^{-4}$ & 0.006 & 0.923 \\
+Muon & 2.04 & -1.43 & $1.29{\times}10^{-5}$ & 0.039 & 0.601 \\
+Adam & 0.98 & -0.33 & $1.14{\times}10^{-3}$ & 0.026 & 0.688 \\
+\bottomrule
+\end{tabular}
+\caption{OT normalization and subspace-alignment diagnostics. The OT spectrum is close to one and often below one, so raw exponent-style $\nu$ is fragile. DAO $\nu$ is negative for all optimizers, with Adam closest to neutral. Update energy in the tracked OT subspace is very small for all optimizers, especially Muon.}
+\label{tab:ot-normalization}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+Diagnostic correlated with relative loss reduction & Pearson $r$ \\
+\midrule
+Energy-weighted top-k $\nu$ & -0.12 \\
+DAO energy-weighted top-k $\nu$ & 0.06 \\
+Mean top-k $\nu$ & -0.14 \\
+Mean DAO top-k $\nu$ & 0.05 \\
+Tracked update-gradient cosine & -0.49 \\
+Tracked update energy fraction & -0.39 \\
+Tracked gradient energy fraction & -0.11 \\
+\bottomrule
+\end{tabular}
+\caption{OT pooled loss-correlation diagnostics. The loss story is not explained by higher $\nu$ or higher tracked subspace descent cosine. Better probe loss reduction is instead associated with avoiding the high OT-curvature subspace.}
+\label{tab:ot-correlations}
+\end{table}
+
+\paragraph{OT interpretation.}
+OT confirms the curvature-avoidance story. Muon again has the best probe loss
+reduction while living in the lowest-curvature region by a large margin. SOAP
+has the largest OT eigenvalues and the second-best loss reduction. Adam is
+middle. Signum has the highest tracked subspace cosine but the weakest loss
+reduction, showing that subspace descent alignment alone is not sufficient.
+
+For OT, raw $\nu$ should be interpreted with extra care because the eigenvalue
+scale is close to one. In this backend the most reliable story is not explicit
+normalization inside the tracked top-k subspace, but avoidance of the high
+OT-curvature region.
+
+\FloatBarrier
+
+\section{Main Takeaways}
+
+\begin{enumerate}
+    \item \textbf{The loss ranking is stable.} Across GGN, EFISHER, and OT, the
+    average relative probe loss reduction ranks the optimizers as
+    Muon, then SOAP, then Adam, then Signum.
+
+    \item \textbf{Muon consistently occupies lower-curvature regions.} This is
+    visible in all three curvature objects. The SOAP-to-Muon top-k eigenvalue
+    ratio is about $9.6\times$ for GGN, $10.4\times$ for EFISHER, and
+    $6.4\times$ for OT.
+
+    \item \textbf{GGN is the cleanest normalization backend.} DAO normalization
+    in the GGN top-k subspace has a strong positive correlation with loss
+    reduction. This is the backend where a ``normalization capability'' story
+    is most defensible.
+
+    \item \textbf{EFISHER and OT emphasize avoidance rather than normalization.}
+    In both backends, normalization indices have weak loss correlations, while
+    update energy in the tracked top curvature subspace correlates negatively
+    with loss reduction.
+
+    \item \textbf{SOAP and Muon appear to solve different parts of the problem.}
+    SOAP often shows more explicit preconditioning or normalization behavior,
+    but it operates in sharper regions. Muon appears less like a universal
+    normalizer and more like an optimizer that avoids high-curvature regions,
+    while still producing the best measured probe loss reduction.
+\end{enumerate}
+
+\end{document}
