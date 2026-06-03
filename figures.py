@@ -33,11 +33,21 @@ import numpy as np
 
 
 DEFAULT_RUN_DIRS = [
-    "plainCV/exp/llm/lm_signum_job_17128624_0",
-    "/home/gtirpitz/plainCV/exp/llm/lm_adam_job_17129156_0",
-    "plainCV/exp/llm/lm_signum_job_17128624_0",
-    "plainCV/exp/llm/lm_soap_job_17133230_0",
+    "exp/llm/paper_runs/GGN_muon",
+    "exp/llm/paper_runs/GGN_soap",
+    "exp/llm/paper_runs/GGN_ni_soap",
+    "exp/llm/paper_runs/GGN_adam",
+    "exp/llm/paper_runs/GGN_signum",
 ]
+
+_OPTIMIZER_FRIENDLY = {
+    "muon": "Muon",
+    "soap": "SOAP",
+    "ni_soap": "NI-SOAP",
+    "adam": "Adam",
+    "adamw": "Adam",
+    "signum": "Signum",
+}
 
 
 @dataclass(frozen=True)
@@ -65,8 +75,26 @@ class Run:
     extra_update_energy_frac: np.ndarray
     probe_loss_before: np.ndarray
     probe_loss_reduction: np.ndarray
+    probe_acc_gain: np.ndarray
     tracked_update_energy_frac: np.ndarray
     tracked_update_grad_cosine: np.ndarray
+    nu_reg: np.ndarray
+    nu_reg_r2: np.ndarray
+    nu_reg_var_log_lambda: np.ndarray
+    nu_reg_ew: np.ndarray
+    nu_reg_ew_r2: np.ndarray
+    nu_reg_dao: np.ndarray
+    nu_reg_dao_r2: np.ndarray
+    nu_reg_dao_ew: np.ndarray
+    nu_reg_dao_ew_r2: np.ndarray
+    # Effective curvature fields (present when effective_curvature_tracking_enabled=true)
+    top_eff_curv_eig: np.ndarray
+    extra_eff_curv_eig: np.ndarray
+    top_precond_dir_gain: np.ndarray
+    extra_precond_dir_gain: np.ndarray
+    eff_cond: np.ndarray
+    effective_curvature_cond: np.ndarray
+    actual_update_rayleigh: np.ndarray
 
 
 def _repo_root() -> Path:
@@ -111,11 +139,12 @@ def _read_simple_yaml_value(path: Path, key: str) -> str | None:
 def _optimizer_from_path(run_dir: Path) -> str:
     optim = _read_simple_yaml_value(run_dir / "config.yaml", "optim")
     if optim:
-        return optim
+        return _OPTIMIZER_FRIENDLY.get(optim, optim)
 
     match = re.search(r"lm_([^_/]+)_job", run_dir.name)
     if match:
-        return match.group(1)
+        raw = match.group(1)
+        return _OPTIMIZER_FRIENDLY.get(raw, raw)
     return run_dir.name
 
 
@@ -356,6 +385,10 @@ def _load_run(
     extra_alpha_valid_cols = _numbered_columns(fieldnames, "extra_alpha_valid")
     top_psi_cols = _numbered_columns(fieldnames, psi_prefix)
     extra_psi_cols = _numbered_columns(fieldnames, f"extra_{psi_prefix}")
+    top_eff_curv_eig_cols = _numbered_columns(fieldnames, "eff_curv_eig")
+    extra_eff_curv_eig_cols = _numbered_columns(fieldnames, "extra_eff_curv_eig")
+    top_precond_dir_gain_cols = _numbered_columns(fieldnames, "precond_dir_gain")
+    extra_precond_dir_gain_cols = _numbered_columns(fieldnames, "extra_precond_dir_gain")
 
     if not top_lambda_cols or not top_phi_cols:
         raise ValueError(f"{csv_path} does not contain the expected eig_* and phi_* columns.")
@@ -385,8 +418,26 @@ def _load_run(
     update_norm = _read_columns(csv_path, ["update_norm"])[:, 0]
     probe_loss_before = _read_columns(csv_path, ["probe_loss_before"])[:, 0]
     probe_loss_reduction = _read_columns(csv_path, ["probe_loss_reduction"])[:, 0]
+    probe_acc_gain = _read_columns(csv_path, ["probe_acc_gain"])[:, 0]
     tracked_update_energy_frac = _read_columns(csv_path, ["tracked_update_energy_frac"])[:, 0]
     tracked_update_grad_cosine = _read_columns(csv_path, ["tracked_update_grad_cosine"])[:, 0]
+    nu_reg              = _read_columns(csv_path, ["nu_reg"])[:, 0]
+    nu_reg_r2           = _read_columns(csv_path, ["nu_reg_r2"])[:, 0]
+    nu_reg_var_log_lambda = _read_columns(csv_path, ["nu_reg_var_log_lambda"])[:, 0]
+    nu_reg_ew           = _read_columns(csv_path, ["nu_reg_ew"])[:, 0]
+    nu_reg_ew_r2        = _read_columns(csv_path, ["nu_reg_ew_r2"])[:, 0]
+    nu_reg_dao          = _read_columns(csv_path, ["nu_reg_dao"])[:, 0]
+    nu_reg_dao_r2       = _read_columns(csv_path, ["nu_reg_dao_r2"])[:, 0]
+    nu_reg_dao_ew       = _read_columns(csv_path, ["nu_reg_dao_ew"])[:, 0]
+    nu_reg_dao_ew_r2    = _read_columns(csv_path, ["nu_reg_dao_ew_r2"])[:, 0]
+
+    top_eff_curv_eig = _read_columns(csv_path, top_eff_curv_eig_cols) if top_eff_curv_eig_cols else np.empty((len(steps), 0))
+    extra_eff_curv_eig = _read_columns(csv_path, extra_eff_curv_eig_cols) if extra_eff_curv_eig_cols else np.empty((len(steps), 0))
+    top_precond_dir_gain = _read_columns(csv_path, top_precond_dir_gain_cols) if top_precond_dir_gain_cols else np.empty((len(steps), 0))
+    extra_precond_dir_gain = _read_columns(csv_path, extra_precond_dir_gain_cols) if extra_precond_dir_gain_cols else np.empty((len(steps), 0))
+    eff_cond = _read_columns(csv_path, ["eff_cond"])[:, 0] if "eff_cond" in fieldnames else np.full(len(steps), np.nan)
+    effective_curvature_cond = _read_columns(csv_path, ["effective_curvature_cond"])[:, 0] if "effective_curvature_cond" in fieldnames else np.full(len(steps), np.nan)
+    actual_update_rayleigh = _read_columns(csv_path, ["actual_update_rayleigh"])[:, 0] if "actual_update_rayleigh" in fieldnames else np.full(len(steps), np.nan)
 
     if not top_eos_rho_cols:
         lr_raw = _read_simple_yaml_value(run_dir / "config.yaml", "lr")
@@ -484,8 +535,25 @@ def _load_run(
         extra_update_energy_frac=extra_update_energy_frac,
         probe_loss_before=probe_loss_before,
         probe_loss_reduction=probe_loss_reduction,
+        probe_acc_gain=probe_acc_gain,
         tracked_update_energy_frac=tracked_update_energy_frac,
         tracked_update_grad_cosine=tracked_update_grad_cosine,
+        nu_reg=nu_reg,
+        nu_reg_r2=nu_reg_r2,
+        nu_reg_var_log_lambda=nu_reg_var_log_lambda,
+        nu_reg_ew=nu_reg_ew,
+        nu_reg_ew_r2=nu_reg_ew_r2,
+        nu_reg_dao=nu_reg_dao,
+        nu_reg_dao_r2=nu_reg_dao_r2,
+        nu_reg_dao_ew=nu_reg_dao_ew,
+        nu_reg_dao_ew_r2=nu_reg_dao_ew_r2,
+        top_eff_curv_eig=top_eff_curv_eig,
+        extra_eff_curv_eig=extra_eff_curv_eig,
+        top_precond_dir_gain=top_precond_dir_gain,
+        extra_precond_dir_gain=extra_precond_dir_gain,
+        eff_cond=eff_cond,
+        effective_curvature_cond=effective_curvature_cond,
+        actual_update_rayleigh=actual_update_rayleigh,
     )
 
 
@@ -918,6 +986,180 @@ def _plot_loss_corr_interaction(
     plt.close(fig)
 
 
+def _plot_measured_vs_effective_curvature(
+    runs: list[Run],
+    category: str,
+    output_path: Path,
+    title: str,
+) -> None:
+    """Side-by-side bar chart: mean measured eigenvalue vs mean effective curvature eigenvalue."""
+    labels = [run.label for run in runs]
+    if category == "top":
+        measured = [np.nanmean(np.abs(run.top_lambdas)) if run.top_lambdas.size else np.nan for run in runs]
+        effective = [np.nanmean(np.abs(run.top_eff_curv_eig)) if run.top_eff_curv_eig.size else np.nan for run in runs]
+    else:
+        measured = [np.nanmean(np.abs(run.extra_lambdas)) if run.extra_lambdas.size else np.nan for run in runs]
+        effective = [np.nanmean(np.abs(run.extra_eff_curv_eig)) if run.extra_eff_curv_eig.size else np.nan for run in runs]
+
+    measured_arr = np.asarray(measured, dtype=float)
+    effective_arr = np.asarray(effective, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(9.5, 5.5), constrained_layout=True)
+    ax.set_title(title)
+    ax.set_xlabel("Optimizer")
+    ax.set_ylabel("Mean |eigenvalue|")
+    ax.grid(True, axis="y", alpha=0.25)
+
+    x = np.arange(len(runs))
+    width = 0.34
+    ax.bar(x - width / 2.0, measured_arr, width=width, label="measured")
+    ax.bar(x + width / 2.0, effective_arr, width=width, label="effective")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    finite_all = np.concatenate([
+        measured_arr[np.isfinite(measured_arr)],
+        effective_arr[np.isfinite(effective_arr)],
+    ])
+    _use_log_scale_for_bars(ax, finite_all)
+    ax.legend(fontsize=9)
+
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _set_log_ylim(ax: plt.Axes, values: np.ndarray) -> None:
+    finite_pos = values[np.logical_and(np.isfinite(values), values > 0.0)]
+    if finite_pos.size:
+        ax.set_ylim(float(np.min(finite_pos)) * 0.5, float(np.max(finite_pos)) * 2.0)
+
+
+def _plot_eff_curv_trajectory(
+    runs: list[Run],
+    category: str,
+    output_path: Path,
+    title: str,
+) -> None:
+    """Mean effective curvature eigenvalue trajectory per optimizer."""
+    fig, ax = _setup_axes(title, "Mean |eff. curv. eigenvalue|", yscale="log")
+    mean_values: list[np.ndarray] = []
+    for run in runs:
+        arr = run.top_eff_curv_eig if category == "top" else run.extra_eff_curv_eig
+        if arr.size == 0:
+            continue
+        mean_val = _nanmean(np.abs(arr), axis=1)
+        mean_values.append(mean_val)
+        ax.plot(run.steps, mean_val, linewidth=2.2, label=run.label)
+    if mean_values:
+        _set_log_ylim(ax, np.concatenate(mean_values))
+        ax.legend(fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No effective curvature data", transform=ax.transAxes, ha="center", va="center")
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_measured_vs_effective_trajectory(
+    run: Run,
+    category: str,
+    output_path: Path,
+) -> None:
+    """Side-by-side trajectory: mean measured eig (left) vs mean eff curvature eig (right)."""
+    lambdas = run.top_lambdas if category == "top" else run.extra_lambdas
+    eff_eig = run.top_eff_curv_eig if category == "top" else run.extra_eff_curv_eig
+    kind = "top-k" if category == "top" else "extra"
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
+    fig.suptitle(f"{run.label}: measured vs effective curvature ({kind} directions)")
+
+    def _apply_log_if_warranted(ax: plt.Axes, data: np.ndarray) -> None:
+        pos = data[np.logical_and(np.isfinite(data), data > 0)]
+        if pos.size >= 2 and float(np.max(pos)) / float(np.min(pos)) > 20.0:
+            ax.set_yscale("log")
+            _set_log_ylim(ax, pos)
+
+    ax_m = axes[0]
+    ax_m.set_title("Measured eigenvalues")
+    ax_m.set_xlabel("Optimizer step")
+    ax_m.set_ylabel("Eigenvalue")
+    ax_m.grid(True, alpha=0.25)
+    if lambdas.size and lambdas.shape[1] > 0:
+        for idx in range(lambdas.shape[1]):
+            ax_m.plot(run.steps, lambdas[:, idx], linewidth=1.8, label=f"dir {idx}")
+        ax_m.legend(ncol=2, fontsize=9)
+        _apply_log_if_warranted(ax_m, lambdas.ravel())
+    else:
+        ax_m.text(0.5, 0.5, "No data", transform=ax_m.transAxes, ha="center", va="center")
+
+    ax_e = axes[1]
+    ax_e.set_title("Effective curvature eigenvalues")
+    ax_e.set_xlabel("Optimizer step")
+    ax_e.set_ylabel("Eff. curv. eigenvalue")
+    ax_e.grid(True, alpha=0.25)
+    if eff_eig.size and eff_eig.shape[1] > 0:
+        has_data = np.any(np.isfinite(eff_eig))
+        if has_data:
+            for idx in range(eff_eig.shape[1]):
+                ax_e.plot(run.steps, eff_eig[:, idx], linewidth=1.8, label=f"dir {idx}")
+            ax_e.legend(ncol=2, fontsize=9)
+            _apply_log_if_warranted(ax_e, eff_eig.ravel())
+        else:
+            ax_e.text(0.5, 0.5, "No eff. curv. data", transform=ax_e.transAxes, ha="center", va="center")
+    else:
+        ax_e.text(0.5, 0.5, "No eff. curv. data", transform=ax_e.transAxes, ha="center", va="center")
+
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_eff_cond_trajectory(
+    runs: list[Run],
+    output_path: Path,
+) -> None:
+    """Effective curvature condition number trajectory per optimizer."""
+    fig, ax = _setup_axes("Effective curvature condition number", "Condition number", yscale="log")
+    all_values: list[np.ndarray] = []
+    for run in runs:
+        val = run.effective_curvature_cond
+        if not np.any(np.isfinite(val)):
+            val = run.eff_cond
+        if not np.any(np.isfinite(val)):
+            continue
+        all_values.append(val[np.isfinite(val)])
+        ax.plot(run.steps, val, linewidth=2.2, label=run.label)
+    if all_values:
+        _set_log_ylim(ax, np.concatenate(all_values))
+        ax.legend(fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No condition number data", transform=ax.transAxes, ha="center", va="center")
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_actual_update_rayleigh(
+    runs: list[Run],
+    output_path: Path,
+) -> None:
+    """Actual update Rayleigh quotient (update^T C update / ||update||^2) trajectory."""
+    fig, ax = _setup_axes("Actual update Rayleigh quotient", r"$\Delta^T C \Delta / \|\Delta\|^2$", yscale="log")
+    all_values: list[np.ndarray] = []
+    for run in runs:
+        val = run.actual_update_rayleigh
+        if not np.any(np.isfinite(val)):
+            continue
+        pos_val = np.where(val > 0, val, np.nan)
+        if not np.any(np.isfinite(pos_val)):
+            continue
+        all_values.append(pos_val[np.isfinite(pos_val)])
+        ax.plot(run.steps, pos_val, linewidth=2.2, label=run.label)
+    if all_values:
+        _set_log_ylim(ax, np.concatenate(all_values))
+        ax.legend(fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No Rayleigh data", transform=ax.transAxes, ha="center", va="center")
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
 def make_figures(runs: list[Run], output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     all_optimizers_dir = output_dir / "all_optimizers"
@@ -1183,6 +1425,62 @@ def make_figures(runs: list[Run], output_dir: Path) -> list[Path]:
         title="Training-mean eigenvalue magnitude by optimizer",
     )
     written.append(optimizer_training_mean_eig_path)
+
+    # Effective curvature plots (per-run side-by-side)
+    runs_with_eff = [r for r in runs if r.top_eff_curv_eig.size > 0]
+    if runs_with_eff:
+        for run in runs_with_eff:
+            safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", run.label).strip("_").lower()
+            run_output_dir = output_dir / safe_label
+            run_output_dir.mkdir(parents=True, exist_ok=True)
+
+            topk_sb = run_output_dir / "measured_vs_eff_curv_topk.png"
+            _plot_measured_vs_effective_trajectory(run, "top", topk_sb)
+            written.append(topk_sb)
+
+            if run.extra_eff_curv_eig.size:
+                extra_sb = run_output_dir / "measured_vs_eff_curv_extra.png"
+                _plot_measured_vs_effective_trajectory(run, "extra", extra_sb)
+                written.append(extra_sb)
+
+        # All-optimizer effective curvature trajectory
+        eff_traj_top_path = all_optimizers_dir / "mean_eff_curv_eig_topk_by_optimizer.png"
+        _plot_eff_curv_trajectory(
+            runs_with_eff, "top", eff_traj_top_path,
+            "Mean effective curvature eigenvalue over top-k directions",
+        )
+        written.append(eff_traj_top_path)
+
+        eff_traj_extra_path = all_optimizers_dir / "mean_eff_curv_eig_extra_by_optimizer.png"
+        _plot_eff_curv_trajectory(
+            runs_with_eff, "extra", eff_traj_extra_path,
+            "Mean effective curvature eigenvalue over extra directions",
+        )
+        written.append(eff_traj_extra_path)
+
+        # Measured vs effective curvature bars
+        meas_vs_eff_top_path = all_optimizers_dir / "measured_vs_eff_curv_topk_bars.png"
+        _plot_measured_vs_effective_curvature(
+            runs_with_eff, "top", meas_vs_eff_top_path,
+            "Measured GGN vs effective curvature (top-k, training mean)",
+        )
+        written.append(meas_vs_eff_top_path)
+
+        meas_vs_eff_extra_path = all_optimizers_dir / "measured_vs_eff_curv_extra_bars.png"
+        _plot_measured_vs_effective_curvature(
+            runs_with_eff, "extra", meas_vs_eff_extra_path,
+            "Measured GGN vs effective curvature (extra, training mean)",
+        )
+        written.append(meas_vs_eff_extra_path)
+
+        # Condition number and Rayleigh quotient
+        eff_cond_path = all_optimizers_dir / "effective_curvature_cond_by_optimizer.png"
+        _plot_eff_cond_trajectory(runs_with_eff, eff_cond_path)
+        written.append(eff_cond_path)
+
+        rayleigh_path = all_optimizers_dir / "actual_update_rayleigh_by_optimizer.png"
+        _plot_actual_update_rayleigh(runs_with_eff, rayleigh_path)
+        written.append(rayleigh_path)
 
     return written
 
