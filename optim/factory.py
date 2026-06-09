@@ -10,6 +10,7 @@ import optax
 
 from .pns_eigenmuon import pns_eigenmuon
 from .soap import soap as soap_opt
+from .ni_soap import ni_soap as ni_soap_opt
 from .pns_eigenadam import pns_eigenadam
 from .ggn_utils import (
     make_ggn_matvec_fn,
@@ -297,6 +298,24 @@ def get_optimizer(
             eps=eps,
             weight_decay=weight_decay,
         )
+
+    # ------------------------
+    # SGD / SGD with momentum
+    # ------------------------
+    elif name in {"sgd", "momentum", "sgdm", "sgd_momentum", "sgd-momentum"}:
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        momentum = getattr(cfg, "sgd_momentum", getattr(cfg, "momentum", 0.9))
+        nesterov = getattr(cfg, "sgd_nesterov", False)
+
+        sgd_tx = optax.sgd(
+            learning_rate=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+        )
+        if weight_decay > 0.0:
+            tx = optax.chain(optax.add_decayed_weights(weight_decay), sgd_tx)
+        else:
+            tx = sgd_tx
 
     # ------------------------
     # Signum (signSGD + momentum)
@@ -743,6 +762,47 @@ def get_optimizer(
             shampoo_beta2=shampoo_beta2,
             log_skipped=log_skipped,
             correct_bias=correct_bias,
+        )
+
+    # ------------------------
+    # NI-SOAP (Noise-Injected SOAP)
+    # ------------------------
+    elif name in {"ni_soap", "ni-soap", "nisoap"}:
+        weight_decay = getattr(cfg, "weight_decay", 0.01)
+        beta1 = getattr(cfg, "beta1", 0.95)
+        beta2 = getattr(cfg, "beta2", 0.95)
+        eps = getattr(cfg, "eps", 1e-8)
+        precond_freq = getattr(cfg, "precondition_frequency", 10)
+        shampoo_beta2 = getattr(cfg, "shampoo_beta2", None)
+        log_skipped = getattr(cfg, "soap_log_skipped", False)
+        correct_bias = getattr(cfg, "correct_bias", True)
+        alpha = float(getattr(cfg, "ni_soap_alpha", 1.0))
+        seed = int(getattr(cfg, "ni_soap_seed", 0))
+        # batch_size = effective samples per gradient step used to compute
+        # the energy-matched noise scale sqrt(lr / batch_size).
+        # For LMs: micro_batch_size * grad_accumulation_steps * world_size.
+        batch_size = int(
+            getattr(
+                cfg,
+                "ni_soap_batch_size",
+                getattr(cfg, "micro_batch_size", 8)
+                * getattr(cfg, "grad_accumulation_steps", 1),
+            )
+        )
+
+        tx = ni_soap_opt(
+            learning_rate=lr,
+            b1=beta1,
+            b2=beta2,
+            eps=eps,
+            weight_decay=weight_decay,
+            precondition_frequency=precond_freq,
+            shampoo_beta2=shampoo_beta2,
+            log_skipped=log_skipped,
+            correct_bias=correct_bias,
+            batch_size=batch_size,
+            alpha=alpha,
+            seed=seed,
         )
 
      # ------------------------

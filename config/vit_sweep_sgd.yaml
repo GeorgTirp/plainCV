@@ -1,0 +1,52 @@
+# W&B Bayesian sweep — SGD+momentum on ViT-S/4 / CIFAR-10
+# Register with:  wandb sweep config/vit_sweep_sgd.yaml
+# Then update nc_sweep_vit_sgd.sub with the returned sweep ID.
+program: train.py
+method: bayes
+metric:
+  name: eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/vit_tinyimagenet_ggn_sgd.yaml
+
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5.0e-4
+    max: 5.0e-1
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 0.1
+
+  sgd_momentum:
+    distribution: uniform
+    min: 0.5
+    max: 0.99
+
+  sgd_nesterov:
+    values: [false]
+
+  # Disable eigentracking during sweep — too expensive
+  eigen_tracking_enabled:
+    value: false
+
+  effective_curvature_tracking_enabled:
+    value: false
+
+  num_epochs:
+    value: 30
+
+  use_wandb:
+    value: true
+
+  wandb_project:
+    value: vit-tinyimagenet-tune
+
+run_cap: 30

@@ -1,0 +1,61 @@
+seed: 0
+print_progress: true
+
+dataset: "cifar10"
+batch_size: 128
+image_size: 32
+num_epochs: 50
+num_channels: 3
+num_classes: 10
+
+# ViT-S/4: ~21.4M params on 32x32x3
+model: "vit"
+vit_patch_size: 4
+vit_hidden_size: 384
+vit_mlp_dim: 1536
+vit_layers: 12
+vit_heads: 6
+vit_dropout: 0.1
+vit_use_layernorm: true
+vit_use_batchnorm: false
+
+optim: adam
+lr: 3.0e-4
+weight_decay: 0.01
+beta1: 0.9
+beta2: 0.999
+
+muon_beta: 0.95
+muon_ns_steps: 5
+muon_ns_coeffs: [3.4445, -4.7750, 2.0315]
+muon_nesterov: true
+muon_adaptive: false
+
+signum_momentum: 0.9
+signum_nesterov: false
+
+precondition_frequency: 32
+shampoo_beta2: 0.99
+
+# GGN eigentracking — mirrors LLM paper_runs/GGN_adam/config.yaml
+eigen_tracking_enabled: true
+eigen_tracking_every: 250
+eigen_tracking_topk: 8
+eigen_tracking_extra_modes: 8
+eigen_tracking_lanczos_iters: 16
+eigen_tracking_backend: ggn
+eigen_tracking_sort_by_abs: false
+eigen_tracking_light_ortho: false
+eigen_tracking_light_ortho_every: 4
+eigen_tracking_measurement_mode: probe_update
+
+# Effective curvature tracking
+effective_curvature_tracking_enabled: true
+effective_curvature_transform_base: zero
+effective_curvature_direction_scale: 1.0
+effective_curvature_normalize_lr: true
+effective_curvature_gram_ridge: 1.0e-8
+
+exp_name: "GGN_vit_cifar10_adam"
+out_dir: "./exp/vit_cifar10"
+use_wandb: false

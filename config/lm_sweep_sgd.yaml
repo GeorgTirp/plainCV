@@ -1,0 +1,35 @@
+# sweep.yaml
+program: train_lm.py
+method: bayes
+metric:
+  name: eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/lm_sgd.yaml
+
+parameters:
+  # Use names that match keys in the base config YAML.
+  lr:
+    distribution: log_uniform_values
+    min: 1e-7
+    max: 1e-1
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 0.25
+
+  sgd_momentum:
+    distribution: uniform
+    min: 0.5
+    max: 0.99
+
+  sgd_nesterov:
+    values: [false]
+
+run_cap: 24

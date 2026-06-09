@@ -19,7 +19,7 @@ vocab_size: 50257
 intra_doc_masking: True
 sampler: "sequential"
 sampler_seed: 0
-num_workers: 2
+num_workers: 0
 
 eval: True
 valid_tokens: 200000
@@ -37,8 +37,8 @@ rope_theta: 500000.0
 torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
-steps_budget: 38147
-micro_batch_size: 16
+steps_budget: 12700
+micro_batch_size: 8
 grad_accumulation_steps: 8
 
 # choose between {float32, float16, bfloat16}
@@ -46,8 +46,8 @@ dtype: "bfloat16"
 
 optim: signum
 fused_optim: False
-lr: 3.622632222670203e-05
-#old non scaled lr: 0.00006361387942129539
+#lr: 3.622632222670203e-05
+lr: 0.00006361387942129539
 weight_decay: 0.217590785906466
 beta1: 0.9
 beta2: 0.95
@@ -56,21 +56,23 @@ signum_nesterov: False
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
-eigen_tracking_every: 768
+measurement_momentum: false
+eigen_tracking_every: 576
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_topk: 6
-eigen_tracking_extra_modes: 6
+eigen_tracking_topk: 5
+eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
-eigen_tracking_lanczos_iters: 12
+eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: wasserstein
 eigen_tracking_sort_by_abs: false
-wasserstein_lm_top_k: 32
-wasserstein_lm_max_positions: 256
+wasserstein_lm_top_k: 256
+wasserstein_lm_max_positions: 512
 wasserstein_graph_temp: 0.0
 wasserstein_graph_eps: 1.e-6
 wasserstein_laplacian_ridge: 1.e-4
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
+effective_curvature_tracking_enabled: true
 
 scheduler: "warmup_cosine"
 warmup_steps: 0.05
@@ -85,8 +87,8 @@ print_progress: True
 use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
-wandb_run_name: "lm_fwedu_10BT_signum"
-exp_name: "lm_fwedu_10BT_signum"
+wandb_run_name: "WASSERSTEIN_signum"
+exp_name: "WASSERSTEIN_signum"
 out_dir: "./exp/llm"
 over_write: True
 

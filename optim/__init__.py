@@ -4,6 +4,7 @@
 from .base import GradientTransformation, StepState
 from .factory import get_optimizer
 from .pns_eigenadam import pns_eigenadam
+from .ni_soap import ni_soap
 from .signum import signum
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "StepState",
     "get_optimizer",
     "pns_eigenadam",
+    "ni_soap",
     "signum",
 ]

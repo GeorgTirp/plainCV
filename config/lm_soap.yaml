@@ -39,7 +39,7 @@ rope_theta: 500000.0
 torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
-steps_budget: 38147
+steps_budget: 12700
 micro_batch_size: 8
 grad_accumulation_steps: 8
 
@@ -48,34 +48,36 @@ dtype: "bfloat16"
 
 optim: soap
 fused_optim: False
-lr: 0.00021140560730609868
-# old non-scaled lr: 0.0003712309167902025
-weight_decay: 0.02946913648450978
-beta1: 0.8928004631097273
-beta2: 0.9831582493142336
-eps: 9.44658692677875e-8
+#lr: 0.00021140560730609868
+lr: 0.0006601861784305773
+weight_decay: 0.02456939618430241
+beta1: 0.8445311418026576
+beta2: 0.976349707978438
+eps: 1.329620780745006e-9
 
 precondition_frequency: 32
-shampoo_beta2: 0.9496977646795652
+shampoo_beta2: 0.9908117914248408
 
 # --- Generic eigen tracking (works with any optimizer) ---
-eigen_tracking_enabled: true
-eigen_tracking_every: 768
+eigen_tracking_enabled: false
+measurement_momentum: false
+eigen_tracking_every: 576
 eigen_tracking_measurement_mode: probe_update
 eigen_tracking_post_soap_refresh: true
-eigen_tracking_topk: 6
-eigen_tracking_extra_modes: 6
+eigen_tracking_topk: 5
+eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
-eigen_tracking_lanczos_iters: 12
+eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: wasserstein
 eigen_tracking_sort_by_abs: false
-wasserstein_lm_top_k: 32
-wasserstein_lm_max_positions: 256
+wasserstein_lm_top_k: 256
+wasserstein_lm_max_positions: 512
 wasserstein_graph_temp: 0.0
 wasserstein_graph_eps: 1.e-6
 wasserstein_laplacian_ridge: 1.e-4
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
+effective_curvature_tracking_enabled: true
 
 scheduler: "warmup_cosine"
 warmup_steps: 0.05
@@ -90,9 +92,9 @@ print_progress: True
 use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
-wandb_run_name: "lm_fwedu_10BT"
+wandb_run_name: "WASSERSTEIN_soap"
 wandb_unique_names: True
-exp_name: "lm_fwedu_10BT"
+exp_name: "WASSERSTEIN_soap"
 out_dir: "./exp/llm"
 over_write: True
 

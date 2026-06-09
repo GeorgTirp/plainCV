@@ -80,6 +80,10 @@ class EigenTrackingState(NamedTuple):
     extra_damped_effective_curvature_eigenvalues: Array
     preconditioned_dir_gain: Array
     extra_preconditioned_dir_gain: Array
+    # Momentum-reference projections (NaN when measurement_momentum=False)
+    m_proj: Array
+    extra_m_proj: Array
+    m_norm: Array
 
 
 def _project_rows(matrix: Array, vector: Array) -> Array:
@@ -135,13 +139,16 @@ def init_eigentracking(
     flat_params, _ = ravel_pytree(params)
     dim = flat_params.shape[0]
     dtype = flat_params.dtype
+    # Eigenvectors are (k, n_params) — at 162M params they are ~3.85 GiB each in fp32.
+    # Use bf16 to halve that; scalar metrics remain in dtype (fp32).
+    vec_dtype = jnp.bfloat16
     nan = jnp.asarray(jnp.nan, dtype=dtype)
     return EigenTrackingState(
         step=jnp.array(0, dtype=jnp.int32),
         eigenvalues=jnp.zeros((k,), dtype=dtype),
-        eigenvectors=jnp.zeros((k, dim), dtype=dtype),
+        eigenvectors=jnp.zeros((k, dim), dtype=vec_dtype),
         extra_eigenvalues=jnp.zeros((extra_modes,), dtype=dtype),
-        extra_eigenvectors=jnp.zeros((extra_modes, dim), dtype=dtype),
+        extra_eigenvectors=jnp.zeros((extra_modes, dim), dtype=vec_dtype),
         ritz_residual=jnp.full((k,), jnp.nan, dtype=dtype),
         extra_ritz_residual=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         g_proj=jnp.full((k,), jnp.nan, dtype=dtype),
@@ -189,6 +196,9 @@ def init_eigentracking(
         ),
         preconditioned_dir_gain=jnp.full((k,), jnp.nan, dtype=dtype),
         extra_preconditioned_dir_gain=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
+        m_proj=jnp.full((k,), jnp.nan, dtype=dtype),
+        extra_m_proj=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
+        m_norm=nan,
     )
 
 
@@ -274,19 +284,55 @@ def _effective_curvature_metrics(
       effective_cond: abs-condition number of generalized_eigs.
       update_rayleigh: u^T H u / ||u||^2 for the actual/probe update.
     """
-    metric_dtype = basis_rows.dtype
+    # Gram/curvature matrices go through potrf (Cholesky); bf16 is unsupported.
+    metric_dtype = jnp.float32
     nan = jnp.asarray(jnp.nan, dtype=metric_dtype)
     n = basis_rows.shape[0]
 
     def transform_row(row: Array) -> Array:
         return effective_transform_flat(row).astype(metric_dtype)
 
-    z_rows = jax.lax.map(transform_row, basis_rows)
-    hz_rows = jax.lax.map(matvec_flat, z_rows)
-    gains = jnp.sqrt(jnp.sum(jnp.square(z_rows), axis=1))
+    # Stream rows instead of materializing z_rows and H z_rows.  For LM-scale
+    # models, each row is a full parameter vector, so keeping transformed basis
+    # matrices resident can dominate eigentracking memory.
+    gram0 = jnp.zeros((n, n), dtype=metric_dtype)
+    curv0 = jnp.zeros((n, n), dtype=metric_dtype)
+    gains0 = jnp.zeros((n,), dtype=metric_dtype)
 
-    gram = z_rows @ z_rows.T
-    curv = z_rows @ hz_rows.T
+    def outer_body(i: int, carry):
+        gram, curv, gains = carry
+        z_i = transform_row(basis_rows[i])
+        hz_i = matvec_flat(z_i).astype(metric_dtype)
+        gains = gains.at[i].set(jnp.sqrt(jnp.sum(jnp.square(z_i))))
+
+        gram_row0 = jnp.zeros((n,), dtype=metric_dtype)
+        curv_row0 = jnp.zeros((n,), dtype=metric_dtype)
+
+        def inner_body(j: int, row_carry):
+            gram_row, curv_row = row_carry
+            z_j = transform_row(basis_rows[j])
+            gram_row = gram_row.at[j].set(jnp.vdot(z_i, z_j))
+            # H is intended to be symmetric; using z_j^T H z_i lets us reuse the
+            # single streamed matvec H z_i for this row. We symmetrize below.
+            curv_row = curv_row.at[j].set(jnp.vdot(z_j, hz_i))
+            return gram_row, curv_row
+
+        gram_row, curv_row = jax.lax.fori_loop(
+            0,
+            n,
+            inner_body,
+            (gram_row0, curv_row0),
+        )
+        gram = gram.at[i, :].set(gram_row)
+        curv = curv.at[i, :].set(curv_row)
+        return gram, curv, gains
+
+    gram, curv, gains = jax.lax.fori_loop(
+        0,
+        n,
+        outer_body,
+        (gram0, curv0, gains0),
+    )
     gram = 0.5 * (gram + gram.T)
     curv = 0.5 * (curv + curv.T)
 
@@ -319,6 +365,154 @@ def _effective_curvature_metrics(
     )
 
 
+def _iter_state_children(state):
+    """Yield direct children of an optax-style state node for structure traversal."""
+    if hasattr(state, '_fields'):
+        for f in state._fields:
+            yield getattr(state, f)
+    elif isinstance(state, dict):
+        yield from state.values()
+    elif isinstance(state, (list, tuple)):
+        yield from state
+
+
+def _find_first_of_type(state, target_type):
+    """Return the first node in the state pytree that is an instance of target_type."""
+    if isinstance(state, target_type):
+        return state
+    if isinstance(state, (dict, list, tuple)) or hasattr(state, '_fields'):
+        for child in _iter_state_children(state):
+            result = _find_first_of_type(child, target_type)
+            if result is not None:
+                return result
+    return None
+
+
+def _combine_masked_pytrees(primary, fallback):
+    """Walk two pytrees with identical structure; for each leaf use primary unless it is a MaskedNode."""
+    try:
+        masked_cls = optax.MaskedNode
+    except AttributeError:
+        return primary
+    if isinstance(primary, masked_cls):
+        return fallback
+    if isinstance(primary, dict):
+        return {k: _combine_masked_pytrees(primary[k], fallback[k]) for k in primary}
+    if hasattr(primary, '_fields'):
+        return type(primary)(
+            *[_combine_masked_pytrees(getattr(primary, f), getattr(fallback, f))
+              for f in primary._fields]
+        )
+    if isinstance(primary, (list, tuple)):
+        merged = [_combine_masked_pytrees(p, f) for p, f in zip(primary, fallback)]
+        return type(primary)(merged)
+    return primary
+
+
+def extract_momentum_pytree(opt_state, optim_name: str):
+    """
+    Extract the post-momentum / pre-preconditioning intermediate vector from the
+    optimizer state.  Returns a pytree matching the params structure, or None if
+    the optimizer is not recognised or has no applicable momentum buffer.
+
+    Concretely:
+      adam / adamw      : ScaleByAdamState.mu  (first-moment EMA)
+      soap / ni_soap    : SoapPerParamState.m / NiSoapPerParamState.m  (momentum before Kronecker projection)
+      muon              : MuonState.mu (Muon params) combined with ScaleByAdamState.mu (Adam params)
+      signum            : SignumState.momentum_buffer  (before sign)
+      sgd               : TraceState.trace  (velocity / momentum buffer; equals grad when momentum=0)
+    """
+    name = optim_name.lower().strip()
+
+    # ---- Adam / AdamW --------------------------------------------------------
+    if name in {"adam", "adamw"}:
+        ScaleByAdamState = getattr(optax, "ScaleByAdamState", None)
+        if ScaleByAdamState is None:
+            try:
+                from optax._src.transform import ScaleByAdamState
+            except ImportError:
+                ScaleByAdamState = None
+        if ScaleByAdamState is not None:
+            node = _find_first_of_type(opt_state, ScaleByAdamState)
+            if node is not None:
+                return node.mu
+        return None
+
+    # ---- SOAP / NI-SOAP -------------------------------------------------------
+    if name in {"soap", "ni_soap", "ni-soap", "nisoap"}:
+        from optim.soap import SoapState, SoapPerParamState
+        from optim.ni_soap import NiSoapState, NiSoapPerParamState
+
+        soap_node = _find_first_of_type(opt_state, SoapState)
+        if soap_node is not None:
+            # per_param is a pytree[SoapPerParamState]; extract .m from each leaf
+            return jax.tree_util.tree_map(
+                lambda s: s.m,
+                soap_node.per_param,
+                is_leaf=lambda x: isinstance(x, SoapPerParamState),
+            )
+        ni_soap_node = _find_first_of_type(opt_state, NiSoapState)
+        if ni_soap_node is not None:
+            return jax.tree_util.tree_map(
+                lambda s: s.m,
+                ni_soap_node.per_param,
+                is_leaf=lambda x: isinstance(x, NiSoapPerParamState),
+            )
+        return None
+
+    # ---- Muon -----------------------------------------------------------------
+    if name == "muon":
+        try:
+            from optax.contrib._muon import MuonState
+        except ImportError:
+            MuonState = None
+        ScaleByAdamState = getattr(optax, "ScaleByAdamState", None)
+        if ScaleByAdamState is None:
+            try:
+                from optax._src.transform import ScaleByAdamState
+            except ImportError:
+                ScaleByAdamState = None
+
+        if MuonState is None or ScaleByAdamState is None:
+            return None
+
+        muon_node = _find_first_of_type(opt_state, MuonState)
+        adam_node = _find_first_of_type(opt_state, ScaleByAdamState)
+        if muon_node is None and adam_node is None:
+            return None
+        if muon_node is None:
+            return adam_node.mu if adam_node is not None else None
+        if adam_node is None:
+            return muon_node.mu
+
+        # Both exist: combine, giving priority to muon momentum where it's real.
+        return _combine_masked_pytrees(muon_node.mu, adam_node.mu)
+
+    # ---- Signum ---------------------------------------------------------------
+    if name in {"signum", "sign_sgd", "sign-sgd", "signsgd"}:
+        from optim.signum import SignumState
+        node = _find_first_of_type(opt_state, SignumState)
+        if node is not None:
+            return node.momentum_buffer
+        return None
+
+    # ---- SGD (with or without momentum) --------------------------------------
+    if name in {"sgd", "momentum", "sgdm", "sgd_momentum", "sgd-momentum"}:
+        TraceState = getattr(optax, "TraceState", None)
+        if TraceState is None:
+            try:
+                from optax._src.transform import TraceState
+            except ImportError:
+                TraceState = None
+        if TraceState is not None:
+            node = _find_first_of_type(opt_state, TraceState)
+            if node is not None:
+                return node.trace
+        return None
+
+    return None
+
+
 def track_eigenstate(
     params: Params,
     grads: PyTree,
@@ -338,6 +532,7 @@ def track_eigenstate(
     alpha_grad_tol_rel: float = 1e-3,
     effective_transform_fn: Optional[Callable[[PyTree], PyTree]] = None,
     effective_curvature_gram_ridge: float = 1e-8,
+    momentum_flat: Optional[Array] = None,
 ) -> EigenTrackingState:
     flat_params, unravel_params = ravel_pytree(params)
     dim = flat_params.shape[0]
@@ -355,6 +550,10 @@ def track_eigenstate(
     extra_k = eigen_state.extra_eigenvalues.shape[0]
     total_keep = k + extra_k
     if total_keep == 0:
+        m_norm_val = (
+            jnp.sqrt(jnp.sum(jnp.square(momentum_flat.astype(metric_dtype))))
+            if momentum_flat is not None else nan
+        )
         return eigen_state._replace(
             step=step,
             rng_key=rng_key,
@@ -376,12 +575,13 @@ def track_eigenstate(
             neg_update_grad_cosine=nan,
             effective_curvature_cond=nan,
             actual_update_rayleigh=nan,
+            m_norm=m_norm_val,
         )
 
     lanczos_steps = max(total_keep, total_keep if num_iter is None else int(num_iter))
 
     def matvec_flat(v_flat: Array) -> Array:
-        v_pytree = unravel_params(v_flat)
+        v_pytree = unravel_params(v_flat.astype(jnp.float32))
         hv_pytree = matvec_fn(params, v_pytree, rng_key)
         hv_flat, _ = ravel_pytree(hv_pytree)
         return hv_flat
@@ -448,7 +648,7 @@ def track_eigenstate(
     if effective_transform_fn is not None:
 
         def effective_transform_flat(v_flat: Array) -> Array:
-            z_pytree = effective_transform_fn(unravel_params(v_flat))
+            z_pytree = effective_transform_fn(unravel_params(v_flat.astype(jnp.float32)))
             z_flat, _ = ravel_pytree(z_pytree)
             return z_flat
 
@@ -597,6 +797,18 @@ def track_eigenstate(
             max_abs / jnp.maximum(min_abs, eps),
             jnp.array(0.0, dtype=phi.dtype),
         )
+
+        # Momentum-reference projections
+        if momentum_flat is not None:
+            mom_flat = momentum_flat.astype(metric_dtype)
+            m_proj_all = _project_rows(all_eigenvectors, mom_flat)
+            top_m_proj = m_proj_all[:k]
+            extra_m_proj = m_proj_all[k : k + extra_k]
+            m_norm_val = jnp.sqrt(jnp.sum(jnp.square(mom_flat)))
+        else:
+            top_m_proj = jnp.full((k,), jnp.nan, dtype=metric_dtype)
+            extra_m_proj = jnp.full((extra_k,), jnp.nan, dtype=metric_dtype)
+            m_norm_val = nan
     else:
         rotation_diff = jnp.array(0.0, dtype=eigenvalues.dtype)
         alpha = eigen_state.alpha
@@ -630,6 +842,9 @@ def track_eigenstate(
         neg_grad_energy_frac = eigen_state.neg_grad_energy_frac
         pos_update_grad_cosine = eigen_state.pos_update_grad_cosine
         neg_update_grad_cosine = eigen_state.neg_update_grad_cosine
+        top_m_proj = eigen_state.m_proj
+        extra_m_proj = eigen_state.extra_m_proj
+        m_norm_val = eigen_state.m_norm
 
     return eigen_state._replace(
         step=step,
@@ -684,6 +899,9 @@ def track_eigenstate(
         ],
         preconditioned_dir_gain=preconditioned_dir_gain_all[:k],
         extra_preconditioned_dir_gain=preconditioned_dir_gain_all[k : k + extra_k],
+        m_proj=top_m_proj,
+        extra_m_proj=extra_m_proj,
+        m_norm=m_norm_val,
     )
 
 
@@ -713,14 +931,15 @@ def lanczos(
 
     def body_fun(carry, i):
         v_basis, alphas, betas = carry
-        v = v_basis[i]
+        # Read as fp32 for numerically stable orthogonalization; v_basis stored as bf16.
+        v = v_basis[i].astype(jnp.float32)
 
         w = matvec(v)
         alpha = jnp.vdot(v, w)
         w = w - alpha * v
 
         def ortho_against_prev(current_w, basis_idx):
-            prev_v = v_basis[basis_idx]
+            prev_v = v_basis[basis_idx].astype(jnp.float32)
             proj = jnp.vdot(prev_v, current_w)
             return current_w - proj * prev_v
 
@@ -749,13 +968,15 @@ def lanczos(
         beta = jnp.where(beta < eps, 0.0, beta)
         next_v = jnp.where(beta > 0, w / (beta + eps), jnp.zeros_like(w))
 
-        v_basis = v_basis.at[i + 1].set(next_v)
+        # Store back as bf16 to halve the 8 GiB Krylov basis memory.
+        v_basis = v_basis.at[i + 1].set(next_v.astype(jnp.bfloat16))
         alphas = alphas.at[i].set(alpha)
         betas = betas.at[i].set(beta)
         return (v_basis, alphas, betas), None
 
-    v_basis = jnp.zeros((num_iter + 1, dim))
-    v_basis = v_basis.at[0].set(v0)
+    # bf16 storage: (num_iter+1, dim) fp32 would be ~8 GiB for 162M-param models.
+    v_basis = jnp.zeros((num_iter + 1, dim), dtype=jnp.bfloat16)
+    v_basis = v_basis.at[0].set(v0.astype(jnp.bfloat16))
     alphas = jnp.zeros((num_iter,))
     betas = jnp.zeros((num_iter,))
 
@@ -789,7 +1010,8 @@ def lanczos(
         evecs_t = evecs_t[:, :keep]
 
     v_k = v_basis[:-1]
-    eigenvectors = _expand_from_basis(evecs_t.T, v_k).reshape(evecs_t.shape[1], dim)
+    # _expand_from_basis promotes bf16 basis × fp32 coeffs → fp32; cast back to bf16.
+    eigenvectors = _expand_from_basis(evecs_t.T, v_k).reshape(evecs_t.shape[1], dim).astype(jnp.bfloat16)
     if return_residuals:
         return evals, eigenvectors, residuals
     return evals, eigenvectors

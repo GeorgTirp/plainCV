@@ -1,5 +1,5 @@
 ## Local LM config (JAX/Flax)
-## Update trainset_path/validset_path to match your prepared dataset outputs.
+## SGD with momentum baseline.
 
 deterministic: False
 seed: 0
@@ -7,18 +7,11 @@ force_cpu: False
 matmul_precision: "highest"
 
 # Dataset (HuggingFace datasets saved via data/datasets/prepare.py)
-# Example output structure:
-# data/datasets/outputs/<dataset_name>/tokenized_<tokenizer_name>/ctx_<seq_len>/train
 trainset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/train"
 validset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/valid"
-#trainset_path: "data/datasets/outputs/wikitext2/tokenized_gpt2/ctx_128/train"
-#validset_path: "data/datasets/outputs/wikitext2/tokenized_gpt2/ctx_128/valid"
 seq_len: 2048
 vocab_size: 50257
 
-
-#vocab_size: 50257
-#seq_len: 2048
 intra_doc_masking: True
 sampler: "sequential"
 sampler_seed: 0
@@ -41,22 +34,18 @@ torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
 steps_budget: 12700
-
 micro_batch_size: 8
 grad_accumulation_steps: 8
 
 # choose between {float32, float16, bfloat16}
 dtype: "bfloat16"
 
-optim: adam
+optim: sgd
 fused_optim: False
-#lr: 0.00019457109803718195
-lr: 0.00034171387260699556
-weight_decay: 0.027816321283115952
-beta1: 0.8598532157519392
-beta2: 0.9131686189635
-
-
+lr: 0.0008506718275883902
+weight_decay: 0.0011141070380806769
+sgd_momentum: 0.8001155891332291
+sgd_nesterov: False
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
@@ -78,7 +67,7 @@ eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 effective_curvature_tracking_enabled: true
 
-scheduler: null
+scheduler: "warmup_cosine"
 warmup_steps: 0.05
 cooldown_steps: null
 lr_start: 0.0
@@ -91,8 +80,9 @@ print_progress: True
 use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
-wandb_run_name: "WASSERSTEIN_adam"
-exp_name: "WASSERSTEIN_adam"
+wandb_run_name: "WASSERSTEIN_sgd"
+wandb_unique_names: True
+exp_name: "WASSERSTEIN_sgd"
 out_dir: "./exp/llm"
 over_write: True
 

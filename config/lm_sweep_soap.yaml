@@ -16,7 +16,7 @@ parameters:
   # Use names that match keys in the base config YAML.
   lr:
     distribution: log_uniform_values
-    min: 1e-6
+    min: 1e-7
     max: 3e-2
   
   weight_decay:
@@ -26,12 +26,12 @@ parameters:
 
   beta1:
     distribution: uniform
-    min: 0.85
+    min: 0.75
     max: 0.95
 
   beta2:
     distribution: uniform
-    min: 0.90
+    min: 0.85
     max: 0.995
 
   eps:
@@ -44,7 +44,7 @@ parameters:
 
   shampoo_beta2:
     distribution: uniform
-    min: 0.90
+    min: 0.85
     max: 0.999
 
   soap_log_skipped:
@@ -52,4 +52,4 @@ parameters:
 
   
 
-run_cap: 16
+run_cap: 32

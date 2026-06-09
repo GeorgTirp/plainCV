@@ -1,24 +1,18 @@
-## Local LM config (JAX/Flax)
-## Update trainset_path/validset_path to match your prepared dataset outputs.
+## NI-SOAP LM config — same hyperparameters as SOAP with noise injection added.
+## NI-SOAP injects noise alpha * sqrt(lr / batch_size) * L^{1/2} Z R^{1/2}
+## after each SOAP step to restore SGD's noise energy (Zhu et al. trace constraint).
 
 deterministic: False
 seed: 0
 force_cpu: False
 matmul_precision: "highest"
 
-# Dataset (HuggingFace datasets saved via data/datasets/prepare.py)
-# Example output structure:
-# data/datasets/outputs/<dataset_name>/tokenized_<tokenizer_name>/ctx_<seq_len>/train
+# Dataset
 trainset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/train"
 validset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/valid"
-#trainset_path: "data/datasets/outputs/wikitext2/tokenized_gpt2/ctx_128/train"
-#validset_path: "data/datasets/outputs/wikitext2/tokenized_gpt2/ctx_128/valid"
 seq_len: 2048
 vocab_size: 50257
 
-
-#vocab_size: 50257
-#seq_len: 2048
 intra_doc_masking: True
 sampler: "sequential"
 sampler_seed: 0
@@ -41,28 +35,37 @@ torch_compile: False
 
 # Step budget = token_budget / (seq_len * micro_batch_size * grad_accumulation_steps * world_size)
 steps_budget: 12700
-
 micro_batch_size: 8
 grad_accumulation_steps: 8
 
 # choose between {float32, float16, bfloat16}
 dtype: "bfloat16"
 
-optim: adam
+optim: ni_soap
 fused_optim: False
-#lr: 0.00019457109803718195
-lr: 0.00034171387260699556
-weight_decay: 0.027816321283115952
-beta1: 0.8598532157519392
-beta2: 0.9131686189635
+# SOAP hyperparameters (same as tuned SOAP baseline)
+lr: 0.0014718687543895895
+weight_decay: 0.06892581601034377
+beta1: 0.8242820703877661
+beta2: 0.9626309521899796
+eps: 1.329620780745006e-9
+precondition_frequency: 32
+shampoo_beta2: 0.950822405302822
 
+# NI-SOAP specific
+# alpha=1.0: energy-matched SGD noise (Zhu et al.); sweep {0.1, 0.3, 1.0, 3.0}
+ni_soap_alpha: 1.0
+# batch_size = micro_batch_size * grad_accumulation_steps (per-GPU sequences per step)
+# Factory auto-derives this from micro_batch_size * grad_accumulation_steps if unset.
+ni_soap_batch_size: 64
+ni_soap_seed: 0
 
-
-# --- Generic eigen tracking (works with any optimizer) ---
-eigen_tracking_enabled: true
+# --- Generic eigen tracking ---
+eigen_tracking_enabled: false
 measurement_momentum: false
 eigen_tracking_every: 576
 eigen_tracking_measurement_mode: probe_update
+eigen_tracking_post_soap_refresh: true
 eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
@@ -78,7 +81,7 @@ eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 effective_curvature_tracking_enabled: true
 
-scheduler: null
+scheduler: "warmup_cosine"
 warmup_steps: 0.05
 cooldown_steps: null
 lr_start: 0.0
@@ -91,8 +94,9 @@ print_progress: True
 use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
-wandb_run_name: "WASSERSTEIN_adam"
-exp_name: "WASSERSTEIN_adam"
+wandb_run_name: "ni_soap"
+wandb_unique_names: True
+exp_name: "ni_soap"
 out_dir: "./exp/llm"
 over_write: True
 

@@ -50,16 +50,17 @@ shampoo_beta2: 0.9496977646795652
 # Track fresh/mid/stale SOAP basis phases:
 # first cycle is completed steps 34, 50, 65 for precondition_frequency=32.
 eigen_tracking_enabled: true
+measurement_momentum: false
 eigen_tracking_schedule: soap_phases
 eigen_tracking_every: 576
 eigen_tracking_cycle_stride: 576
 eigen_tracking_phase_offsets: [0, 16, 31]
 eigen_tracking_measurement_mode: probe_update
 eigen_tracking_post_soap_refresh: false
-eigen_tracking_topk: 6
-eigen_tracking_extra_modes: 6
+eigen_tracking_topk: 5
+eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
-eigen_tracking_lanczos_iters: 12
+eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: wasserstein
 eigen_tracking_sort_by_abs: false
 wasserstein_lm_top_k: 256

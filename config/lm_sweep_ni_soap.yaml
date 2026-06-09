@@ -1,0 +1,68 @@
+# Bayesian sweep for NI-SOAP.
+# Run:  wandb sweep config/lm_sweep_ni_soap.yaml   → get <sweep_id>
+#       Then fill <sweep_id> into nc_sweep_ni_soap.sub and condor_submit it.
+#
+# Strategy: joint sweep over all SOAP hyperparameters + ni_soap_alpha.
+# The SOAP base hyperparameters are re-swept from scratch (same ranges as
+# lm_sweep_soap.yaml) because noise injection changes the effective update
+# scale and the optimal lr / momentum may differ from tuned SOAP.
+# ni_soap_alpha controls the noise energy (alpha=1 = energy-matched SGD noise
+# per Zhu et al.; sweep covers sub-energy to supra-energy injection).
+# ni_soap_batch_size is kept fixed at 64 (= micro_batch * grad_accum) since
+# it is determined by the batch configuration, not a free algorithmic knob.
+program: train_lm.py
+method: bayes
+metric:
+  name: eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/lm_ni_soap.yaml
+
+parameters:
+  # --- Core SOAP hyperparameters (re-tuned jointly with alpha) ---
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-7
+    max: 3.0e-2
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.30
+
+  beta1:
+    distribution: uniform
+    min: 0.75
+    max: 0.95
+
+  beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.995
+
+  eps:
+    distribution: log_uniform_values
+    min: 1.0e-10
+    max: 1.0e-6
+
+  precondition_frequency:
+    values: [32]
+
+  shampoo_beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.999
+
+  # --- NI-SOAP specific ---
+  # Noise injection scale. alpha=1 matches SGD noise energy.
+  # Lower alpha = less noise (closer to vanilla SOAP).
+  # Higher alpha = more noise (stronger regularisation / avoidance effect).
+  ni_soap_alpha:
+    values: [0.1, 0.3, 1.0, 3.0]
+
+run_cap: 40

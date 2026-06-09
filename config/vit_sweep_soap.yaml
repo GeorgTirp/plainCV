@@ -1,0 +1,62 @@
+# W&B Bayesian sweep — SOAP on ViT-S/4 / CIFAR-10
+# Register with:  wandb sweep config/vit_sweep_soap.yaml
+# Then update nc_sweep_vit_soap.sub with the returned sweep ID.
+program: train.py
+method: bayes
+metric:
+  name: eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/vit_tinyimagenet_ggn_soap.yaml
+
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5.0e-5
+    max: 5.0e-3
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 0.1
+
+  beta1:
+    distribution: uniform
+    min: 0.75
+    max: 0.95
+
+  beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.999
+
+  shampoo_beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.999
+
+  precondition_frequency:
+    values: [25]
+
+  # Disable eigentracking during sweep — too expensive
+  eigen_tracking_enabled:
+    value: false
+
+  effective_curvature_tracking_enabled:
+    value: false
+
+  num_epochs:
+    value: 30
+
+  use_wandb:
+    value: true
+
+  wandb_project:
+    value: vit-tinyimagenet-tune
+
+run_cap: 30

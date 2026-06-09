@@ -5,8 +5,9 @@ import re
 import yaml
 import csv
 from datetime import datetime
-from typing import Sequence
+from typing import Optional, Sequence
 import jax
+import numpy as np
 try:
     import matplotlib.pyplot as plt
 except ImportError:
@@ -426,11 +427,65 @@ def _sanitize_name(name: str) -> str:
     )
 
 
+def _nu_regression(
+    log_alpha: np.ndarray,
+    log_lambda: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    spread_threshold: float = 0.1,
+) -> tuple[float, float]:
+    """OLS regression of log|alpha| on log|lambda|, returning (nu_hat, r2).
+
+    Fits the model  log|α_i| = c − ν log|λ_i|  and returns the slope
+    ν̂ = −Cov(log|λ|, log|α|) / Var(log|λ|)  plus R².
+
+    Returns (nan, nan) when fewer than 2 finite points are available or when
+    Var(log|λ|) < spread_threshold (eigenvalues too tightly clustered to
+    recover a reliable scaling exponent).  This avoids the per-direction
+    division-by-small-log instability of the ratio formula.
+    """
+    finite = np.isfinite(log_alpha) & np.isfinite(log_lambda)
+    if finite.sum() < 2:
+        return float("nan"), float("nan")
+    x = log_lambda[finite]
+    y = log_alpha[finite]
+    if weights is not None:
+        w = weights[finite]
+        s = float(w.sum())
+        if s < 1e-30:
+            return float("nan"), float("nan")
+        w = w / s
+        mx = float(np.dot(w, x))
+        my = float(np.dot(w, y))
+        dx = x - mx
+        var_x = float(np.dot(w, dx * dx))
+        cov_xy = float(np.dot(w, dx * (y - my)))
+        ss_tot = float(np.dot(w, (y - my) ** 2))
+    else:
+        mx = float(np.mean(x))
+        my = float(np.mean(y))
+        dx = x - mx
+        n = len(x)
+        var_x = float(np.dot(dx, dx)) / n
+        cov_xy = float(np.dot(dx, y - my)) / n
+        ss_tot = float(np.dot(y - my, y - my))
+    if var_x < spread_threshold:
+        return float("nan"), float("nan")
+    nu_hat = float(-cov_xy / var_x)
+    resid = y - (my - nu_hat * dx)
+    if weights is not None:
+        ss_res = float(np.dot(w, resid * resid))
+    else:
+        ss_res = float(np.dot(resid, resid))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-30 else float("nan")
+    return nu_hat, r2
+
+
 def init_eigen_tracking_csv(
     cfg,
     top_k: int,
     extra_modes: int = 0,
     filename: str = "eigen_tracking.csv",
+    measurement_momentum: bool = False,
 ) -> str:
     exp_dir = get_exp_dir_path(cfg)
     os.makedirs(exp_dir, exist_ok=True)
@@ -468,7 +523,35 @@ def init_eigen_tracking_csv(
             "neg_grad_energy_frac",
             "pos_update_grad_cosine",
             "neg_update_grad_cosine",
+            # Regression-based nu (OLS slope of log|alpha| on log|lambda|)
+            "nu_reg",
+            "nu_reg_r2",
+            "nu_reg_var_log_lambda",
+            "nu_reg_ew",
+            "nu_reg_ew_r2",
+            "nu_reg_dao",
+            "nu_reg_dao_r2",
+            "nu_reg_dao_ew",
+            "nu_reg_dao_ew_r2",
         ]
+        # Momentum-reference columns (only when measurement_momentum=True)
+        + (
+            [
+                # Scale-dependent nu (momentum reference, analogous to nu_reg)
+                "nu_reg_mom",
+                "nu_reg_mom_r2",
+                "nu_reg_mom_ew",
+                "nu_reg_mom_ew_r2",
+                # Direction-alignment-only nu (momentum reference, analogous to nu_reg_dao)
+                "nu_reg_dao_mom",
+                "nu_reg_dao_mom_r2",
+                "nu_reg_dao_mom_ew",
+                "nu_reg_dao_mom_ew_r2",
+                "m_norm",
+            ]
+            if measurement_momentum
+            else []
+        )
         + [f"eig_{i}" for i in range(top_k)]
         + [f"extra_eig_{i}" for i in range(extra_modes)]
         + [f"ritz_resid_{i}" for i in range(top_k)]
@@ -477,6 +560,8 @@ def init_eigen_tracking_csv(
         + [f"extra_g_proj_{i}" for i in range(extra_modes)]
         + [f"d_proj_{i}" for i in range(top_k)]
         + [f"extra_d_proj_{i}" for i in range(extra_modes)]
+        + ([f"m_proj_{i}" for i in range(top_k)] if measurement_momentum else [])
+        + ([f"extra_m_proj_{i}" for i in range(extra_modes)] if measurement_momentum else [])
         + [f"update_energy_frac_{i}" for i in range(top_k)]
         + [f"extra_update_energy_frac_{i}" for i in range(extra_modes)]
         + [f"alpha_valid_{i}" for i in range(top_k)]
@@ -502,7 +587,12 @@ def init_eigen_tracking_csv(
     return csv_path
 
 
-def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics=None) -> None:
+def append_eigen_tracking_row(
+    csv_path: str,
+    tracking_state,
+    measurement_metrics=None,
+    measurement_momentum: bool = False,
+) -> None:
     measurement_metrics = measurement_metrics or {}
 
     def _metric(name: str) -> float:
@@ -564,6 +654,9 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         extra_damped_effective_curvature_eigenvalues,
         preconditioned_dir_gain,
         extra_preconditioned_dir_gain,
+        m_proj,
+        extra_m_proj,
+        m_norm,
     ) = jax.device_get(
         (
             tracking_state.eigenvalues,
@@ -612,8 +705,95 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             getattr(tracking_state, "extra_damped_effective_curvature_eigenvalues", ()),
             getattr(tracking_state, "preconditioned_dir_gain", ()),
             getattr(tracking_state, "extra_preconditioned_dir_gain", ()),
+            getattr(tracking_state, "m_proj", ()),
+            getattr(tracking_state, "extra_m_proj", ()),
+            getattr(tracking_state, "m_norm", float("nan")),
         )
     )
+
+    # --- Regression-based nu (computed on CPU from already-fetched arrays) ---
+    _LOG_EPS = 1e-30
+    _all_lambda = np.concatenate([np.asarray(eigenvalues, dtype=float),
+                                   np.asarray(extra_eigenvalues, dtype=float)])
+    _all_alpha  = np.concatenate([np.asarray(alpha, dtype=float),
+                                   np.asarray(extra_alpha, dtype=float)])
+    _all_valid  = np.concatenate([np.asarray(alpha_valid, dtype=float),
+                                   np.asarray(extra_alpha_valid, dtype=float)]) > 0.5
+    _all_energy = np.concatenate([np.asarray(update_energy_frac, dtype=float),
+                                   np.asarray(extra_update_energy_frac, dtype=float)])
+    _all_g_proj = np.concatenate([np.asarray(g_proj, dtype=float),
+                                   np.asarray(extra_g_proj, dtype=float)])
+    _all_d_proj = np.concatenate([np.asarray(d_proj, dtype=float),
+                                   np.asarray(extra_d_proj, dtype=float)])
+
+    _vmask = _all_valid & np.isfinite(_all_lambda) & np.isfinite(_all_alpha) & (np.abs(_all_lambda) > _LOG_EPS)
+    _log_lam = np.where(_vmask, np.log(np.abs(_all_lambda) + _LOG_EPS), np.nan)
+    _log_alp = np.where(_vmask, np.log(np.abs(_all_alpha) + _LOG_EPS), np.nan)
+    _ew       = np.where(_vmask, np.abs(_all_energy), 0.0)
+
+    _log_lam_valid = _log_lam[_vmask & np.isfinite(_log_lam)]
+    _nu_reg_var_log_lambda = float(np.var(_log_lam_valid)) if len(_log_lam_valid) >= 2 else float("nan")
+
+    nu_reg,    nu_reg_r2    = _nu_regression(_log_alp, _log_lam)
+    nu_reg_ew, nu_reg_ew_r2 = _nu_regression(_log_alp, _log_lam, weights=_ew)
+
+    # DAO alpha regression (uses globally-normalised projections)
+    _grad_n = float(grad_norm)
+    _upd_n  = float(update_norm)
+    _dao_eps = 1e-10
+    if _grad_n > _dao_eps and _upd_n > _dao_eps:
+        _g_hat = _all_g_proj / _grad_n
+        _d_hat = _all_d_proj / _upd_n
+        _dao_vmask = (np.isfinite(_g_hat) & np.isfinite(_d_hat)
+                      & (np.abs(_g_hat) > _dao_eps)
+                      & np.isfinite(_all_lambda)
+                      & (np.abs(_all_lambda) > _LOG_EPS))
+        _dao_alpha   = np.where(_dao_vmask, -_d_hat / _g_hat, np.nan)
+        _log_lam_dao = np.where(_dao_vmask, np.log(np.abs(_all_lambda) + _LOG_EPS), np.nan)
+        _log_dao_alp = np.where(_dao_vmask, np.log(np.abs(_dao_alpha)  + _LOG_EPS), np.nan)
+        _ew_dao      = np.where(_dao_vmask, np.abs(_all_energy), 0.0)
+        nu_reg_dao,    nu_reg_dao_r2    = _nu_regression(_log_dao_alp, _log_lam_dao)
+        nu_reg_dao_ew, nu_reg_dao_ew_r2 = _nu_regression(_log_dao_alp, _log_lam_dao, weights=_ew_dao)
+    else:
+        nu_reg_dao = nu_reg_dao_r2 = nu_reg_dao_ew = nu_reg_dao_ew_r2 = float("nan")
+
+    # Momentum-reference nu (post-momentum / pre-preconditioning direction)
+    _m_n = float(m_norm) if measurement_momentum else float("nan")
+    if measurement_momentum and _m_n > _dao_eps and _upd_n > _dao_eps:
+        _all_m_proj = np.concatenate([np.asarray(m_proj, dtype=float),
+                                       np.asarray(extra_m_proj, dtype=float)])
+
+        # Scale-dependent version: alpha_mom = -d_proj / m_proj  (same formula as nu_reg
+        # but using the momentum buffer instead of the raw gradient as reference)
+        _mom_ref = np.abs(_all_m_proj)
+        _mom_ref_max = np.nanmax(_mom_ref) if np.any(np.isfinite(_mom_ref)) else 0.0
+        _mom_tol = max(1e-10, 1e-3 * float(_mom_ref_max))
+        _mom_valid = (np.isfinite(_all_m_proj) & (_mom_ref > _mom_tol)
+                      & np.isfinite(_all_lambda) & (np.abs(_all_lambda) > _LOG_EPS))
+        _safe_m_proj = np.where(_mom_valid, _all_m_proj, 1.0)
+        _alpha_mom   = np.where(_mom_valid, -_all_d_proj / _safe_m_proj, np.nan)
+        _log_lam_mom = np.where(_mom_valid, np.log(np.abs(_all_lambda) + _LOG_EPS), np.nan)
+        _log_alp_mom = np.where(_mom_valid, np.log(np.abs(_alpha_mom)  + _LOG_EPS), np.nan)
+        _ew_mom      = np.where(_mom_valid, np.abs(_all_energy), 0.0)
+        nu_reg_mom,    nu_reg_mom_r2    = _nu_regression(_log_alp_mom, _log_lam_mom)
+        nu_reg_mom_ew, nu_reg_mom_ew_r2 = _nu_regression(_log_alp_mom, _log_lam_mom, weights=_ew_mom)
+
+        # DAO version: normalise both update and momentum reference before computing alpha
+        _m_hat = _all_m_proj / _m_n
+        _d_hat_mom = _all_d_proj / _upd_n
+        _dao_mom_vmask = (np.isfinite(_m_hat) & np.isfinite(_d_hat_mom)
+                          & (np.abs(_m_hat) > _dao_eps)
+                          & np.isfinite(_all_lambda)
+                          & (np.abs(_all_lambda) > _LOG_EPS))
+        _dao_mom_alpha   = np.where(_dao_mom_vmask, -_d_hat_mom / _m_hat, np.nan)
+        _log_lam_dao_mom = np.where(_dao_mom_vmask, np.log(np.abs(_all_lambda) + _LOG_EPS), np.nan)
+        _log_dao_mom_alp = np.where(_dao_mom_vmask, np.log(np.abs(_dao_mom_alpha) + _LOG_EPS), np.nan)
+        _ew_dao_mom      = np.where(_dao_mom_vmask, np.abs(_all_energy), 0.0)
+        nu_reg_dao_mom,    nu_reg_dao_mom_r2    = _nu_regression(_log_dao_mom_alp, _log_lam_dao_mom)
+        nu_reg_dao_mom_ew, nu_reg_dao_mom_ew_r2 = _nu_regression(_log_dao_mom_alp, _log_lam_dao_mom, weights=_ew_dao_mom)
+    else:
+        nu_reg_mom = nu_reg_mom_r2 = nu_reg_mom_ew = nu_reg_mom_ew_r2 = float("nan")
+        nu_reg_dao_mom = nu_reg_dao_mom_r2 = nu_reg_dao_mom_ew = nu_reg_dao_mom_ew_r2 = float("nan")
 
     row = (
         [
@@ -647,7 +827,31 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
             float(neg_grad_energy_frac),
             float(pos_update_grad_cosine),
             float(neg_update_grad_cosine),
+            nu_reg,
+            nu_reg_r2,
+            _nu_reg_var_log_lambda,
+            nu_reg_ew,
+            nu_reg_ew_r2,
+            nu_reg_dao,
+            nu_reg_dao_r2,
+            nu_reg_dao_ew,
+            nu_reg_dao_ew_r2,
         ]
+        + (
+            [
+                nu_reg_mom,
+                nu_reg_mom_r2,
+                nu_reg_mom_ew,
+                nu_reg_mom_ew_r2,
+                nu_reg_dao_mom,
+                nu_reg_dao_mom_r2,
+                nu_reg_dao_mom_ew,
+                nu_reg_dao_mom_ew_r2,
+                float(m_norm),
+            ]
+            if measurement_momentum
+            else []
+        )
         + [float(x) for x in eigenvalues]
         + [float(x) for x in extra_eigenvalues]
         + [float(x) for x in ritz_residual]
@@ -656,6 +860,8 @@ def append_eigen_tracking_row(csv_path: str, tracking_state, measurement_metrics
         + [float(x) for x in extra_g_proj]
         + [float(x) for x in d_proj]
         + [float(x) for x in extra_d_proj]
+        + ([float(x) for x in m_proj] if measurement_momentum else [])
+        + ([float(x) for x in extra_m_proj] if measurement_momentum else [])
         + [float(x) for x in update_energy_frac]
         + [float(x) for x in extra_update_energy_frac]
         + [int(bool(x)) for x in alpha_valid]

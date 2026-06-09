@@ -62,7 +62,7 @@ gradient_eigenvectors: 6
 gradient_iters: 6
 pns_precond_damping: 1.0e-4
 pns_sqrt_scaling: false       
-pns_curvature_backend: fisher  # or "hessian", "ggn", "fisher", "wasserstein"
+pns_curvature_backend: wasserstein  # or "hessian", "ggn", "fisher", "wasserstein"
 pns_log_curvature: true
 pns_split_spaces: false
 pns_lr_top: 1e-3
@@ -74,6 +74,7 @@ pns_block_iters: 4
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
+measurement_momentum: false
 eigen_tracking_every: 20
 eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 0
