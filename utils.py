@@ -118,20 +118,29 @@ def load_config(path: str):
         model: "resnet_small"
 
       This defines 4 configs. job_idx=0..3 selects each one.
+
+    If the config contains ``sweep_keys`` (a list of key names), only those
+    keys are treated as sweep axes; every other list is kept as-is.
     """
     with open(path, "r") as f:
         config_dict = _coerce_yaml_values(yaml.safe_load(f))
 
+    sweep_keys = config_dict.pop("sweep_keys", None)
+
     if FLAGS.job_idx is None:
-        # No sweep: use YAML as-is
         cfg = config_dict
         sweep_size = 1
     else:
-        # Interpret YAML as sweep definition
-        values = [
-            v if isinstance(v, list) else [v]
-            for v in config_dict.values()
-        ]
+        if sweep_keys is not None:
+            sweep_keys = set(sweep_keys)
+        keys = list(config_dict.keys())
+        values = []
+        for k in keys:
+            v = config_dict[k]
+            if isinstance(v, list) and (sweep_keys is None or k in sweep_keys):
+                values.append(v)
+            else:
+                values.append([v])
         combinations = list(product(*values))
 
         sweep_size = len(combinations)
@@ -142,7 +151,6 @@ def load_config(path: str):
             )
 
         combo = combinations[FLAGS.job_idx]
-        keys = list(config_dict.keys())
         cfg = {keys[i]: combo[i] for i in range(len(keys))}
 
     return Config(cfg), sweep_size
@@ -486,6 +494,11 @@ def init_eigen_tracking_csv(
     extra_modes: int = 0,
     filename: str = "eigen_tracking.csv",
     measurement_momentum: bool = False,
+    precond_criterion: bool = False,
+    num_precond_dirs: int = 0,
+    soap_perlayer_sin2: bool = False,
+    muon_topk_energy: bool = False,
+    num_2d_layers: int = 0,
 ) -> str:
     exp_dir = get_exp_dir_path(cfg)
     os.makedirs(exp_dir, exist_ok=True)
@@ -497,6 +510,8 @@ def init_eigen_tracking_csv(
             "tracking_phase_offset",
             "tracking_phase_index",
             "tracking_phase_frac",
+            "refresh_T",
+            "refresh_offset",
             "rotation_diff",
             "eff_cond",
             "effective_curvature_cond",
@@ -506,12 +521,16 @@ def init_eigen_tracking_csv(
             "topk_eos_rho_update_weighted",
             "topk_eos_rho_over_2_max",
             "topk_eos_rho_over_2_update_weighted",
+            "rho_cutoff",
+            "participation_ratio",
             "probe_loss_before",
             "probe_loss_after",
             "probe_loss_reduction",
             "probe_acc_before",
             "probe_acc_after",
             "probe_acc_gain",
+            "eval_loss",
+            "eval_accuracy",
             "grad_norm",
             "update_norm",
             "tracked_update_energy_frac",
@@ -578,6 +597,34 @@ def init_eigen_tracking_csv(
         + [f"extra_damped_eff_curv_eig_{i}" for i in range(extra_modes)]
         + [f"precond_dir_gain_{i}" for i in range(top_k)]
         + [f"extra_precond_dir_gain_{i}" for i in range(extra_modes)]
+        # Experiment 1b columns (only when precond_criterion=True)
+        + (
+            [
+                "A_P_believed",
+                "A_Muon_block",
+                "crit_resid",
+                "precond_basis_sin2",
+            ]
+            + [f"a_per_dir_{i}" for i in range(num_precond_dirs)]
+            + [f"phat_per_dir_{i}" for i in range(num_precond_dirs)]
+            if precond_criterion
+            else []
+        )
+        # Per-layer SOAP sin² (bilinear-form based)
+        + (
+            ["soap_sin2_layermean"]
+            + [f"soap_sin2_layer_{i}" for i in range(num_2d_layers)]
+            if soap_perlayer_sin2
+            else []
+        )
+        # Muon top-k energy fraction
+        + (
+            ["muon_topk_energy_mean", "muon_topk_energy_baseline_mean"]
+            + [f"muon_topk_energy_layer_{i}" for i in range(num_2d_layers)]
+            + [f"muon_topk_energy_baseline_layer_{i}" for i in range(num_2d_layers)]
+            if muon_topk_energy
+            else []
+        )
     )
 
     with open(csv_path, "w", newline="") as f:
@@ -587,11 +634,47 @@ def init_eigen_tracking_csv(
     return csv_path
 
 
+def _append_precond_criterion_row(tracking_state) -> list:
+    """Return the Exp 1b scalar + per-dir values for one CSV row."""
+    import jax
+    nan_val = float("nan")
+
+    def _scalar(name: str) -> float:
+        v = getattr(tracking_state, name, nan_val)
+        try:
+            return float(jax.device_get(v))
+        except Exception:
+            return nan_val
+
+    def _array(name: str) -> list:
+        v = getattr(tracking_state, name, [])
+        try:
+            return [float(x) for x in jax.device_get(v)]
+        except Exception:
+            return []
+
+    return (
+        [
+            _scalar("A_P_believed"),
+            _scalar("A_Muon_block"),
+            _scalar("crit_resid"),
+            _scalar("precond_basis_sin2"),
+        ]
+        + _array("a_per_dir")
+        + _array("phat_per_dir")
+    )
+
+
 def append_eigen_tracking_row(
     csv_path: str,
     tracking_state,
     measurement_metrics=None,
     measurement_momentum: bool = False,
+    precond_criterion: bool = False,
+    num_precond_dirs: int = 0,
+    soap_perlayer_sin2: bool = False,
+    muon_topk_energy: bool = False,
+    num_2d_layers: int = 0,
 ) -> None:
     measurement_metrics = measurement_metrics or {}
 
@@ -711,6 +794,18 @@ def append_eigen_tracking_row(
         )
     )
 
+    # --- Cutoff diagnostic and participation ratio ---
+    _eigs = np.asarray(eigenvalues, dtype=float)
+    _extra_eigs = np.asarray(extra_eigenvalues, dtype=float)
+    _lambda_max = float(_eigs[0]) if len(_eigs) > 0 else float("nan")
+    _lambda_kp1 = float(_extra_eigs[0]) if len(_extra_eigs) > 0 else float("nan")
+    rho_cutoff = _lambda_kp1 / _lambda_max if abs(_lambda_max) > 1e-30 else float("nan")
+
+    _uef = np.asarray(update_energy_frac, dtype=float)
+    _uef_sum = float(np.sum(_uef))
+    _uef_sq_sum = float(np.sum(_uef ** 2))
+    participation_ratio = (_uef_sum ** 2 / _uef_sq_sum) if _uef_sq_sum > 1e-30 else float("nan")
+
     # --- Regression-based nu (computed on CPU from already-fetched arrays) ---
     _LOG_EPS = 1e-30
     _all_lambda = np.concatenate([np.asarray(eigenvalues, dtype=float),
@@ -801,6 +896,8 @@ def append_eigen_tracking_row(
             _metric("tracking_phase_offset"),
             _metric("tracking_phase_index"),
             _metric("tracking_phase_frac"),
+            _metric("refresh_T"),
+            _metric("refresh_offset"),
             float(scalar_rotation),
             float(scalar_eff_cond),
             float(effective_curvature_cond),
@@ -810,12 +907,16 @@ def append_eigen_tracking_row(
             float(topk_eos_rho_update_weighted),
             float(topk_eos_rho_over_2_max),
             float(topk_eos_rho_over_2_update_weighted),
+            rho_cutoff,
+            participation_ratio,
             _metric("probe_loss_before"),
             _metric("probe_loss_after"),
             _metric("probe_loss_reduction"),
             _metric("probe_acc_before"),
             _metric("probe_acc_after"),
             _metric("probe_acc_gain"),
+            _metric("eval_loss"),
+            _metric("eval_accuracy"),
             float(grad_norm),
             float(update_norm),
             float(tracked_update_energy_frac),
@@ -878,6 +979,202 @@ def append_eigen_tracking_row(
         + [float(x) for x in extra_damped_effective_curvature_eigenvalues]
         + [float(x) for x in preconditioned_dir_gain]
         + [float(x) for x in extra_preconditioned_dir_gain]
+        # Experiment 1b columns
+        + (
+            _append_precond_criterion_row(tracking_state)
+            if precond_criterion
+            else []
+        )
+        # Per-layer SOAP sin²
+        + (
+            [_metric("soap_sin2_layermean")]
+            + [_metric(f"soap_sin2_layer_{i}") for i in range(num_2d_layers)]
+            if soap_perlayer_sin2
+            else []
+        )
+        # Muon top-k energy
+        + (
+            [_metric("muon_topk_energy_mean"), _metric("muon_topk_energy_baseline_mean")]
+            + [_metric(f"muon_topk_energy_layer_{i}") for i in range(num_2d_layers)]
+            + [_metric(f"muon_topk_energy_baseline_layer_{i}") for i in range(num_2d_layers)]
+            if muon_topk_energy
+            else []
+        )
+    )
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
+
+
+def init_section1_csv(
+    cfg,
+    total_keep: int,
+    n_blocks: int,
+    n_types: int,
+    block_meta: dict,
+    filename: str = "section1_measures.csv",
+) -> str:
+    """Create the Section-1 measures CSV plus a static per-block tags file.
+
+    Columns cover participation ratio (1a), the Hutchinson trace / AM reference
+    (1b), per-block covariance (1c) and layer-type / governance attribution (1d).
+    """
+    from optim.eigentools import LAYER_TYPES
+
+    types = list(LAYER_TYPES)
+    exp_dir = get_exp_dir_path(cfg)
+    os.makedirs(exp_dir, exist_ok=True)
+    csv_path = os.path.join(exp_dir, filename)
+
+    header = (
+        [
+            "global_step",
+            # 1b — Hutchinson trace / arithmetic-mean reference
+            "hutch_m", "tr_C", "tr_C_se", "AM", "lambda_max", "AM_over_lammax",
+            # full exposure
+            "A_full", "A_over_lammax",
+            # 1d — restricted (namesake-governed) exposure + reference
+            "A_restricted", "AM_S", "A_restricted_over_lammax", "AM_S_over_lammax",
+            "r_S", "namesake_energy_frac",
+            # 1c — block-diagonal exposure aggregate and cross-block residual
+            "sum_wb_Ab", "sum_wb_AMb", "cross_block_resid",
+        ]
+        # 1a — participation ratio per tracked eigenvector
+        + [f"pr_{i}" for i in range(total_keep)]
+        + [f"pr_norm_{i}" for i in range(total_keep)]
+        # 1d — eigenvector mass by layer type
+        + [f"evec{i}_mass_{t}" for i in range(total_keep) for t in types]
+        # 1d — update-energy fraction by layer type
+        + [f"type_energy_{t}" for t in types]
+        # 1c — per-block energy share, block Rayleigh, block AM
+        + [f"block_w_{b}" for b in range(n_blocks)]
+        + [f"block_A_{b}" for b in range(n_blocks)]
+        + [f"block_AM_{b}" for b in range(n_blocks)]
+    )
+    with open(csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(header)
+
+    # Static companion file: one row per block with its tags (Section 1d point 1).
+    tags_path = os.path.join(exp_dir, "section1_block_tags.csv")
+    with open(tags_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            ["block_id", "name", "layer_type", "is_matrix", "namesake",
+             "rows", "cols", "size", "start"]
+        )
+        for b in range(n_blocks):
+            w.writerow([
+                b,
+                block_meta["names"][b],
+                block_meta["types"][b],
+                int(bool(block_meta["is_matrix"][b])),
+                int(bool(block_meta["namesake"][b])),
+                int(block_meta["rows"][b]),
+                int(block_meta["cols"][b]),
+                int(block_meta["sizes"][b]),
+                int(block_meta["starts"][b]),
+            ])
+    return csv_path
+
+
+def append_section1_row(
+    csv_path: str,
+    global_step: int,
+    out: dict,
+    total_keep: int,
+    n_blocks: int,
+    n_types: int,
+) -> None:
+    """Append one Section-1 measures row from the ``section1_measures`` output."""
+    g = {k: jax.device_get(v) for k, v in out.items()}
+
+    def s(name: str) -> float:
+        try:
+            return float(g[name])
+        except (TypeError, ValueError, KeyError):
+            return float("nan")
+
+    pr = np.asarray(g.get("pr", []), dtype=float).ravel()
+    pr_norm = np.asarray(g.get("pr_norm", []), dtype=float).ravel()
+    emt = np.asarray(g.get("evec_mass_type", []), dtype=float).reshape(total_keep, n_types)
+    tef = np.asarray(g.get("type_energy_frac", []), dtype=float).ravel()
+    bw = np.asarray(g.get("block_w", []), dtype=float).ravel()
+    bA = np.asarray(g.get("block_A", []), dtype=float).ravel()
+    bAM = np.asarray(g.get("block_AM", []), dtype=float).ravel()
+
+    def _pad(a, n):
+        a = list(a[:n])
+        return a + [float("nan")] * (n - len(a))
+
+    row = (
+        [
+            int(global_step),
+            int(s("hutch_m")), s("tr_C"), s("tr_C_se"), s("AM"), s("lambda_max"),
+            s("AM_over_lammax"),
+            s("A_full"), s("A_over_lammax"),
+            s("A_restricted"), s("AM_S"), s("A_restricted_over_lammax"),
+            s("AM_S_over_lammax"), s("r_S"), s("namesake_energy_frac"),
+            s("sum_wb_Ab"), s("sum_wb_AMb"), s("cross_block_resid"),
+        ]
+        + _pad(pr, total_keep)
+        + _pad(pr_norm, total_keep)
+        + [float(emt[i, t]) for i in range(total_keep) for t in range(n_types)]
+        + _pad(tef, n_types)
+        + _pad(bw, n_blocks)
+        + _pad(bA, n_blocks)
+        + _pad(bAM, n_blocks)
+    )
+    with open(csv_path, "a", newline="") as f:
+        csv.writer(f).writerow(row)
+
+
+def init_hessian_probe_csv(
+    cfg,
+    top_k: int,
+    extra_modes: int = 0,
+    filename: str = "hessian_probe.csv",
+) -> str:
+    exp_dir = get_exp_dir_path(cfg)
+    os.makedirs(exp_dir, exist_ok=True)
+    csv_path = os.path.join(exp_dir, filename)
+
+    header = (
+        ["global_step", "negative_curvature_mass", "lambda_max", "lambda_min"]
+        + [f"eig_{i}" for i in range(top_k)]
+        + [f"extra_eig_{i}" for i in range(extra_modes)]
+    )
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+    return csv_path
+
+
+def append_hessian_probe_row(
+    csv_path: str,
+    tracking_state,
+) -> None:
+    import jax
+
+    step = int(jax.device_get(tracking_state.step))
+    eigenvalues = np.asarray(jax.device_get(tracking_state.eigenvalues), dtype=float)
+    extra_eigenvalues = np.asarray(
+        jax.device_get(getattr(tracking_state, "extra_eigenvalues", ())), dtype=float
+    )
+
+    all_eigs = np.concatenate([eigenvalues, extra_eigenvalues])
+    abs_eigs = np.abs(all_eigs)
+    abs_sum = float(np.sum(abs_eigs))
+    neg_mass = float(np.sum(abs_eigs[all_eigs < 0])) / abs_sum if abs_sum > 1e-30 else float("nan")
+    lambda_max = float(np.max(all_eigs)) if len(all_eigs) > 0 else float("nan")
+    lambda_min = float(np.min(all_eigs)) if len(all_eigs) > 0 else float("nan")
+
+    row = (
+        [step, neg_mass, lambda_max, lambda_min]
+        + [float(x) for x in eigenvalues]
+        + [float(x) for x in extra_eigenvalues]
     )
 
     with open(csv_path, "a", newline="") as f:
