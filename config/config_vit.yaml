@@ -19,12 +19,12 @@ model: "resnet_small"  # or "mlp", "vit_small", "small_resnet", "resnet18"
 
 # Vision Transformer defaults (only used if model starts with "vit")
 vit_patch_size: 4
-vit_hidden_size: 128
-vit_mlp_dim: 256
-vit_layers: 4
-vit_heads: 4
-vit_dropout: 0.1
-vit_use_layernorm: true
+vit_hidden_size: 96
+vit_mlp_dim: 192
+vit_layers: 3
+vit_heads: 3
+vit_dropout: 0.0
+vit_use_layernorm: false
 vit_use_batchnorm: false
 
 # ResNet defaults

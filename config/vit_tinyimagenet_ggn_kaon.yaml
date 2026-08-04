@@ -1,3 +1,8 @@
+## ViT TinyImageNet — Kaon arm.
+## Copied verbatim from vit_tinyimagenet_ggn_muon.yaml (same hyperparameters);
+## only `optim`, `kaon_sv_dist` and the experiment name differ. Mirrors the LM
+## lm_kaon arm: Muon's singular basis with random positive singular values, so
+## Muon's LR transfers directly.
 seed: 0
 print_progress: true
 
@@ -19,32 +24,32 @@ vit_dropout: 0.2
 vit_use_layernorm: true
 vit_use_batchnorm: false
 
-optim: soap
-lr: 0.0003151516887393953
-weight_decay: 0.09006476081934933
-beta1: 0.7760361639771391
-beta2: 0.981660653958689
+optim: kaon
+lr: 0.0022989324808814432
+weight_decay: 0.08202160491660175
+beta1: 0.9
+beta2: 0.999
 
-muon_beta: 0.95
+muon_beta: 0.8897271787640741
 muon_ns_steps: 5
 muon_ns_coeffs: [3.4445, -4.7750, 2.0315]
-muon_nesterov: true
+muon_nesterov: false
 muon_adaptive: false
+# Kaon-specific: distribution for the random positive singular values.
+# {"halfnormal" -> |N(0,1)|, "exp" -> Exp(1)}; normalized to unit RMS.
+kaon_sv_dist: "halfnormal"
 
 signum_momentum: 0.9
 signum_nesterov: false
 
-precondition_frequency: 25
-shampoo_beta2: 0.851106956428801
+precondition_frequency: 32
+shampoo_beta2: 0.99
 
-# GGN eigentracking — harmonized with config/lm_soap.yaml logging protocol
-# (topk=5, extra_modes=5, lanczos_iters=10, probe_update; post-SOAP-refresh
-# measurement + per-layer sin^2). every=575 (=23*precondition_frequency 25) so
-# the post_soap_refresh alignment check in train.py (every % precond_freq == 0)
-# passes.
+# GGN eigentracking — harmonized with config/lm_*.yaml logging protocol
+# (topk=5, extra_modes=5, lanczos_iters=10, every=576, probe_update).
 eigen_tracking_enabled: true
 measurement_momentum: true
-eigen_tracking_every: 575
+eigen_tracking_every: 576
 eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 5
 eigen_tracking_lanczos_iters: 10
@@ -53,8 +58,6 @@ eigen_tracking_sort_by_abs: false
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_post_soap_refresh: true
-soap_perlayer_sin2_enabled: true
 precond_criterion_enabled: true
 
 # Effective curvature tracking
@@ -68,6 +71,6 @@ effective_curvature_gram_ridge: 1.0e-8
 hessian_probe_enabled: true
 hessian_probe_count: 5
 
-exp_name: "GGN_vit_tinyimagenet_soap"
+exp_name: "GGN_vit_tinyimagenet_kaon"
 out_dir: "./exp/vit_tinyimagenet"
 use_wandb: false

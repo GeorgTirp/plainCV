@@ -8,15 +8,15 @@ num_epochs: 50
 num_channels: 3
 num_classes: 10
 
-# ViT-S/4: ~21.4M params on 32x32x3
+# ViT-XS/4: smaller, no dropout, no layernorm (for isotropy)
 model: "vit"
 vit_patch_size: 4
-vit_hidden_size: 384
-vit_mlp_dim: 1536
-vit_layers: 12
-vit_heads: 6
-vit_dropout: 0.1
-vit_use_layernorm: true
+vit_hidden_size: 256
+vit_mlp_dim: 1024
+vit_layers: 8
+vit_heads: 4
+vit_dropout: 0.0
+vit_use_layernorm: false
 vit_use_batchnorm: false
 
 optim: adam

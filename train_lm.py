@@ -58,7 +58,14 @@ from flax.training import train_state
 from jax import tree_util as jtu
 
 from models.LM.constructor import construct_model
-from optim.eigentools import init_eigentracking, track_eigenstate
+from optim.eigentools import (
+    init_eigentracking,
+    track_eigenstate,
+    extract_momentum_pytree,
+    extract_precond_eigsystem,
+    compute_soap_perlayer_sin2,
+    compute_muon_topk_energy,
+)
 from optim.factory import get_optimizer, build_lm_dynamic_curvature_matvec_fn
 from utils import (
     load_config,
@@ -67,6 +74,8 @@ from utils import (
     log_scalar_dict,
     init_eigen_tracking_csv,
     append_eigen_tracking_row,
+    init_section1_csv,
+    append_section1_row,
 )
 
 FLAGS = flags.FLAGS
@@ -529,7 +538,7 @@ def _make_probe_measurement_fn(
                 "probe_loss_reduction": loss_before - loss_after,
                 "probe_acc_before": acc_before,
                 "probe_acc_after": acc_after,
-                "probe_acc_gain": acc_after - acc_before,
+                "probe_acc_gain": (acc_after - acc_before) / jnp.maximum(1.0 - acc_before, 1e-8),
             }
             return probe_grads, probe_updates, measurement_metrics
 
@@ -608,7 +617,7 @@ def _make_probe_measurement_fn(
             "probe_loss_reduction": loss_before - loss_after,
             "probe_acc_before": acc_before,
             "probe_acc_after": acc_after,
-            "probe_acc_gain": acc_after - acc_before,
+            "probe_acc_gain": (acc_after - acc_before) / jnp.maximum(1.0 - acc_before, 1e-8),
         }
         return probe_grads, probe_updates, measurement_metrics
 
@@ -798,9 +807,11 @@ def _eigen_tracking_phase_info(cfg, completed_step: int) -> tuple[bool, float, f
     if eigen_tracking_every <= 0:
         raise ValueError("eigen_tracking_every must be >= 1 when tracking is enabled.")
 
+    _SOAP_LIKE_OPTIMS = {"soap", "ni_soap", "ni-soap", "nisoap"}
+
     if schedule in {"soap_phases", "soap_phase", "soap_triplet", "soap_triplets"}:
-        if str(getattr(cfg, "optim", "")).lower() != "soap":
-            raise ValueError("eigen_tracking_schedule='soap_phases' requires optim='soap'.")
+        if str(getattr(cfg, "optim", "")).lower() not in _SOAP_LIKE_OPTIMS:
+            raise ValueError("eigen_tracking_schedule='soap_phases' requires optim='soap' or 'ni_soap'.")
 
         precondition_frequency = int(getattr(cfg, "precondition_frequency", 0))
         if precondition_frequency <= 0:
@@ -856,9 +867,9 @@ def _eigen_tracking_phase_info(cfg, completed_step: int) -> tuple[bool, float, f
         should_run = (completed_step % eigen_tracking_every) == 0
         return should_run, float("nan"), float("nan"), float("nan")
 
-    if str(getattr(cfg, "optim", "")).lower() != "soap":
+    if str(getattr(cfg, "optim", "")).lower() not in _SOAP_LIKE_OPTIMS:
         raise ValueError(
-            "eigen_tracking_post_soap_refresh=True is only supported with optim='soap'."
+            "eigen_tracking_post_soap_refresh=True is only supported with optim='soap' or 'ni_soap'."
         )
 
     precondition_frequency = int(getattr(cfg, "precondition_frequency", 0))
@@ -882,36 +893,81 @@ def _eigen_tracking_phase_info(cfg, completed_step: int) -> tuple[bool, float, f
     ), 0.0, 0.0, 0.0
 
 
-def _probe_pmap_collectives(n_devices: int) -> tuple[bool, Optional[str]]:
-    """Return whether pmap collectives are usable on this host.
+def _probe_pmap_collectives(n_devices: int, timeout_secs: float = 60.0) -> None:
+    """Verify that pmap collectives work on this host, or abort.
 
-    Some cluster setups expose multiple GPUs but lack a usable NCCL runtime.
-    In that case, pmap + psum/pmean fails at runtime. We probe once and
-    gracefully fall back to single-device execution if needed.
+    Some cluster nodes expose multiple GPUs but have a broken NCCL runtime.
+    A deadlock in the rendezvous doesn't raise — it just hangs forever.
+    We run the probe in a background thread so we can apply a hard timeout
+    and fail fast with a clear error instead of silently freezing.
     """
+    import threading
+
     if n_devices <= 1:
-        return False, None
+        return
 
-    try:
-        print(
-            "train_lm pmap collective probe | "
-            f"torch_imported={'torch' in sys.modules}"
+    print(
+        f"[init] pmap collective probe starting "
+        f"(n_devices={n_devices}, timeout={timeout_secs}s, "
+        f"torch_imported_before={'torch' in sys.modules})",
+        flush=True,
+    )
+
+    result: list = []
+
+    def _run():
+        try:
+            # Import torch before the pmap probe: on some nodes (e.g. g146)
+            # NCCL works before torch is loaded but deadlocks after. Importing
+            # here ensures the probe tests the same environment as training.
+            try:
+                import torch as _torch  # noqa: F401
+            except ImportError:
+                pass
+
+            test = jnp.arange(n_devices, dtype=jnp.float32)
+
+            @partial(jax.pmap, axis_name="data")
+            def _psum(x):
+                return jax.lax.psum(x, axis_name="data")
+
+            out = jax.device_get(_psum(test))
+            result.append((True, None, out))
+        except Exception as exc:
+            result.append((False, str(exc), None))
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_secs)
+
+    if t.is_alive():
+        msg = (
+            f"pmap collective probe timed out after {timeout_secs}s — "
+            "NCCL rendezvous deadlock on this node. Aborting."
         )
-        test = jnp.arange(n_devices, dtype=jnp.float32)
+        print(f"[init] FATAL: {msg}", flush=True)
+        sys.exit(1)
 
-        @partial(jax.pmap, axis_name="data")
-        def _psum(x):
-            return jax.lax.psum(x, axis_name="data")
+    ok, err, out = result[0]
+    if ok:
+        print(f"[init] pmap collective probe ok: {out}", flush=True)
+        return
+    else:
+        print(f"[init] FATAL: pmap collective probe failed: {err}", flush=True)
+        sys.exit(1)
 
-        _ = jax.device_get(_psum(test))
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
+
+def _ts() -> str:
+    """Compact timestamp for init-phase prints."""
+    return time.strftime("%H:%M:%S")
 
 
 def run(cfg):
     if cfg.model != "transformer" and not str(cfg.model).startswith("pythia"):
         raise ValueError(f"LM training expects model='transformer' or 'pythia*', got {cfg.model}.")
+
+    optim_name = getattr(cfg, "optim", "?")
+    print(f"[{_ts()}][init] run() started  optim={optim_name}", flush=True)
 
     wb_run = init_wandb(cfg)
     if wb_run is not None:
@@ -921,6 +977,7 @@ def run(cfg):
 
     use_doc_mask = bool(getattr(cfg, "intra_doc_masking", False))
     n_local_devices = jax.local_device_count()
+    print(f"[{_ts()}][init] JAX devices: {jax.devices()}", flush=True)
     requested_use_pmap = getattr(cfg, "use_pmap", None)
     force_single_device = bool(getattr(cfg, "force_single_device", False))
 
@@ -930,33 +987,30 @@ def run(cfg):
         use_pmap = bool(requested_use_pmap) and n_local_devices > 1 and not force_single_device
 
     if use_pmap:
-        pmap_ok, pmap_err = _probe_pmap_collectives(n_local_devices)
-        if not pmap_ok:
-            print(
-                "Disabling pmap and falling back to single-device training because "
-                f"multi-device collectives are unavailable (likely NCCL issue): {pmap_err}"
-            )
-            use_pmap = False
+        _probe_pmap_collectives(n_local_devices)
 
     n_devices = n_local_devices if use_pmap else 1
     grouped_batches = n_devices if use_pmap else 1
 
     if use_pmap:
-        print(f"Using pmap over {n_devices} local devices.")
+        print(f"[{_ts()}][init] Using pmap over {n_devices} local devices.", flush=True)
     else:
         if n_local_devices > 1:
             print(
-                f"Using single-device mode on 1/{n_local_devices} visible devices "
-                "(pmap disabled)."
+                f"[{_ts()}][init] Using single-device mode on 1/{n_local_devices} visible devices "
+                "(pmap disabled).",
+                flush=True,
             )
         else:
-            print("Using single-device mode.")
+            print(f"[{_ts()}][init] Using single-device mode.", flush=True)
 
     maybe_make_dir(cfg)
 
     from data.lm_loader import get_dataloaders
 
+    print(f"[{_ts()}][init] loading dataloaders...", flush=True)
     trainloader, validloader = get_dataloaders(cfg)
+    print(f"[{_ts()}][init] dataloaders ready", flush=True)
 
     # Build a deterministic fixed curvature probe for curvature-based optimizers.
     # Multiple microbatches are averaged inside the LM GGN matvec to reduce
@@ -972,16 +1026,25 @@ def run(cfg):
         )
     except Exception as exc:
         # If an optimizer needs curvature, it'll raise later with a clearer message.
-        print(f"Warning: could not build curvature_batch: {exc}")
+        print(f"Warning: could not build curvature_batch: {exc}", flush=True)
 
     rng = jax.random.PRNGKey(getattr(cfg, "seed", 0))
+    print(f"[{_ts()}][init] constructing model...", flush=True)
     model, model_cfg, variables = construct_model(cfg, rng=rng, init_batch_size=cfg.micro_batch_size)
     params = variables["params"]
+    print(f"[{_ts()}][init] model ready", flush=True)
 
+    print(f"[{_ts()}][init] building optimizer (optim={optim_name})...", flush=True)
     tx = get_optimizer(cfg, model_def=model, curvature_batch=curvature_batch, batch_stats=None)
+    print(f"[{_ts()}][init] optimizer built", flush=True)
+
+    print(f"[{_ts()}][init] creating train state...", flush=True)
     state = LMTrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    print(f"[{_ts()}][init] train state created", flush=True)
     if use_pmap:
+        print(f"[{_ts()}][init] replicating state across {n_devices} devices...", flush=True)
         state = flax_jax_utils.replicate(state)
+        print(f"[{_ts()}][init] state replicated", flush=True)
 
     grad_clip = getattr(cfg, "grad_clip", None)
     eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
@@ -1017,6 +1080,18 @@ def run(cfg):
             "effective_curvature_tracking_enabled=True requires "
             "eigen_tracking_enabled=True."
         )
+    measurement_momentum = bool(getattr(cfg, "measurement_momentum", False))
+    precond_criterion_enabled = bool(getattr(cfg, "precond_criterion_enabled", False))
+    precond_criterion_max_dirs = int(getattr(cfg, "precond_criterion_max_dirs", 40))
+    precond_criterion_damping = float(getattr(cfg, "precond_criterion_damping", 1e-6))
+    _soap_perlayer_sin2_lm = (
+        eigen_tracking_enabled
+        and str(getattr(cfg, "optim", "")).lower() in {"soap", "ni_soap", "ni-soap", "nisoap"}
+        and bool(getattr(cfg, "soap_perlayer_sin2_enabled", True))
+    )
+    _muon_topk_energy_lm = (
+        eigen_tracking_enabled and str(getattr(cfg, "optim", "")).lower() == "muon"
+    )
     eigen_tracking_state = None
     eigen_tracking_csv_path = None
     eigen_tracking_measurement_mode = str(
@@ -1084,10 +1159,17 @@ def run(cfg):
             backend=eigen_tracking_backend,
         )
         eigen_params = _unwrap_replicated(state.params, use_pmap)
+        _num_precond_dirs_lm = (
+            precond_criterion_max_dirs if (precond_criterion_enabled and not use_pmap) else 0
+        )
+        _num_2d_layers_lm = sum(
+            1 for l in jax.tree_util.tree_leaves(eigen_params) if l.ndim == 2
+        )
         eigen_tracking_state = init_eigentracking(
             eigen_params,
             k=eigen_tracking_topk,
             extra_modes=eigen_tracking_extra_modes,
+            num_precond_dirs=_num_precond_dirs_lm,
             seed=int(getattr(cfg, "seed", 0)),
         )
         if use_pmap:
@@ -1096,7 +1178,44 @@ def run(cfg):
             cfg,
             eigen_tracking_topk,
             extra_modes=eigen_tracking_extra_modes,
+            measurement_momentum=measurement_momentum,
+            precond_criterion=precond_criterion_enabled and not use_pmap,
+            num_precond_dirs=_num_precond_dirs_lm,
+            soap_perlayer_sin2=_soap_perlayer_sin2_lm,
+            muon_topk_energy=_muon_topk_energy_lm and not use_pmap,
+            num_2d_layers=_num_2d_layers_lm,
         )
+
+        # --- Revision Section 1 probe measures (participation ratio, AM trace,
+        #     per-block covariance, layer-type / governance attribution) ---
+        _section1_enabled = bool(
+            getattr(cfg, "eigen_tracking_block_measures", True)
+        )
+        section1_csv_path = None
+        _s1_meta = None
+        if _section1_enabled:
+            from optim.eigentools import (
+                build_block_metadata as _build_block_metadata,
+                section1_measures as _section1_measures,
+            )
+            _s1_meta = _build_block_metadata(eigen_params)
+            _s1_seg = jnp.asarray(_s1_meta["seg"], dtype=jnp.int32)
+            _s1_namesake = jnp.asarray(
+                np.array(_s1_meta["namesake"], dtype=bool)
+            )
+            _s1_type_ids = jnp.asarray(_s1_meta["type_ids"], dtype=jnp.int32)
+            _s1_sizes = jnp.asarray(_s1_meta["sizes"], dtype=jnp.int32)
+            _s1_n_blocks = int(_s1_meta["n_blocks"])
+            _s1_n_types = int(_s1_meta["n_types"])
+            _s1_m_hutch = int(getattr(cfg, "eigen_tracking_hutchinson_probes", 32))
+            _s1_block_A = bool(getattr(cfg, "eigen_tracking_block_A", True))
+            section1_csv_path = init_section1_csv(
+                cfg,
+                total_keep=eigen_tracking_topk + eigen_tracking_extra_modes,
+                n_blocks=_s1_n_blocks,
+                n_types=_s1_n_types,
+                block_meta=_s1_meta,
+            )
 
         if use_pmap:
 
@@ -1132,6 +1251,14 @@ def run(cfg):
                         learning_rate=float(cfg.lr),
                     )
 
+                momentum_flat = None
+                if measurement_momentum:
+                    _mom_pytree = extract_momentum_pytree(opt_state, optim_name)
+                    if _mom_pytree is not None:
+                        from jax.flatten_util import ravel_pytree as _rp
+                        momentum_flat, _ = _rp(_mom_pytree)
+                        momentum_flat = momentum_flat.astype(jnp.float32)
+
                 return track_eigenstate(
                     params=params,
                     grads=grads,
@@ -1147,9 +1274,13 @@ def run(cfg):
                     signed_split_enabled=eigen_tracking_signed_split_enabled,
                     effective_transform_fn=effective_transform_fn,
                     effective_curvature_gram_ridge=effective_curvature_gram_ridge,
+                    momentum_flat=momentum_flat,
+                    precond_eigsys=None,  # not supported for pmap (memory cost)
                 )
 
         else:
+
+            _precond_criterion_damping_lm = precond_criterion_damping
 
             @jax.jit
             def run_eigen_tracking(
@@ -1160,6 +1291,7 @@ def run(cfg):
                 step,
                 tracking_state,
                 tracking_curvature_batch,
+                precond_eigsys=None,
             ):
                 def matvec_fn(matvec_params, vec_pytree, rng_key):
                     return eigen_tracking_matvec_fn(
@@ -1182,6 +1314,14 @@ def run(cfg):
                         learning_rate=float(cfg.lr),
                     )
 
+                momentum_flat = None
+                if measurement_momentum:
+                    _mom_pytree = extract_momentum_pytree(opt_state, optim_name)
+                    if _mom_pytree is not None:
+                        from jax.flatten_util import ravel_pytree as _rp
+                        momentum_flat, _ = _rp(_mom_pytree)
+                        momentum_flat = momentum_flat.astype(jnp.float32)
+
                 return track_eigenstate(
                     params=params,
                     grads=grads,
@@ -1197,12 +1337,74 @@ def run(cfg):
                     signed_split_enabled=eigen_tracking_signed_split_enabled,
                     effective_transform_fn=effective_transform_fn,
                     effective_curvature_gram_ridge=effective_curvature_gram_ridge,
+                    momentum_flat=momentum_flat,
+                    precond_eigsys=precond_eigsys,
+                    precond_criterion_damping=_precond_criterion_damping_lm,
+                )
+
+        run_section1 = None
+        if _section1_enabled:
+            from jax.flatten_util import ravel_pytree as _ravel_pytree
+
+            def _section1_impl(
+                params, updates, tracking_curvature_batch,
+                evecs, extra_evecs, evals, rng_key,
+                seg, namesake, type_ids, sizes, _use_pmap,
+            ):
+                _, unravel = _ravel_pytree(params)
+                mk, hk = jax.random.split(rng_key)
+
+                def matvec_flat(v_flat):
+                    v_pytree = unravel(v_flat.astype(jnp.float32))
+                    hv = eigen_tracking_matvec_fn(
+                        params, v_pytree, mk, tracking_curvature_batch
+                    )
+                    if _use_pmap:
+                        hv = jax.lax.pmean(hv, axis_name="data")
+                    hv_flat, _ = _ravel_pytree(hv)
+                    return hv_flat
+
+                return _section1_measures(
+                    updates,
+                    evecs,
+                    extra_evecs,
+                    evals,
+                    matvec_flat,
+                    seg=seg,
+                    block_namesake=namesake,
+                    type_ids=type_ids,
+                    sizes=sizes,
+                    n_blocks=_s1_n_blocks,
+                    n_types=_s1_n_types,
+                    m_hutchinson=_s1_m_hutch,
+                    rng_key=hk,
+                    compute_block_A=_s1_block_A,
+                )
+
+            if use_pmap:
+                run_section1 = jax.pmap(
+                    partial(_section1_impl, _use_pmap=True),
+                    axis_name="data",
+                    in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None),
+                )
+            else:
+                run_section1 = jax.jit(
+                    partial(_section1_impl, _use_pmap=False)
                 )
 
         if eigen_tracking_measurement_mode == "probe_update":
+            # Weight-decay-free tx for measurements; only the update function
+            # is used (with the training opt_state), no extra state allocated.
+            tx_no_wd = get_optimizer(
+                cfg,
+                model_def=model,
+                curvature_batch=curvature_batch,
+                batch_stats=None,
+                override_weight_decay=0.0,
+            )
             compute_probe_measurement = _make_probe_measurement_fn(
                 model,
-                tx,
+                tx_no_wd,
                 curvature_batch,
                 grad_clip=grad_clip,
                 use_doc_mask=use_doc_mask,
@@ -1231,6 +1433,7 @@ def run(cfg):
     )
     apply_grads = _make_apply_grads_fn(grad_clip, use_pmap=use_pmap)
 
+    print(f"[{_ts()}][init] entering training loop (steps_budget={steps_budget})", flush=True)
     train_iter = iter(trainloader)
     global_step = 0
     start_time = time.time()
@@ -1271,10 +1474,14 @@ def run(cfg):
                 n_devices,
             )
 
+            if global_step == 0:
+                print(f"[{_ts()}][init] first compute_grads call (JIT compile + first pmap)...", flush=True)
             if use_doc_mask:
                 grads, loss, acc = compute_grads(state.params, inputs, labels, attn_mask)
             else:
                 grads, loss, acc = compute_grads(state.params, inputs, labels)
+            if global_step == 0:
+                print(f"[{_ts()}][init] first compute_grads done", flush=True)
 
             grads_accum = grads if grads_accum is None else jtu.tree_map(
                 lambda a, b: a + b, grads_accum, grads
@@ -1324,6 +1531,14 @@ def run(cfg):
                         n_devices,
                     )
 
+            _lm_precond_eigsys = None
+            if not use_pmap and precond_criterion_enabled:
+                _lm_precond_eigsys = extract_precond_eigsystem(
+                    opt_state_before,
+                    optim_name,
+                    params_before,
+                    precond_criterion_max_dirs,
+                )
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
                 opt_state_before,
@@ -1332,6 +1547,7 @@ def run(cfg):
                 state.step,
                 eigen_tracking_state,
                 tracking_curvature_batch,
+                **({"precond_eigsys": _lm_precond_eigsys} if not use_pmap else {}),
             )
             should_track_now, phase_offset, phase_index, phase_frac = (
                 _eigen_tracking_phase_info(cfg, global_step)
@@ -1347,11 +1563,81 @@ def run(cfg):
                     "tracking_phase_frac": phase_frac,
                 }
             )
+
+            _unwrapped_tracking_state = _unwrap_replicated(
+                eigen_tracking_state, use_pmap
+            )
+
+            if _soap_perlayer_sin2_lm:
+                # Section 4 (SOAP believed-basis vs GGN eigenvectors). Host-side
+                # numpy after device_get, so it works under pmap once the SOAP
+                # state and params are unreplicated. Memory-light; the previous
+                # LM block was only the unoptimized einsum, now fixed.
+                _is_ni = str(getattr(cfg, "optim", "")).lower() in {
+                    "ni_soap", "ni-soap", "nisoap"
+                }
+                _sin2_mean, _sin2_layers = compute_soap_perlayer_sin2(
+                    _unwrap_replicated(opt_state_before, use_pmap),
+                    _is_ni,
+                    _unwrap_replicated(params_before, use_pmap),
+                    _unwrapped_tracking_state.eigenvectors,
+                )
+                measurement_metrics["soap_sin2_layermean"] = _sin2_mean
+                for _i, _s in enumerate(_sin2_layers):
+                    measurement_metrics[f"soap_sin2_layer_{_i}"] = _s
+            elif not use_pmap and _muon_topk_energy_lm:
+                _e_mean, _e_base, _e_layers, _b_layers = compute_muon_topk_energy(
+                    tracking_updates, params_before,
+                    _unwrapped_tracking_state.eigenvectors,
+                )
+                measurement_metrics["muon_topk_energy_mean"] = _e_mean
+                measurement_metrics["muon_topk_energy_baseline_mean"] = _e_base
+                for _i, (_e, _b) in enumerate(
+                    zip(_e_layers, _b_layers)
+                ):
+                    measurement_metrics[f"muon_topk_energy_layer_{_i}"] = _e
+                    measurement_metrics[f"muon_topk_energy_baseline_layer_{_i}"] = _b
+
             append_eigen_tracking_row(
                 eigen_tracking_csv_path,
-                _unwrap_replicated(eigen_tracking_state, use_pmap),
+                _unwrapped_tracking_state,
                 measurement_metrics=measurement_metrics,
+                measurement_momentum=measurement_momentum,
+                precond_criterion=precond_criterion_enabled and not use_pmap,
+                num_precond_dirs=_num_precond_dirs_lm,
+                soap_perlayer_sin2=_soap_perlayer_sin2_lm,
+                muon_topk_energy=_muon_topk_energy_lm and not use_pmap,
+                num_2d_layers=_num_2d_layers_lm,
             )
+
+            if run_section1 is not None:
+                _s1_key = jax.random.PRNGKey(
+                    (int(getattr(cfg, "seed", 0)) * 1000003 + global_step) & 0x7FFFFFFF
+                )
+                if use_pmap:
+                    _s1_key = flax_jax_utils.replicate(_s1_key)
+                _section1_out = run_section1(
+                    params_before,
+                    tracking_updates,
+                    tracking_curvature_batch,
+                    eigen_tracking_state.eigenvectors,
+                    eigen_tracking_state.extra_eigenvectors,
+                    eigen_tracking_state.eigenvalues,
+                    _s1_key,
+                    _s1_seg,
+                    _s1_namesake,
+                    _s1_type_ids,
+                    _s1_sizes,
+                )
+                _section1_out = _unwrap_replicated(_section1_out, use_pmap)
+                append_section1_row(
+                    section1_csv_path,
+                    global_step,
+                    _section1_out,
+                    total_keep=eigen_tracking_topk + eigen_tracking_extra_modes,
+                    n_blocks=_s1_n_blocks,
+                    n_types=_s1_n_types,
+                )
 
         if global_step % log_every == 0:
             loss_val = float(

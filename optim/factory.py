@@ -31,6 +31,8 @@ from .muon import build_muon_dim_numbers
 from .hessian_free import hessian_free as hf_opt
 from .shampoo import shampoo as shampoo_opt
 from .signum import signum as signum_opt
+from .hadamard import hadamard_signum as hadamard_signum_opt
+from .kaon import kaon as kaon_opt
 from .sophia import sophia as sophia_opt
 from .sophia import sophia_shampoo as sophia_shampoo_opt
 from .lanzos_hybrid import pns_eigen_hybrid
@@ -277,10 +279,17 @@ def get_optimizer(
     model_def: Optional[Any] = None,
     curvature_batch: Optional[Any] = None,
     batch_stats: Optional[Any] = None,
+    override_weight_decay: Optional[float] = None,
 ) -> optax.GradientTransformation:
     # You can leave default "adamw" if you like; config will override anyway.
     name = getattr(cfg, "optim", "adamw").lower()
     lr = float(cfg.lr)
+
+    _orig_wd = getattr(cfg, "weight_decay", 0.0)
+    if override_weight_decay is not None:
+        from utils import Config
+        cfg = Config(cfg)
+        cfg.weight_decay = override_weight_decay
 
     # ------------------------
     # Adam / AdamW
@@ -312,7 +321,7 @@ def get_optimizer(
             momentum=momentum,
             nesterov=nesterov,
         )
-        if weight_decay > 0.0:
+        if _orig_wd > 0.0:
             tx = optax.chain(optax.add_decayed_weights(weight_decay), sgd_tx)
         else:
             tx = sgd_tx
@@ -329,6 +338,21 @@ def get_optimizer(
             momentum=momentum,
             nesterov=nesterov,
             weight_decay=weight_decay,
+        )
+
+    # ------------------------
+    # Hadamard-Signum (Signum in a fixed random Walsh-Hadamard frame)
+    # ------------------------
+    elif name in {"hadamard_signum", "hadamard-signum", "hadamardsignum"}:
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        momentum = getattr(cfg, "signum_momentum", getattr(cfg, "beta1", 0.9))
+        nesterov = getattr(cfg, "signum_nesterov", False)
+        tx = hadamard_signum_opt(
+            learning_rate=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            seed=int(getattr(cfg, "seed", 0)),
         )
 
     # ------------------------
@@ -594,6 +618,33 @@ def get_optimizer(
             # Routing is handled by build_muon_dim_numbers (shared with SOAP).
             muon_weight_dimension_numbers=dim_fn,
             # consistent_rms=consistent_rms,
+        )
+
+    # ------------------------
+    # Kaon (Muon's singular basis, random singular values)
+    # ------------------------
+    elif name == "kaon":
+        weight_decay = getattr(cfg, "weight_decay", 0.0)
+        beta1 = getattr(cfg, "beta1", 0.9)   # Adam part (non-routed params)
+        beta2 = getattr(cfg, "beta2", 0.999)
+        eps = getattr(cfg, "eps", 1e-8)
+        # Reuse Muon's momentum knobs so the copied Muon config transfers directly.
+        muon_beta = getattr(cfg, "muon_beta", 0.95)
+        nesterov = getattr(cfg, "muon_nesterov", True)
+        sv_dist = getattr(cfg, "kaon_sv_dist", "halfnormal")
+
+        tx = kaon_opt(
+            learning_rate=lr,
+            weight_decay=weight_decay,
+            beta=muon_beta,
+            eps=eps,
+            nesterov=nesterov,
+            seed=int(getattr(cfg, "seed", 0)),
+            sv_dist=sv_dist,
+            adam_b1=beta1,
+            adam_b2=beta2,
+            adam_eps=eps,
+            adam_weight_decay=weight_decay,
         )
 
         # ------------------------

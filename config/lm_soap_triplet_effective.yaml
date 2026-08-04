@@ -61,7 +61,7 @@ eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
 eigen_tracking_lanczos_iters: 10
-eigen_tracking_backend: wasserstein
+eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false
 wasserstein_lm_top_k: 256
 wasserstein_lm_max_positions: 512
@@ -70,6 +70,12 @@ wasserstein_graph_eps: 1.e-6
 wasserstein_laplacian_ridge: 1.e-4
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
+# Disabled at LM scale: compute_soap_perlayer_sin2's np.einsum("ia,kij,jb->kab", ...)
+# is unoptimized (no optimize=True), costing O(k*m^2*n^2) per 2D weight matrix
+# instead of O(k*m*n*(m+n)). For LM-sized layers (e.g. 768x2048) this hangs the
+# training loop for hours per layer with the GPU idle. Fine at ViT scale. See
+# optim/eigentools.py:880.
+soap_perlayer_sin2_enabled: false
 
 # Empirical effective curvature in the optimizer-induced update geometry.
 effective_curvature_tracking_enabled: true
@@ -91,9 +97,9 @@ print_progress: True
 use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
-wandb_run_name: "LAPLACIAN_soap_triplet_effective"
+wandb_run_name: "GGN_soap_triplet_effective"
 wandb_unique_names: True
-exp_name: "LAPLACIAN_soap_triplet_effective"
+exp_name: "GGN_soap_triplet_effective"
 out_dir: "./exp/llm"
 over_write: True
 

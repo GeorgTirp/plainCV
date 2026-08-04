@@ -1,13 +1,15 @@
-## NI-SOAP LM config — same hyperparameters as SOAP with noise injection added.
-## NI-SOAP injects noise alpha * sqrt(lr / batch_size) * L^{1/2} Z R^{1/2}
-## after each SOAP step to restore SGD's noise energy (Zhu et al. trace constraint).
+## Local LM config (JAX/Flax) — Kaon arm (Sec. 2c of the revision plan)
+## Copied verbatim from lm_muon.yaml (same hyperparameters). Only `optim` and the
+## experiment names differ. Kaon keeps Muon's momentum and shape scaling but
+## replaces the orthogonalized singular values with random positive noise, so
+## Muon's LR transfers directly (exposure A/lambda_max is scale-invariant).
 
 deterministic: False
 seed: 0
 force_cpu: False
 matmul_precision: "highest"
 
-# Dataset
+# Dataset (HuggingFace datasets saved via data/datasets/prepare.py)
 trainset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/train"
 validset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/valid"
 seq_len: 2048
@@ -41,31 +43,28 @@ grad_accumulation_steps: 8
 # choose between {float32, float16, bfloat16}
 dtype: "bfloat16"
 
-optim: ni_soap
+optim: kaon
 fused_optim: False
-# SOAP hyperparameters (same as tuned SOAP baseline)
-lr: 0.0014718687543895895
-weight_decay: 0.06892581601034377
-beta1: 0.8242820703877661
-beta2: 0.9626309521899796
-eps: 1.329620780745006e-9
-precondition_frequency: 32
-shampoo_beta2: 0.950822405302822
+# Inherited verbatim from Muon (see lm_muon.yaml); not retuned.
+lr: 0.008721198402419975
+weight_decay: 0.016510933735912593
+beta1: 0.8732925489555765
+beta2: 0.9453534792484316
 
-# NI-SOAP specific
-# alpha=1.0: energy-matched SGD noise (Zhu et al.); sweep {0.1, 0.3, 1.0, 3.0}
-ni_soap_alpha: 1.0
-# batch_size = micro_batch_size * grad_accumulation_steps (per-GPU sequences per step)
-# Factory auto-derives this from micro_batch_size * grad_accumulation_steps if unset.
-ni_soap_batch_size: 64
-ni_soap_seed: 0
+muon_beta: 0.92102295653509
+muon_ns_steps: 5
+muon_ns_coeffs: [3.4445, -4.7750, 2.0315]
+muon_nesterov: true
+muon_adaptive: false
+# Kaon-specific: distribution for the random positive singular values.
+# {"halfnormal" -> |N(0,1)|, "exp" -> Exp(1)}; normalized to unit RMS.
+kaon_sv_dist: "halfnormal"
 
-# --- Generic eigen tracking ---
+# --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
 measurement_momentum: true
 eigen_tracking_every: 576
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_post_soap_refresh: true
 eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
@@ -83,11 +82,8 @@ effective_curvature_tracking_enabled: true
 # --- Revision Section 1 probe measures (participation ratio, AM trace, per-block) ---
 eigen_tracking_hutchinson_probes: 32
 eigen_tracking_block_measures: true
-# Section 4 (SOAP believed-basis vs GGN eigenvectors): the O(k*m^2*n^2) einsum
-# hang was fixed (batched matmul, O(k*m*n*(m+n))). Memory-light, runs under pmap.
-soap_perlayer_sin2_enabled: true
 
-scheduler: "warmup_cosine"
+scheduler: null
 warmup_steps: 0.05
 cooldown_steps: null
 lr_start: 0.0
@@ -100,9 +96,9 @@ print_progress: True
 use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
-wandb_run_name: "ni_soap"
+wandb_run_name: "GGN_kaon"
 wandb_unique_names: True
-exp_name: "ni_soap"
+exp_name: "GGN_kaon"
 out_dir: "./exp/llm"
 over_write: True
 

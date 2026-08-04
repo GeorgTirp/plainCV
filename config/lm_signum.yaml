@@ -56,14 +56,14 @@ signum_nesterov: False
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
-measurement_momentum: false
+measurement_momentum: true
 eigen_tracking_every: 576
 eigen_tracking_measurement_mode: probe_update
 eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
 eigen_tracking_lanczos_iters: 10
-eigen_tracking_backend: wasserstein
+eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false
 wasserstein_lm_top_k: 256
 wasserstein_lm_max_positions: 512
@@ -73,6 +73,9 @@ wasserstein_laplacian_ridge: 1.e-4
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 effective_curvature_tracking_enabled: true
+# --- Revision Section 1 probe measures (participation ratio, AM trace, per-block) ---
+eigen_tracking_hutchinson_probes: 32
+eigen_tracking_block_measures: true
 
 scheduler: "warmup_cosine"
 warmup_steps: 0.05

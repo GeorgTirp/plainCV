@@ -27,10 +27,19 @@ from absl import app, flags
 
 from flax.metrics.tensorboard import SummaryWriter
 
+import optax
+
 from data import get_datasets
-from engine.flax_engine import create_train_state, make_train_step, make_eval_step
-from optim.eigentools import init_eigentracking, track_eigenstate
-from optim.factory import build_curvature_matvec_fn
+from engine.flax_engine import create_train_state, make_train_step, make_eval_step, cross_entropy_loss
+from optim.eigentools import (
+    init_eigentracking,
+    track_eigenstate,
+    extract_momentum_pytree,
+    extract_precond_eigsystem,
+    compute_soap_perlayer_sin2,
+    compute_muon_topk_energy,
+)
+from optim.factory import build_curvature_matvec_fn, get_optimizer
 from models.mlp import MLP
 from models.resnet import SmallResNet, ResNet30, ResNet18
 from models.vit_small import VisionTransformer
@@ -44,6 +53,8 @@ from utils import (
     _sanitize_name,
     init_eigen_tracking_csv,
     append_eigen_tracking_row,
+    init_hessian_probe_csv,
+    append_hessian_probe_row,
 )
 
 FLAGS = flags.FLAGS
@@ -53,6 +64,100 @@ flags.DEFINE_string(
     None,
     "Override exp_name from the config for the output folder.",
 )
+
+
+def _make_effective_update_transform_fn(
+    tx,
+    params,
+    opt_state,
+    base_grads,
+    *,
+    base_mode: str,
+    direction_scale: float,
+    normalize_lr: bool,
+    learning_rate: float,
+):
+    """Return transform(direction) -> effective update delta.
+
+    Probes how the optimizer preconditions a given direction by comparing
+    tx.update(base + scale*direction) against tx.update(base), normalised by
+    direction_scale (and optionally lr). Identical logic to train_lm.py.
+    """
+    if base_mode == "zero":
+        reference_grads = jtu.tree_map(jnp.zeros_like, base_grads)
+    elif base_mode == "grad":
+        reference_grads = base_grads
+    else:
+        raise ValueError(
+            "effective_curvature_transform_base must be one of {'zero', 'grad'}."
+        )
+
+    reference_updates, _ = tx.update(reference_grads, opt_state, params)
+
+    lr_scale = 1.0
+    if normalize_lr:
+        lr_scale = max(abs(float(learning_rate)), 1e-30)
+    denom = float(direction_scale) * lr_scale
+
+    def transform(direction):
+        if base_mode == "zero":
+            probe_grads = jtu.tree_map(lambda d: direction_scale * d, direction)
+        else:
+            probe_grads = jtu.tree_map(
+                lambda g, d: g + direction_scale * d, base_grads, direction
+            )
+        probe_updates, _ = tx.update(probe_grads, opt_state, params)
+        return jtu.tree_map(
+            lambda probe, reference: (probe - reference) / denom,
+            probe_updates,
+            reference_updates,
+        )
+
+    return transform
+
+
+def _make_probe_measurement_fn(model_def, tx, curvature_batch, batch_stats):
+    """Build a JIT-compiled probe measurement function for image classification.
+
+    Applies one optimizer step on the fixed curvature batch and measures
+    loss/accuracy before and after, matching the LLM probe_update mode.
+    """
+    probe_images, probe_labels = curvature_batch
+
+    def _fwd(params):
+        variables = {"params": params}
+        if batch_stats is not None:
+            variables["batch_stats"] = batch_stats
+            out, _ = model_def.apply(
+                variables, probe_images, train=False, mutable=["batch_stats"]
+            )
+        else:
+            out = model_def.apply(variables, probe_images, train=False)
+        logits = out[0] if isinstance(out, tuple) else out
+        loss = cross_entropy_loss(logits, probe_labels)
+        acc = jnp.mean(jnp.argmax(logits, axis=-1) == probe_labels)
+        return loss, acc
+
+    @jax.jit
+    def compute_probe_measurement(params, opt_state):
+        (loss_before, acc_before), grads = jax.value_and_grad(
+            _fwd, has_aux=True
+        )(params)
+        probe_updates, _ = tx.update(grads, opt_state, params)
+        probe_params = optax.apply_updates(params, probe_updates)
+        loss_after, acc_after = _fwd(probe_params)
+        return {
+            "probe_loss_before": loss_before,
+            "probe_loss_after": loss_after,
+            "probe_loss_reduction": loss_before - loss_after,
+            "probe_acc_before": acc_before,
+            "probe_acc_after": acc_after,
+            "probe_acc_gain": (acc_after - acc_before) / jnp.maximum(
+                1.0 - acc_before, 1e-8
+            ),
+        }
+
+    return compute_probe_measurement
 
 
 def _should_run_eigen_tracking_for_step(cfg, completed_step: int) -> bool:
@@ -198,8 +303,45 @@ def main(_argv):
     )
 
     eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
+    measurement_momentum = bool(getattr(cfg, "measurement_momentum", False))
+    precond_criterion_enabled = bool(getattr(cfg, "precond_criterion_enabled", False))
+    precond_criterion_max_dirs = int(getattr(cfg, "precond_criterion_max_dirs", 40))
+    precond_criterion_damping = float(getattr(cfg, "precond_criterion_damping", 1e-6))
     eigen_tracking_state = None
     eigen_tracking_csv_path = None
+    compute_probe_measurement = None
+
+    _optim_name_lower = str(getattr(cfg, "optim", "")).lower()
+    _soap_perlayer_sin2 = (
+        eigen_tracking_enabled
+        and _optim_name_lower in {"soap", "ni_soap", "ni-soap", "nisoap"}
+        and bool(getattr(cfg, "soap_perlayer_sin2_enabled", True))
+    )
+    _muon_topk_energy = eigen_tracking_enabled and _optim_name_lower == "muon"
+    _num_2d_layers = sum(
+        1 for l in jax.tree_util.tree_leaves(state.params) if l.ndim == 2
+    )
+
+    # Effective curvature config (mirrors train_lm.py)
+    effective_curvature_enabled = bool(
+        getattr(cfg, "effective_curvature_tracking_enabled", False)
+    )
+    effective_curvature_transform_base = str(
+        getattr(cfg, "effective_curvature_transform_base", "zero")
+    ).lower()
+    effective_curvature_direction_scale = float(
+        getattr(cfg, "effective_curvature_direction_scale", 1.0)
+    )
+    effective_curvature_normalize_lr = bool(
+        getattr(cfg, "effective_curvature_normalize_lr", True)
+    )
+    effective_curvature_gram_ridge = float(
+        getattr(cfg, "effective_curvature_gram_ridge", 1e-8)
+    )
+    eigen_tracking_measurement_mode = str(
+        getattr(cfg, "eigen_tracking_measurement_mode", "actual_update")
+    ).lower()
+
     if eigen_tracking_enabled:
         eigen_tracking_topk = int(
             getattr(
@@ -247,20 +389,56 @@ def main(_argv):
             batch_stats=state.batch_stats,
             backend=eigen_tracking_backend,
         )
+        _num_precond_dirs = precond_criterion_max_dirs if precond_criterion_enabled else 0
         eigen_tracking_state = init_eigentracking(
             state.params,
             k=eigen_tracking_topk,
             extra_modes=eigen_tracking_extra_modes,
+            num_precond_dirs=_num_precond_dirs,
             seed=int(getattr(cfg, "seed", 0)),
         )
         eigen_tracking_csv_path = init_eigen_tracking_csv(
             cfg,
             eigen_tracking_topk,
             extra_modes=eigen_tracking_extra_modes,
+            measurement_momentum=measurement_momentum,
+            precond_criterion=precond_criterion_enabled,
+            num_precond_dirs=_num_precond_dirs,
+            soap_perlayer_sin2=_soap_perlayer_sin2,
+            muon_topk_energy=_muon_topk_energy,
+            num_2d_layers=_num_2d_layers,
         )
 
+        # Capture tx and optim_name for use inside JIT (static closed-over values)
+        _tx = state.tx
+        _optim_name = str(getattr(cfg, "optim", "")).lower()
+        _precond_criterion_damping = precond_criterion_damping
+
         @jax.jit
-        def run_eigen_tracking(params, grads, updates, step, tracking_state):
+        def run_eigen_tracking(
+            params, opt_state, grads, updates, step, tracking_state, precond_eigsys
+        ):
+            effective_transform_fn = None
+            if effective_curvature_enabled:
+                effective_transform_fn = _make_effective_update_transform_fn(
+                    _tx,
+                    params,
+                    opt_state,
+                    grads,
+                    base_mode=effective_curvature_transform_base,
+                    direction_scale=effective_curvature_direction_scale,
+                    normalize_lr=effective_curvature_normalize_lr,
+                    learning_rate=float(cfg.lr),
+                )
+
+            momentum_flat = None
+            if measurement_momentum:
+                _mom_pytree = extract_momentum_pytree(opt_state, _optim_name)
+                if _mom_pytree is not None:
+                    from jax.flatten_util import ravel_pytree as _rp
+                    momentum_flat, _ = _rp(_mom_pytree)
+                    momentum_flat = momentum_flat.astype(jnp.float32)
+
             return track_eigenstate(
                 params=params,
                 grads=grads,
@@ -274,7 +452,109 @@ def main(_argv):
                 light_ortho_every=eigen_tracking_light_ortho_every,
                 learning_rate=float(cfg.lr),
                 signed_split_enabled=eigen_tracking_signed_split_enabled,
+                effective_transform_fn=effective_transform_fn,
+                effective_curvature_gram_ridge=effective_curvature_gram_ridge,
+                momentum_flat=momentum_flat,
+                precond_eigsys=precond_eigsys,
+                precond_criterion_damping=_precond_criterion_damping,
             )
+
+        if eigen_tracking_measurement_mode == "probe_update":
+            # Weight-decay-free tx for measurements; only the update function
+            # is used (with the training opt_state), no extra state allocated.
+            tx_no_wd = get_optimizer(
+                cfg,
+                model_def=model_def,
+                curvature_batch=curvature_batch,
+                batch_stats=state.batch_stats,
+                override_weight_decay=0.0,
+            )
+            compute_probe_measurement = _make_probe_measurement_fn(
+                model_def, tx_no_wd, curvature_batch, state.batch_stats
+            )
+
+    # --- Hessian probe (robustness check at ~N checkpoints) ---
+    hessian_probe_enabled = bool(getattr(cfg, "hessian_probe_enabled", False))
+    hessian_probe_state = None
+    hessian_probe_csv_path = None
+    hessian_probe_steps = set()
+    if hessian_probe_enabled and eigen_tracking_enabled:
+        hessian_probe_count = int(getattr(cfg, "hessian_probe_count", 5))
+        hessian_probe_matvec_fn = build_curvature_matvec_fn(
+            cfg,
+            model_def=model_def,
+            curvature_batch=curvature_batch,
+            batch_stats=state.batch_stats,
+            backend="hessian",
+        )
+        hessian_probe_state = init_eigentracking(
+            state.params,
+            k=eigen_tracking_topk,
+            extra_modes=eigen_tracking_extra_modes,
+            num_precond_dirs=0,
+            seed=int(getattr(cfg, "seed", 0)) + 9999,
+        )
+        hessian_probe_csv_path = init_hessian_probe_csv(
+            cfg,
+            eigen_tracking_topk,
+            extra_modes=eigen_tracking_extra_modes,
+        )
+
+        @jax.jit
+        def run_hessian_probe(params, grads, updates, step, h_state):
+            return track_eigenstate(
+                params=params,
+                grads=grads,
+                updates=updates,
+                step=step,
+                eigen_state=h_state,
+                matvec_fn=hessian_probe_matvec_fn,
+                num_iter=eigen_tracking_iters,
+                sort_by_abs=True,
+                use_light_ortho=eigen_tracking_light_ortho,
+                light_ortho_every=eigen_tracking_light_ortho_every,
+                learning_rate=float(cfg.lr),
+                signed_split_enabled=True,
+                effective_transform_fn=None,
+                effective_curvature_gram_ridge=0.0,
+                momentum_flat=None,
+                precond_eigsys=None,
+                precond_criterion_damping=0.0,
+            )
+
+    # --- Phase-sweep measurement schedule (SOAP refresh-cycle isolation) ---
+    phase_sweep_enabled = bool(getattr(cfg, "eigen_tracking_phase_sweep", False))
+    phase_sweep_steps = set()
+    phase_sweep_T = 0
+    phase_sweep_first_fresh = 0
+    if phase_sweep_enabled and eigen_tracking_enabled:
+        phase_sweep_T = int(getattr(cfg, "precondition_frequency", 32))
+        phase_sweep_num_cycles = int(
+            getattr(cfg, "eigen_tracking_phase_sweep_num_cycles", 7)
+        )
+        phase_sweep_first_fresh = phase_sweep_T + 2
+        offsets = [
+            0,
+            round(phase_sweep_T / 4),
+            round(phase_sweep_T / 2),
+            round(3 * phase_sweep_T / 4),
+            phase_sweep_T - 1,
+        ]
+        _est_bpe = 100000 // cfg.batch_size
+        _est_total = _est_bpe * cfg.num_epochs
+        _total_cycles = max(1, (_est_total - phase_sweep_first_fresh) // phase_sweep_T)
+        _cycle_interval = max(1, _total_cycles // phase_sweep_num_cycles)
+        for c in range(0, _total_cycles, _cycle_interval):
+            _cycle_start = phase_sweep_first_fresh + c * phase_sweep_T
+            for o in offsets:
+                s = _cycle_start + o
+                if s <= _est_total:
+                    phase_sweep_steps.add(s)
+        print(
+            f"Phase sweep: T={phase_sweep_T}, {len(phase_sweep_steps)} measurement steps "
+            f"across {phase_sweep_num_cycles} probe cycles, "
+            f"offsets={offsets}"
+        )
 
     muon_log_files = {}
     if log_curv and use_muon:
@@ -362,6 +642,15 @@ def main(_argv):
     train_accs = []
     eval_accs = []
 
+    # Pre-compute which tracking steps get a Hessian probe
+    if hessian_probe_enabled and eigen_tracking_enabled:
+        _eigen_every = int(getattr(cfg, "eigen_tracking_every", 100))
+        _est_batches_per_epoch = 100000 // cfg.batch_size  # TinyImageNet: 100k train
+        _est_total_steps = _est_batches_per_epoch * cfg.num_epochs
+        _est_total_trackings = max(1, _est_total_steps // _eigen_every)
+        _probe_interval = max(1, _est_total_trackings // hessian_probe_count)
+        _tracking_counter = [0]  # mutable counter for tracking steps seen
+
     training_start_time = time.time()
     train_global_step = 0
 
@@ -383,26 +672,109 @@ def main(_argv):
         train_metrics = []
         for batch in train_ds:
             rng, batch_rng = jax.random.split(rng)
-            should_track = (
-                eigen_tracking_enabled
-                and _should_run_eigen_tracking_for_step(cfg, train_global_step + 1)
-            )
+            _completed = train_global_step + 1
+            if phase_sweep_enabled:
+                should_track = eigen_tracking_enabled and (_completed in phase_sweep_steps)
+            else:
+                should_track = (
+                    eigen_tracking_enabled
+                    and _should_run_eigen_tracking_for_step(cfg, _completed)
+                )
             if should_track:
                 params_before = state.params
+                opt_state_before = state.opt_state
                 state, metrics, grads, updates = tracking_train_step(
                     state, batch, batch_rng
                 )
+
+                measurement_metrics = {}
+                if compute_probe_measurement is not None:
+                    measurement_metrics = jax.device_get(
+                        compute_probe_measurement(params_before, opt_state_before)
+                    )
+
+                if phase_sweep_enabled:
+                    measurement_metrics["refresh_T"] = phase_sweep_T
+                    measurement_metrics["refresh_offset"] = (
+                        (_completed - phase_sweep_first_fresh) % phase_sweep_T
+                    )
+
+                _, eval_ds_meas = get_datasets(
+                    dataset=cfg.dataset,
+                    batch_size=cfg.batch_size,
+                    seed=cfg.seed,
+                    image_size=getattr(cfg, "image_size", None),
+                )
+                _eval_metrics_meas = [eval_step(state, batch) for batch in eval_ds_meas]
+                measurement_metrics["eval_loss"] = float(
+                    jnp.mean(jnp.array([m["loss"] for m in _eval_metrics_meas]))
+                )
+                measurement_metrics["eval_accuracy"] = float(
+                    jnp.mean(jnp.array([m["accuracy"] for m in _eval_metrics_meas]))
+                )
+
+                _precond_eigsys = None
+                if precond_criterion_enabled:
+                    _precond_eigsys = extract_precond_eigsystem(
+                        opt_state_before,
+                        _optim_name,
+                        params_before,
+                        precond_criterion_max_dirs,
+                    )
                 eigen_tracking_state = run_eigen_tracking(
                     params_before,
+                    opt_state_before,
                     grads,
                     updates,
                     state.step,
                     eigen_tracking_state,
+                    _precond_eigsys,
                 )
+
+                if _soap_perlayer_sin2:
+                    _is_ni = _optim_name in {"ni_soap", "ni-soap", "nisoap"}
+                    _sin2_mean, _sin2_layers = compute_soap_perlayer_sin2(
+                        opt_state_before, _is_ni, params_before,
+                        eigen_tracking_state.eigenvectors,
+                    )
+                    measurement_metrics["soap_sin2_layermean"] = _sin2_mean
+                    for _i, _s in enumerate(_sin2_layers):
+                        measurement_metrics[f"soap_sin2_layer_{_i}"] = _s
+                elif _muon_topk_energy:
+                    _e_mean, _e_base, _e_layers, _b_layers = compute_muon_topk_energy(
+                        updates, params_before,
+                        eigen_tracking_state.eigenvectors,
+                    )
+                    measurement_metrics["muon_topk_energy_mean"] = _e_mean
+                    measurement_metrics["muon_topk_energy_baseline_mean"] = _e_base
+                    for _i, (_e, _b) in enumerate(
+                        zip(_e_layers, _b_layers)
+                    ):
+                        measurement_metrics[f"muon_topk_energy_layer_{_i}"] = _e
+                        measurement_metrics[f"muon_topk_energy_baseline_layer_{_i}"] = _b
+
                 append_eigen_tracking_row(
                     eigen_tracking_csv_path,
                     eigen_tracking_state,
+                    measurement_metrics=measurement_metrics,
+                    measurement_momentum=measurement_momentum,
+                    precond_criterion=precond_criterion_enabled,
+                    num_precond_dirs=_num_precond_dirs,
+                    soap_perlayer_sin2=_soap_perlayer_sin2,
+                    muon_topk_energy=_muon_topk_energy,
+                    num_2d_layers=_num_2d_layers,
                 )
+
+                if hessian_probe_enabled:
+                    _tracking_counter[0] += 1
+                    if (_tracking_counter[0] - 1) % _probe_interval == 0:
+                        hessian_probe_state = run_hessian_probe(
+                            params_before, grads, updates,
+                            state.step, hessian_probe_state,
+                        )
+                        append_hessian_probe_row(
+                            hessian_probe_csv_path, hessian_probe_state,
+                        )
             else:
                 state, metrics = train_step(state, batch, batch_rng)
             train_global_step += 1

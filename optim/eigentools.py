@@ -2,6 +2,7 @@ from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.flatten_util import ravel_pytree
 import optax
 
@@ -84,6 +85,13 @@ class EigenTrackingState(NamedTuple):
     m_proj: Array
     extra_m_proj: Array
     m_norm: Array
+    # Experiment 1b — preconditioner-basis vs curvature alignment
+    A_P_believed: Array       # Σ_i p̂_i a_i  (preconditioner-weighted curvature)
+    A_Muon_block: Array       # (1/M) Σ_i a_i  (uniform / Muon reference)
+    crit_resid: Array         # (A_P − A_Muon) − M·Cov(p̂, a) ≈ 0 sanity check
+    precond_basis_sin2: Array # 1 − mean(σ²) of V @ Q_hat^T; 0 = aligned
+    a_per_dir: Array          # (num_precond_dirs,) per-direction curvatures
+    phat_per_dir: Array       # (num_precond_dirs,) per-direction p̂ weights
 
 
 def _project_rows(matrix: Array, vector: Array) -> Array:
@@ -134,6 +142,7 @@ def init_eigentracking(
     k: int,
     *,
     extra_modes: int = 0,
+    num_precond_dirs: int = 0,
     seed: int = 0,
 ) -> EigenTrackingState:
     flat_params, _ = ravel_pytree(params)
@@ -199,6 +208,12 @@ def init_eigentracking(
         m_proj=jnp.full((k,), jnp.nan, dtype=dtype),
         extra_m_proj=jnp.full((extra_modes,), jnp.nan, dtype=dtype),
         m_norm=nan,
+        A_P_believed=nan,
+        A_Muon_block=nan,
+        crit_resid=nan,
+        precond_basis_sin2=nan,
+        a_per_dir=jnp.full((num_precond_dirs,), jnp.nan, dtype=dtype),
+        phat_per_dir=jnp.full((num_precond_dirs,), jnp.nan, dtype=dtype),
     )
 
 
@@ -513,6 +528,437 @@ def extract_momentum_pytree(opt_state, optim_name: str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Experiment 1b helpers: preconditioner-basis vs curvature alignment
+# ---------------------------------------------------------------------------
+
+def _precond_criterion_metrics(
+    Q_hat: Array,
+    lambda_hat: Array,
+    V: Array,
+    matvec_flat: Callable[[Array], Array],
+    num_store: int,
+    *,
+    damping: float,
+    eps: float,
+) -> Tuple[Array, Array, Array, Array, Array, Array]:
+    """Compute Exp 1b criterion metrics.
+
+    Args:
+        Q_hat: (M, dim) bfloat16 — believed preconditioner eigenvectors (unit rows).
+        lambda_hat: (M,) float32 — believed preconditioner eigenvalues.
+        V: (k, dim) bfloat16 — measured curvature eigenvectors from Lanczos.
+        matvec_flat: curvature matrix-vector product in flat param space.
+        num_store: number of per-direction entries to store (0 → empty arrays).
+        damping: ridge added to lambda_hat before inverting for p̂.
+        eps: numerical floor.
+
+    Returns (A_P, A_Muon, crit_resid, precond_basis_sin2, a_store, phat_store).
+    """
+    M = Q_hat.shape[0]
+    metric_dtype = jnp.float32
+    nan = jnp.asarray(jnp.nan, dtype=metric_dtype)
+
+    # a_i = q_i^T H q_i  (one Hvp per believed direction)
+    def rayleigh(q_bf16: Array) -> Array:
+        q = q_bf16.astype(metric_dtype)
+        hq = matvec_flat(q).astype(metric_dtype)
+        return jnp.vdot(q, hq)
+
+    a_per_dir = jax.lax.map(rayleigh, Q_hat)  # (M,) float32
+
+    # p̂_i = (1/(λ̂_i+δ)) / Σ_j 1/(λ̂_j+δ)
+    lam = lambda_hat.astype(metric_dtype)
+    inv_lam = 1.0 / (lam + jnp.asarray(damping, metric_dtype))
+    phat = inv_lam / jnp.maximum(jnp.sum(inv_lam), eps)  # (M,)
+
+    A_P = jnp.sum(phat * a_per_dir)
+    M_f = jnp.asarray(M, dtype=metric_dtype)
+    A_Muon = jnp.sum(a_per_dir) / M_f
+
+    # crit_resid = (A_P − A_Muon) − M·Cov(p̂, a)  ≈ 0 by identity (sanity check)
+    cov_phat_a = jnp.mean(phat * a_per_dir) - jnp.mean(phat) * jnp.mean(a_per_dir)
+    crit_resid = (A_P - A_Muon) - M_f * cov_phat_a
+
+    # precond_basis_sin2 = 1 − mean(σ²) where σ = SVD(V @ Q_hat^T)
+    overlap = V.astype(metric_dtype) @ Q_hat.astype(metric_dtype).T  # (k, M)
+    sing_vals = jnp.linalg.svd(overlap, compute_uv=False)            # min(k,M)
+    precond_basis_sin2 = jnp.maximum(0.0, 1.0 - jnp.mean(jnp.square(sing_vals)))
+
+    # Store per-direction arrays, truncated to num_store
+    store_len = min(M, num_store)
+    a_store = jnp.full((num_store,), jnp.nan, dtype=metric_dtype).at[:store_len].set(
+        a_per_dir[:store_len]
+    )
+    phat_store = jnp.full((num_store,), jnp.nan, dtype=metric_dtype).at[:store_len].set(
+        phat[:store_len]
+    )
+    return A_P, A_Muon, crit_resid, precond_basis_sin2, a_store, phat_store
+
+
+def _extract_soap_precond_eigsystem(
+    opt_state,
+    is_ni_soap: bool,
+    param_leaves: list,
+    leaf_offsets: list,
+    dim: int,
+    max_dirs: int,
+) -> Optional[Tuple[Array, Array]]:
+    """Extract top-M Kronecker eigenvectors and eigenvalues from SOAP / NI-SOAP state.
+
+    Returns (Q_hat, lambda_hat) or None.  Q_hat rows are unit vectors in the flat
+    parameter space; lambda_hat[i] = eL[qi] * eR[qj] (Kronecker eigenvalue).
+    """
+    from optim.soap import SoapState, SoapPerParamState
+    from optim.ni_soap import NiSoapState, NiSoapPerParamState
+
+    if is_ni_soap:
+        StateClass, PerParamClass = NiSoapState, NiSoapPerParamState
+    else:
+        StateClass, PerParamClass = SoapState, SoapPerParamState
+
+    node = _find_first_of_type(opt_state, StateClass)
+    if node is None:
+        return None
+
+    per_param_leaves = jax.tree_util.tree_leaves(
+        node.per_param, is_leaf=lambda x: isinstance(x, PerParamClass)
+    )
+    if len(per_param_leaves) != len(param_leaves):
+        return None
+
+    all_kron_eig: list = []
+    all_leaf_idx: list = []
+    all_qi: list = []
+    all_qj: list = []
+    soap_states_2d: dict = {}  # leaf_idx -> (QL, QR, shape)
+
+    for leaf_idx, (p_leaf, s_leaf) in enumerate(zip(param_leaves, per_param_leaves)):
+        p_np = np.asarray(jax.device_get(p_leaf))
+        if p_np.ndim != 2:
+            continue
+        r, c = p_np.shape
+
+        # Transfer only small factor matrices, not the large m/v buffers.
+        QL = np.asarray(jax.device_get(s_leaf.QL), dtype=np.float32)
+        QR = np.asarray(jax.device_get(s_leaf.QR), dtype=np.float32)
+        if QL.shape[0] <= 1 or QR.shape[0] <= 1 or QL.shape[0] != r or QR.shape[0] != c:
+            continue  # preconditioner not initialised or mismatched
+
+        if is_ni_soap:
+            eL = np.asarray(jax.device_get(s_leaf.eL), dtype=np.float32)
+            eR = np.asarray(jax.device_get(s_leaf.eR), dtype=np.float32)
+        else:
+            L = np.asarray(jax.device_get(s_leaf.L), dtype=np.float32)
+            R = np.asarray(jax.device_get(s_leaf.R), dtype=np.float32)
+            eL = np.diag(QL.T @ L @ QL)
+            eR = np.diag(QR.T @ R @ QR)
+
+        soap_states_2d[leaf_idx] = (QL, QR, r, c)
+
+        # Vectorised generation of all (i, j) Kronecker candidates for this param.
+        kron_eig = np.abs(np.outer(eL, eR)).ravel()  # (r*c,)
+        ii = np.repeat(np.arange(r, dtype=np.int32), c)
+        jj = np.tile(np.arange(c, dtype=np.int32), r)
+        all_kron_eig.append(kron_eig)
+        all_leaf_idx.append(np.full(r * c, leaf_idx, dtype=np.int32))
+        all_qi.append(ii)
+        all_qj.append(jj)
+
+    if not all_kron_eig:
+        return None
+
+    cand_kron = np.concatenate(all_kron_eig).astype(np.float32)
+    cand_leaf = np.concatenate(all_leaf_idx)
+    cand_qi   = np.concatenate(all_qi)
+    cand_qj   = np.concatenate(all_qj)
+
+    # Select top-max_dirs by Kronecker eigenvalue (largest = most curvature).
+    M = min(max_dirs, len(cand_kron))
+    if M < len(cand_kron):
+        top_idx = np.argpartition(cand_kron, -M)[-M:]
+        top_idx = top_idx[np.argsort(-cand_kron[top_idx])]
+    else:
+        top_idx = np.argsort(-cand_kron)
+
+    Q_hat      = np.zeros((M, dim), dtype=np.float32)
+    lambda_hat = np.zeros(M, dtype=np.float32)
+
+    for k_out, idx in enumerate(top_idx):
+        leaf_idx = int(cand_leaf[idx])
+        qi = int(cand_qi[idx])
+        qj = int(cand_qj[idx])
+        QL, QR, r, c = soap_states_2d[leaf_idx]
+        offset = leaf_offsets[leaf_idx]
+
+        # Unit direction: outer(QL[:, qi], QR[:, qj]) flattened (norm = 1).
+        dir_local = np.outer(QL[:, qi], QR[:, qj]).ravel()
+        Q_hat[k_out, offset : offset + r * c] = dir_local
+        lambda_hat[k_out] = float(cand_kron[idx])
+
+    return (
+        jnp.asarray(Q_hat, dtype=jnp.bfloat16),
+        jnp.asarray(lambda_hat, dtype=jnp.float32),
+    )
+
+
+def _extract_adam_precond_eigsystem(
+    opt_state,
+    dim: int,
+    max_dirs: int,
+) -> Optional[Tuple[Array, Array]]:
+    """Extract top-M coordinate directions (by second moment) from Adam/AdamW state.
+
+    Q_hat rows are one-hot standard-basis vectors; lambda_hat = ν_i (second moment).
+    """
+    ScaleByAdamState = getattr(optax, "ScaleByAdamState", None)
+    if ScaleByAdamState is None:
+        try:
+            from optax._src.transform import ScaleByAdamState  # type: ignore[assignment]
+        except ImportError:
+            return None
+
+    node = _find_first_of_type(opt_state, ScaleByAdamState)
+    if node is None:
+        return None
+
+    nu_flat, _ = ravel_pytree(jax.device_get(node.nu))
+    nu_np = np.asarray(nu_flat, dtype=np.float32)
+
+    M = min(max_dirs, dim)
+    if M >= dim:
+        indices = np.arange(dim, dtype=np.int32)
+    else:
+        indices = np.argpartition(nu_np, -M)[-M:].astype(np.int32)
+        indices = indices[np.argsort(-nu_np[indices])]
+
+    Q_hat = np.zeros((M, dim), dtype=np.float32)
+    Q_hat[np.arange(M), indices] = 1.0
+    lambda_hat = nu_np[indices]
+
+    return (
+        jnp.asarray(Q_hat, dtype=jnp.bfloat16),
+        jnp.asarray(lambda_hat, dtype=jnp.float32),
+    )
+
+
+def extract_precond_eigsystem(
+    opt_state,
+    optim_name: str,
+    params: Params,
+    max_dirs: int,
+) -> Optional[Tuple[Array, Array]]:
+    """Extract the preconditioner's believed eigenbasis in flat parameter space.
+
+    Returns ``(Q_hat, lambda_hat)`` where ``Q_hat`` is ``(M, dim)`` bfloat16 (unit
+    rows) and ``lambda_hat`` is ``(M,)`` float32, or ``None`` when the optimizer has
+    no structured eigenbasis (Muon, SGD, Signum).
+
+    Supported optimizers:
+      - SOAP / NI-SOAP: top-M Kronecker eigenvectors, λ̂ = eL[i]·eR[j].
+      - Adam / AdamW: top-M coordinate axes by second-moment ν; λ̂ = ν_i.
+
+    Memory: M × dim × 2 bytes (bfloat16) for Q_hat — set max_dirs small for
+    large models or disable by passing max_dirs=0.
+
+    Must be called *outside* JIT (uses Python/numpy to inspect optimizer state).
+    """
+    if max_dirs <= 0:
+        return None
+
+    name = optim_name.lower().strip()
+
+    # Build flat-space offsets for each parameter leaf.
+    leaves = jax.tree_util.tree_leaves(params)
+    offsets: list = []
+    offset = 0
+    for leaf in leaves:
+        offsets.append(offset)
+        offset += int(np.asarray(jax.device_get(leaf)).size)
+    dim = offset
+
+    if name in {"soap", "ni_soap", "ni-soap", "nisoap"}:
+        is_ni = name in {"ni_soap", "ni-soap", "nisoap"}
+        return _extract_soap_precond_eigsystem(
+            opt_state, is_ni, leaves, offsets, dim, max_dirs
+        )
+
+    if name in {"adam", "adamw"}:
+        return _extract_adam_precond_eigsystem(opt_state, dim, max_dirs)
+
+    # Muon / SGD / Signum: no structured parameter-level eigenbasis.
+    return None
+
+
+def compute_soap_perlayer_sin2(
+    opt_state,
+    is_ni_soap: bool,
+    params: Params,
+    eigenvectors: Array,
+) -> Tuple[float, list]:
+    """Per-layer sin² between SOAP's believed top-k and true top-k subspaces.
+
+    Uses the bilinear form trick: P_i = Q_L^T V_i Q_R avoids forming
+    D-dimensional Kronecker vectors.  O(m²n + mn²) per Ritz vector per layer.
+
+    Returns (layer_mean_sin2, list_of_per_layer_sin2) where the list has one
+    entry per 2D param leaf (NaN for leaves where SOAP state is unavailable).
+    Must be called outside JIT.
+    """
+    from optim.soap import SoapState, SoapPerParamState
+    from optim.ni_soap import NiSoapState, NiSoapPerParamState
+
+    if is_ni_soap:
+        StateClass, PerParamClass = NiSoapState, NiSoapPerParamState
+    else:
+        StateClass, PerParamClass = SoapState, SoapPerParamState
+
+    node = _find_first_of_type(opt_state, StateClass)
+    if node is None:
+        return float("nan"), []
+
+    param_leaves = jax.tree_util.tree_leaves(params)
+    per_param_leaves = jax.tree_util.tree_leaves(
+        node.per_param, is_leaf=lambda x: isinstance(x, PerParamClass)
+    )
+    if len(per_param_leaves) != len(param_leaves):
+        return float("nan"), []
+
+    k_ritz = eigenvectors.shape[0]
+    if k_ritz == 0:
+        return float("nan"), []
+
+    offsets: list = []
+    offset = 0
+    for p_leaf in param_leaves:
+        offsets.append(offset)
+        offset += int(np.asarray(jax.device_get(p_leaf)).size)
+
+    per_layer_sin2: list = []
+    valid_sin2s: list = []
+
+    for leaf_idx, (p_leaf, s_leaf) in enumerate(zip(param_leaves, per_param_leaves)):
+        p_np = np.asarray(jax.device_get(p_leaf))
+        if p_np.ndim != 2:
+            continue
+
+        m, n = p_np.shape
+
+        QL = np.asarray(jax.device_get(s_leaf.QL), dtype=np.float32)
+        QR = np.asarray(jax.device_get(s_leaf.QR), dtype=np.float32)
+        if QL.shape[0] <= 1 or QR.shape[0] <= 1 or QL.shape[0] != m or QR.shape[0] != n:
+            per_layer_sin2.append(float("nan"))
+            continue
+
+        if is_ni_soap:
+            eL = np.asarray(jax.device_get(s_leaf.eL), dtype=np.float32)
+            eR = np.asarray(jax.device_get(s_leaf.eR), dtype=np.float32)
+        else:
+            L_mat = np.asarray(jax.device_get(s_leaf.L), dtype=np.float32)
+            R_mat = np.asarray(jax.device_get(s_leaf.R), dtype=np.float32)
+            eL = np.diag(QL.T @ L_mat @ QL)
+            eR = np.diag(QR.T @ R_mat @ QR)
+
+        Lam_ab = np.abs(np.outer(eL, eR))
+
+        k_use = min(k_ritz, m * n)
+        flat_lam = Lam_ab.ravel()
+        if k_use < len(flat_lam):
+            top_flat_idx = np.argpartition(flat_lam, -k_use)[-k_use:]
+            top_flat_idx = top_flat_idx[np.argsort(-flat_lam[top_flat_idx])]
+        else:
+            top_flat_idx = np.argsort(-flat_lam)[:k_use]
+        idx_a = top_flat_idx // n
+        idx_b = top_flat_idx % n
+
+        off = offsets[leaf_idx]
+        v_block = np.asarray(
+            jax.device_get(eigenvectors[:, off : off + m * n]),
+            dtype=np.float32,
+        ).reshape(k_ritz, m, n)
+
+        # P_k = Q_L^T V_k Q_R for each Ritz vector k. Computed as two batched
+        # matmuls -> O(k*m*n*(m+n)); the previous np.einsum("ia,kij,jb->kab")
+        # was unoptimized (O(k*m^2*n^2)) and hung for LM-sized layers. This is
+        # memory-neutral (Section 4 of the revision plan / Q_L,Q_R-vs-GGN alignment).
+        T = np.matmul(QL.T[None, :, :], v_block)  # (k, m, n) = Q_L^T V_k
+        P = np.matmul(T, QR)                       # (k, m, n) = (Q_L^T V_k) Q_R
+        M = P[:, idx_a, idx_b]  # (k_ritz, k_use)
+
+        sv = np.linalg.svd(M, compute_uv=False)
+        sv = np.clip(sv, 0.0, 1.0)
+        sin2 = float(max(0.0, 1.0 - np.mean(sv ** 2)))
+        per_layer_sin2.append(sin2)
+        valid_sin2s.append(sin2)
+
+    layer_mean = float(np.mean(valid_sin2s)) if valid_sin2s else float("nan")
+    return layer_mean, per_layer_sin2
+
+
+def compute_muon_topk_energy(
+    updates: PyTree,
+    params: Params,
+    eigenvectors: Array,
+) -> Tuple[float, float, list, list]:
+    """Fraction of update energy in the true top-k sharp subspace per 2D layer.
+
+    If e_top ≈ k/D the update is incoherent w.r.t. curvature (exposure ≈ AM).
+    If e_top < k/D the optimizer actively vacates the sharp subspace (sub-AM).
+
+    Returns (mean_e_top, mean_baseline, per_layer_e_top, per_layer_baseline)
+    where the lists have one entry per 2D param leaf (NaN for zero-energy layers).
+    Must be called outside JIT.
+    """
+    param_leaves = jax.tree_util.tree_leaves(params)
+    update_leaves = jax.tree_util.tree_leaves(updates)
+
+    k = eigenvectors.shape[0]
+    if k == 0:
+        return float("nan"), float("nan"), [], []
+
+    offsets: list = []
+    offset = 0
+    for p_leaf in param_leaves:
+        offsets.append(offset)
+        offset += int(np.asarray(jax.device_get(p_leaf)).size)
+
+    per_layer_etop: list = []
+    per_layer_baseline: list = []
+    valid_etop: list = []
+    valid_baseline: list = []
+
+    for leaf_idx, (p_leaf, u_leaf) in enumerate(zip(param_leaves, update_leaves)):
+        p_np = np.asarray(jax.device_get(p_leaf))
+        if p_np.ndim != 2:
+            continue
+
+        delta = np.asarray(jax.device_get(u_leaf), dtype=np.float32).ravel()
+        d_energy = float(np.sum(delta ** 2))
+        D_layer = delta.shape[0]
+        baseline = float(k / D_layer)
+
+        if d_energy < 1e-30:
+            per_layer_etop.append(float("nan"))
+            per_layer_baseline.append(baseline)
+            continue
+
+        off = offsets[leaf_idx]
+        V_layer = np.asarray(
+            jax.device_get(eigenvectors[:, off : off + D_layer]),
+            dtype=np.float32,
+        )
+
+        e_top = float(np.sum((V_layer @ delta) ** 2)) / d_energy
+        per_layer_etop.append(e_top)
+        per_layer_baseline.append(baseline)
+        valid_etop.append(e_top)
+        valid_baseline.append(baseline)
+
+    mean_etop = float(np.mean(valid_etop)) if valid_etop else float("nan")
+    mean_baseline = float(np.mean(valid_baseline)) if valid_baseline else float("nan")
+    return mean_etop, mean_baseline, per_layer_etop, per_layer_baseline
+
+
 def track_eigenstate(
     params: Params,
     grads: PyTree,
@@ -533,6 +979,8 @@ def track_eigenstate(
     effective_transform_fn: Optional[Callable[[PyTree], PyTree]] = None,
     effective_curvature_gram_ridge: float = 1e-8,
     momentum_flat: Optional[Array] = None,
+    precond_eigsys: Optional[Tuple[Array, Array]] = None,
+    precond_criterion_damping: float = 1e-6,
 ) -> EigenTrackingState:
     flat_params, unravel_params = ravel_pytree(params)
     dim = flat_params.shape[0]
@@ -576,6 +1024,10 @@ def track_eigenstate(
             effective_curvature_cond=nan,
             actual_update_rayleigh=nan,
             m_norm=m_norm_val,
+            A_P_believed=nan,
+            A_Muon_block=nan,
+            crit_resid=nan,
+            precond_basis_sin2=nan,
         )
 
     lanczos_steps = max(total_keep, total_keep if num_iter is None else int(num_iter))
@@ -666,6 +1118,35 @@ def track_eigenstate(
             eps=eps,
             gram_ridge=effective_curvature_gram_ridge,
         )
+
+    # Experiment 1b: preconditioner criterion metrics
+    _metric_nan = jnp.asarray(jnp.nan, dtype=metric_dtype)
+    _num_precond_dirs = eigen_state.a_per_dir.shape[0]
+    if precond_eigsys is not None:
+        _Q_hat, _lambda_hat = precond_eigsys
+        (
+            A_P_believed_val,
+            A_Muon_block_val,
+            crit_resid_val,
+            precond_basis_sin2_val,
+            a_per_dir_val,
+            phat_per_dir_val,
+        ) = _precond_criterion_metrics(
+            _Q_hat,
+            _lambda_hat,
+            all_eigenvectors,
+            matvec_flat,
+            _num_precond_dirs,
+            damping=precond_criterion_damping,
+            eps=eps,
+        )
+    else:
+        A_P_believed_val = _metric_nan
+        A_Muon_block_val = _metric_nan
+        crit_resid_val = _metric_nan
+        precond_basis_sin2_val = _metric_nan
+        a_per_dir_val = eigen_state.a_per_dir
+        phat_per_dir_val = eigen_state.phat_per_dir
 
     if total_keep > 0:
         g_proj = _project_rows(all_eigenvectors, grad_flat)
@@ -902,6 +1383,12 @@ def track_eigenstate(
         m_proj=top_m_proj,
         extra_m_proj=extra_m_proj,
         m_norm=m_norm_val,
+        A_P_believed=A_P_believed_val,
+        A_Muon_block=A_Muon_block_val,
+        crit_resid=crit_resid_val,
+        precond_basis_sin2=precond_basis_sin2_val,
+        a_per_dir=a_per_dir_val,
+        phat_per_dir=phat_per_dir_val,
     )
 
 
@@ -1015,3 +1502,251 @@ def lanczos(
     if return_residuals:
         return evals, eigenvectors, residuals
     return evals, eigenvectors
+
+
+# ===========================================================================
+# Revision Section 1 — probe measures (additive; consumes the eigenvectors
+# already produced by track_eigenstate, does not modify it).
+#
+#   1a  participation ratio per tracked eigenvector          (PR, PR/d)
+#   1b  Hutchinson curvature trace -> arithmetic-mean ref     (Tr(C), AM, AM/lammax)
+#   1c  per-block covariance decomposition                    (w_b, A_b, AM_b)
+#   1d  layer-type / governance attribution + restricted A    (A_restricted, AM_S)
+#
+# All heavy reductions are done on-device; only small per-block/per-type arrays
+# are returned to the host for CSV logging. The block partition is a *contiguous*
+# partition of the raveled parameter vector (ravel_pytree leaf order), which is
+# exactly the order of jax.tree_util.tree_leaves_with_path used below.
+# ===========================================================================
+
+# Ordered layer taxonomy used for the by-type attribution of Section 1d.
+LAYER_TYPES: Tuple[str, ...] = (
+    "embed",
+    "head_unembed",
+    "attn_qkv",
+    "attn_out",
+    "mlp_up",
+    "mlp_down",
+    "norm",
+    "bias",
+    "other",
+)
+
+
+def classify_layer_type(name: str, ndim: int) -> str:
+    """Map a Flax parameter path to one of :data:`LAYER_TYPES`."""
+    n = name.lower()
+    if "lm_head" in n:
+        return "head_unembed"
+    if ("embed_tokens" in n) or ("embedding" in n):
+        return "embed"
+    if "w_qkv" in n:
+        return "attn_qkv"
+    if "w_out" in n:
+        return "attn_out"
+    if ("fc_gate" in n) or ("fc_up" in n) or ("fc1" in n):
+        return "mlp_up"
+    if "fc2" in n:
+        return "mlp_down"
+    if "norm" in n:
+        return "norm"
+    if ndim <= 1:
+        return "bias"
+    return "other"
+
+
+def build_block_metadata(params: Params) -> dict:
+    """Contiguous per-leaf block partition of the raveled parameter vector.
+
+    Returns a dict of host-side lists/arrays. ``namesake`` marks the routed 2-D
+    matrices (Muon/SOAP/Kaon/Hadamard-Signum apply their namesake rule there and
+    fall back to AdamW elsewhere); it is optimizer-independent here so the same
+    restricted subspace is applied to every arm (the decisive control of 1d).
+    """
+    from .matrix_routing import should_use_matrix_preconditioner, path_to_name
+
+    leaves_with_path = jax.tree_util.tree_leaves_with_path(params)
+    names, types, is_matrix, namesake = [], [], [], []
+    starts, sizes, rows, cols = [], [], [], []
+    off = 0
+    for path, leaf in leaves_with_path:
+        name = path_to_name(path)
+        numel = int(np.prod(leaf.shape))
+        ndim = int(getattr(leaf, "ndim", np.ndim(leaf)))
+        ism = ndim == 2
+        names.append(name)
+        types.append(classify_layer_type(name, ndim))
+        is_matrix.append(ism)
+        namesake.append(bool(should_use_matrix_preconditioner(path, leaf)))
+        starts.append(off)
+        sizes.append(numel)
+        rows.append(int(leaf.shape[0]) if ism else numel)
+        cols.append(int(leaf.shape[1]) if ism else 1)
+        off += numel
+
+    n_blocks = len(names)
+    type_ids = np.array([LAYER_TYPES.index(t) for t in types], dtype=np.int32)
+    # Flat segment map: coordinate -> block id (contiguous). Used both for
+    # segment reductions and for the per-block matvec masks (seg == b).
+    seg = np.repeat(np.arange(n_blocks, dtype=np.int32), np.array(sizes, dtype=np.int64))
+    return {
+        "names": names,
+        "types": types,
+        "is_matrix": is_matrix,
+        "namesake": namesake,
+        "type_ids": type_ids,
+        "starts": np.array(starts, dtype=np.int64),
+        "sizes": np.array(sizes, dtype=np.int32),
+        "rows": np.array(rows, dtype=np.int32),
+        "cols": np.array(cols, dtype=np.int32),
+        "seg": seg,
+        "dim": off,
+        "n_blocks": n_blocks,
+        "n_types": len(LAYER_TYPES),
+    }
+
+
+def section1_measures(
+    updates: PyTree,
+    eigenvectors: Array,
+    extra_eigenvectors: Array,
+    eigenvalues: Array,
+    matvec_flat: Callable[[Array], Array],
+    *,
+    seg: Array,
+    block_namesake: Array,
+    type_ids: Array,
+    sizes: Array,
+    n_blocks: int,
+    n_types: int,
+    m_hutchinson: int,
+    rng_key: Array,
+    compute_block_A: bool = True,
+    eps: float = 1e-12,
+) -> dict:
+    """Compute the Section-1 probe measures for one checkpoint.
+
+    Args mirror :func:`track_eigenstate`: ``matvec_flat`` maps a flat vector to
+    ``C @ v`` (same curvature operator used by the probe). ``seg`` is the flat
+    coordinate->block map from :func:`build_block_metadata`. Returns a dict of
+    JAX arrays (small except ``d_hat`` is reduced away internally).
+    """
+    upd_flat, _ = ravel_pytree(updates)
+    upd_flat = upd_flat.astype(jnp.float32)
+    dim = upd_flat.shape[0]
+    update_energy = jnp.sum(jnp.square(upd_flat)) + eps
+    f32 = jnp.float32
+
+    # ---- 1a: participation ratio of each tracked eigenvector ----
+    V = jnp.concatenate([eigenvectors, extra_eigenvectors], axis=0).astype(f32)
+    v2 = jnp.square(V)                                  # (total_keep, dim)
+    row_norm2 = jnp.sum(v2, axis=1) + eps               # ~1 for unit vectors
+    sum4 = jnp.sum(jnp.square(v2), axis=1) + eps
+    pr = jnp.square(row_norm2) / sum4
+    pr_norm = pr / dim
+
+    # eigenvector mass by block then by layer type (fraction of ||v_i||^2)
+    def _block_mass(row_v2):
+        return jax.ops.segment_sum(row_v2, seg, num_segments=n_blocks)
+
+    block_mass = jax.vmap(_block_mass)(v2)              # (total_keep, n_blocks)
+
+    def _type_from_block(bvals):
+        return jax.ops.segment_sum(bvals, type_ids, num_segments=n_types)
+
+    evec_mass_type = jax.vmap(_type_from_block)(block_mass)   # (total_keep, n_types)
+    evec_mass_type = evec_mass_type / row_norm2[:, None]
+
+    # ---- 1b: Hutchinson trace + diagonal estimator (shared with 1c/1d) ----
+    keys = jax.random.split(rng_key, m_hutchinson)
+
+    def _hutch_body(d_sum, key):
+        z = jax.random.rademacher(key, (dim,), dtype=f32)
+        Cz = matvec_flat(z).astype(f32)
+        return d_sum + z * Cz, jnp.vdot(z, Cz)
+
+    d_sum, per_probe = jax.lax.scan(_hutch_body, jnp.zeros((dim,), f32), keys)
+    d_hat = d_sum / jnp.asarray(m_hutchinson, f32)      # unbiased diag(C) estimate
+    tr_C = jnp.mean(per_probe)
+    tr_C_se = jnp.std(per_probe) / jnp.sqrt(jnp.asarray(m_hutchinson, f32))
+    AM = tr_C / dim
+    lambda_max = eigenvalues[0].astype(f32)
+    AM_over_lammax = AM / (lambda_max + eps)
+
+    # ---- full exposure A = Δ^T C Δ / ||Δ||^2 ----
+    CDelta = matvec_flat(upd_flat).astype(f32)
+    A_full = jnp.vdot(upd_flat, CDelta) / update_energy
+    A_over_lammax = A_full / (lambda_max + eps)
+
+    # ---- 1c: per-block energy share, block trace (AM_b), block Rayleigh A_b ----
+    block_energy = jax.ops.segment_sum(jnp.square(upd_flat), seg, num_segments=n_blocks)
+    block_w = block_energy / update_energy
+    block_diag_C = jax.ops.segment_sum(d_hat, seg, num_segments=n_blocks)  # Tr(C_b)
+    block_AM = block_diag_C / jnp.maximum(sizes.astype(f32), 1.0)          # Tr(C_b)/r_b
+
+    if compute_block_A:
+        def _a_body(_carry, b):
+            mask = seg == b
+            e = jnp.where(mask, upd_flat, 0.0)
+            Ce = matvec_flat(e).astype(f32)
+            den = jnp.vdot(e, e)
+            a_b = jnp.where(den > eps, jnp.vdot(e, Ce) / (den + eps), jnp.nan)
+            return _carry, a_b
+
+        _, block_A = jax.lax.scan(_a_body, None, jnp.arange(n_blocks, dtype=jnp.int32))
+    else:
+        block_A = jnp.full((n_blocks,), jnp.nan, dtype=f32)
+
+    # block-diagonal exposure and its residual against the full operator
+    sum_wb_Ab = jnp.nansum(block_w * block_A)
+    sum_wb_AMb = jnp.sum(block_w * block_AM)
+    cross_block_resid = A_full - sum_wb_Ab
+
+    # ---- 1d: layer-type / governance attribution + restricted exposure ----
+    type_energy = jax.ops.segment_sum(block_energy, type_ids, num_segments=n_types)
+    type_energy_frac = type_energy / update_energy
+    namesake_energy = jnp.sum(jnp.where(block_namesake, block_energy, 0.0))
+    fallback_energy = update_energy - eps - namesake_energy
+    namesake_energy_frac = namesake_energy / update_energy
+
+    nm_coord = block_namesake[seg]                     # (dim,) bool over coordinates
+    e_S = jnp.where(nm_coord, upd_flat, 0.0)
+    CeS = matvec_flat(e_S).astype(f32)
+    den_S = jnp.vdot(e_S, e_S)
+    A_restricted = jnp.where(den_S > eps, jnp.vdot(e_S, CeS) / (den_S + eps), jnp.nan)
+    r_S = jnp.sum(jnp.where(block_namesake, sizes.astype(f32), 0.0))
+    tr_C_S = jnp.sum(jnp.where(nm_coord, d_hat, 0.0))
+    AM_S = tr_C_S / jnp.maximum(r_S, 1.0)
+    A_restricted_over_lammax = A_restricted / (lambda_max + eps)
+    AM_S_over_lammax = AM_S / (lambda_max + eps)
+
+    return {
+        # 1a
+        "pr": pr,
+        "pr_norm": pr_norm,
+        "evec_mass_type": evec_mass_type,           # (total_keep, n_types)
+        # 1b
+        "hutch_m": jnp.asarray(m_hutchinson, jnp.int32),
+        "tr_C": tr_C,
+        "tr_C_se": tr_C_se,
+        "AM": AM,
+        "lambda_max": lambda_max,
+        "AM_over_lammax": AM_over_lammax,
+        "A_full": A_full,
+        "A_over_lammax": A_over_lammax,
+        # 1c
+        "block_w": block_w,
+        "block_A": block_A,
+        "block_AM": block_AM,
+        "sum_wb_Ab": sum_wb_Ab,
+        "sum_wb_AMb": sum_wb_AMb,
+        "cross_block_resid": cross_block_resid,
+        # 1d
+        "type_energy_frac": type_energy_frac,       # (n_types,)
+        "namesake_energy_frac": namesake_energy_frac,
+        "A_restricted": A_restricted,
+        "AM_S": AM_S,
+        "A_restricted_over_lammax": A_restricted_over_lammax,
+        "AM_S_over_lammax": AM_S_over_lammax,
+        "r_S": r_S,
+    }

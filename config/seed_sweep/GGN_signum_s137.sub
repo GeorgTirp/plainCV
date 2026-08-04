@@ -1,0 +1,29 @@
+universe   = vanilla
+initialdir = /home/gtirpitz/plainCV
+
+executable = nc_train_lm.sh
+arguments  = config/seed_sweep/lm_signum_seeds.yaml _ ggn
+
+environment = "JOB_IDX=2"
+
+output = job_outputs/GGN_signum_s137.$(Cluster).$(Process).out
+error  = job_outputs/GGN_signum_s137.$(Cluster).$(Process).err
+log    = job_outputs/GGN_signum_s137.$(Cluster).log
+
+request_cpus   = 4
+request_memory = 16384
+request_gpus   = 1
+min_gpu_mem_mb = 80000
+requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb)) \
+                 && !regexp("^(g146|g193|g194|g195)\\.", Machine)
+
+getenv = True
+
++JobBatchName = "ggn-seed-sweep"
+
+MaxTime = 129600
+
+periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+queue 1

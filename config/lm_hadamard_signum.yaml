@@ -1,13 +1,14 @@
-## NI-SOAP LM config — same hyperparameters as SOAP with noise injection added.
-## NI-SOAP injects noise alpha * sqrt(lr / batch_size) * L^{1/2} Z R^{1/2}
-## after each SOAP step to restore SGD's noise energy (Zhu et al. trace constraint).
+## Local LM config (JAX/Flax) — Hadamard-Signum arm (Sec. 2a of the revision plan)
+## Copied verbatim from lm_signum.yaml (same hyperparameters). Only `optim` and the
+## experiment names differ. LR is inherited from Signum for the first pass; per the
+## plan the LR MAY be retuned for this arm (it is the one arm that might need it).
 
 deterministic: False
 seed: 0
 force_cpu: False
 matmul_precision: "highest"
 
-# Dataset
+# Dataset (HuggingFace datasets saved via data/datasets/prepare.py)
 trainset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/train"
 validset_path: "data/datasets/outputs/fwedu/fwedu_sample_10BT_tokenizer_GPT2/tokenized_gpt2/ctx_2048/valid"
 seq_len: 2048
@@ -41,31 +42,21 @@ grad_accumulation_steps: 8
 # choose between {float32, float16, bfloat16}
 dtype: "bfloat16"
 
-optim: ni_soap
+optim: hadamard_signum
 fused_optim: False
-# SOAP hyperparameters (same as tuned SOAP baseline)
-lr: 0.0014718687543895895
-weight_decay: 0.06892581601034377
-beta1: 0.8242820703877661
-beta2: 0.9626309521899796
-eps: 1.329620780745006e-9
-precondition_frequency: 32
-shampoo_beta2: 0.950822405302822
+# Inherited from Signum (see lm_signum.yaml). May be retuned for this arm only.
+lr: 0.00006361387942129539
+weight_decay: 0.217590785906466
+beta1: 0.9
+beta2: 0.95
+signum_momentum: 0.8846546273088175
+signum_nesterov: False
 
-# NI-SOAP specific
-# alpha=1.0: energy-matched SGD noise (Zhu et al.); sweep {0.1, 0.3, 1.0, 3.0}
-ni_soap_alpha: 1.0
-# batch_size = micro_batch_size * grad_accumulation_steps (per-GPU sequences per step)
-# Factory auto-derives this from micro_batch_size * grad_accumulation_steps if unset.
-ni_soap_batch_size: 64
-ni_soap_seed: 0
-
-# --- Generic eigen tracking ---
+# --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
 measurement_momentum: true
 eigen_tracking_every: 576
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_post_soap_refresh: true
 eigen_tracking_topk: 5
 eigen_tracking_extra_modes: 5
 eigen_tracking_curvature_batches: 1
@@ -83,9 +74,6 @@ effective_curvature_tracking_enabled: true
 # --- Revision Section 1 probe measures (participation ratio, AM trace, per-block) ---
 eigen_tracking_hutchinson_probes: 32
 eigen_tracking_block_measures: true
-# Section 4 (SOAP believed-basis vs GGN eigenvectors): the O(k*m^2*n^2) einsum
-# hang was fixed (batched matmul, O(k*m*n*(m+n))). Memory-light, runs under pmap.
-soap_perlayer_sin2_enabled: true
 
 scheduler: "warmup_cosine"
 warmup_steps: 0.05
@@ -100,9 +88,8 @@ print_progress: True
 use_wandb: False
 wandb_project: "llm"
 wandb_dir: "./exp/llm/wandb"
-wandb_run_name: "ni_soap"
-wandb_unique_names: True
-exp_name: "ni_soap"
+wandb_run_name: "GGN_hadamard_signum"
+exp_name: "GGN_hadamard_signum"
 out_dir: "./exp/llm"
 over_write: True
 

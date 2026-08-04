@@ -19,6 +19,7 @@ vit_dropout: 0.2
 vit_use_layernorm: true
 vit_use_batchnorm: false
 
+# Identical SOAP hyperparams to standard run (same trajectory)
 optim: soap
 lr: 0.0003151516887393953
 weight_decay: 0.09006476081934933
@@ -37,25 +38,23 @@ signum_nesterov: false
 precondition_frequency: 25
 shampoo_beta2: 0.851106956428801
 
-# GGN eigentracking — harmonized with config/lm_soap.yaml logging protocol
-# (topk=5, extra_modes=5, lanczos_iters=10, probe_update; post-SOAP-refresh
-# measurement + per-layer sin^2). every=575 (=23*precondition_frequency 25) so
-# the post_soap_refresh alignment check in train.py (every % precond_freq == 0)
-# passes.
+# GGN eigentracking — phase-synchronized measurement
 eigen_tracking_enabled: true
 measurement_momentum: true
-eigen_tracking_every: 575
-eigen_tracking_topk: 5
+eigen_tracking_every: 500
+eigen_tracking_topk: 16
 eigen_tracking_extra_modes: 5
-eigen_tracking_lanczos_iters: 10
+eigen_tracking_lanczos_iters: 48
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_post_soap_refresh: true
-soap_perlayer_sin2_enabled: true
 precond_criterion_enabled: true
+
+# Phase sweep: measure at 5 offsets within ~7 refresh cycles
+eigen_tracking_phase_sweep: true
+eigen_tracking_phase_sweep_num_cycles: 7
 
 # Effective curvature tracking
 effective_curvature_tracking_enabled: true
@@ -68,6 +67,6 @@ effective_curvature_gram_ridge: 1.0e-8
 hessian_probe_enabled: true
 hessian_probe_count: 5
 
-exp_name: "GGN_vit_tinyimagenet_soap"
+exp_name: "GGN_vit_tinyimagenet_soap_refreshphase"
 out_dir: "./exp/vit_tinyimagenet"
 use_wandb: false
