@@ -1,0 +1,29 @@
+universe   = vanilla
+initialdir = /Users/georgtirpitz/Library/CloudStorage/OneDrive-Persönlich/Uni/Master/Research_project/plainCV
+
+executable = nc_train_ggn.sh
+arguments  = config/seed_sweep/vit_tinyimagenet_muon_seeds.yaml _ ggn
+
+environment = "JOB_IDX=1"
+
+output = job_outputs/GGN_vit_muon_s42.$(Cluster).$(Process).out
+error  = job_outputs/GGN_vit_muon_s42.$(Cluster).$(Process).err
+log    = job_outputs/GGN_vit_muon_s42.$(Cluster).log
+
+request_cpus   = 4
+request_memory = 16384
+request_gpus   = 1
+min_gpu_mem_mb = 40000
+requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb)) \
+                 && !regexp("^(g146|g193|g194|g195)\\.", Machine)
+
+getenv = True
+
++JobBatchName = "ggn-vit-seed-sweep"
+
+MaxTime = 129600
+
+periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+queue 1

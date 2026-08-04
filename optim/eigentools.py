@@ -67,6 +67,8 @@ class EigenTrackingState(NamedTuple):
     tracked_update_energy_frac: Array
     tracked_grad_energy_frac: Array
     tracked_update_grad_cosine: Array
+    full_update_grad_cosine: Array   # full-space update–gradient cosine (Eq. 5 first-order alignment)
+    full_update_grad_cos2: Array     # its square
     pos_update_energy_frac: Array
     neg_update_energy_frac: Array
     pos_grad_energy_frac: Array
@@ -187,6 +189,8 @@ def init_eigentracking(
         tracked_update_energy_frac=nan,
         tracked_grad_energy_frac=nan,
         tracked_update_grad_cosine=nan,
+        full_update_grad_cosine=nan,
+        full_update_grad_cos2=nan,
         pos_update_energy_frac=nan,
         neg_update_energy_frac=nan,
         pos_grad_energy_frac=nan,
@@ -992,6 +996,11 @@ def track_eigenstate(
     update_energy = jnp.sum(jnp.square(upd_flat))
     grad_norm = jnp.sqrt(grad_energy)
     update_norm = jnp.sqrt(update_energy)
+    # Full-space update–gradient cosine (Eq. 5 first-order alignment factor).  Same leading-sign
+    # convention as tracked_update_grad_cosine so a descent step gives a positive value.  Computed on
+    # the whole raveled vectors (not the tracked subspace, which holds ~ppm of the update energy).
+    full_update_grad_cosine = -jnp.vdot(upd_flat, grad_flat) / (update_norm * grad_norm + eps)
+    full_update_grad_cos2 = jnp.square(full_update_grad_cosine)
 
     rng_key, lanczos_key = jax.random.split(eigen_state.rng_key)
     k = eigen_state.eigenvalues.shape[0]
@@ -1010,6 +1019,8 @@ def track_eigenstate(
             tracked_update_energy_frac=jnp.array(0.0, dtype=metric_dtype),
             tracked_grad_energy_frac=jnp.array(0.0, dtype=metric_dtype),
             tracked_update_grad_cosine=nan,
+            full_update_grad_cosine=full_update_grad_cosine,
+            full_update_grad_cos2=full_update_grad_cos2,
             topk_eos_rho_max=nan,
             topk_eos_rho_mean=nan,
             topk_eos_rho_update_weighted=nan,
@@ -1362,6 +1373,8 @@ def track_eigenstate(
         tracked_update_energy_frac=tracked_update_energy_frac,
         tracked_grad_energy_frac=tracked_grad_energy_frac,
         tracked_update_grad_cosine=tracked_update_grad_cosine,
+        full_update_grad_cosine=full_update_grad_cosine,
+        full_update_grad_cos2=full_update_grad_cos2,
         pos_update_energy_frac=pos_update_energy_frac,
         neg_update_energy_frac=neg_update_energy_frac,
         pos_grad_energy_frac=pos_grad_energy_frac,
