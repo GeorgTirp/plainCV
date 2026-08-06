@@ -1,0 +1,26 @@
+universe   = vanilla
+initialdir = /lustre/home/gtirpitz/plainCV
+
+executable = nc_train_lm.sh
+arguments  = config/lm_muon.yaml ggn_muon_job_$(Cluster)_$(Process) ggn
+
+output = job_outputs/ggn_muon.$(Cluster).$(Process).out
+error  = job_outputs/ggn_muon.$(Cluster).$(Process).err
+log    = job_outputs/ggn_muon.$(Cluster).log
+
+request_cpus   = 4
+request_memory = 12288
+request_gpus   = 2
+min_gpu_mem_mb = 80000
+requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb)) \
+                 && !regexp("^(g146|g174|g193|g194|g195)\\.", Machine)
+
+getenv = True
+
++JobBatchName = "ggn-muon"
+MaxTime = 129600
+
+periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+queue 1
