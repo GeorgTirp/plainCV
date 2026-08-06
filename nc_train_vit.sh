@@ -1,67 +1,66 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
+#
+# Cluster wrapper for the ViT (image) experiments -> train.py
+#
+# This is the IMAGE counterpart of nc_train_lm.sh / nc_train_ggn.sh, which drive
+# train_lm.py. The two pipelines are deliberately separate entrypoints:
+#
+#     train.py      <- ViT / ResNet / MLP  (this wrapper)
+#     train_lm.py   <- transformer / pythia LM
+#
+# Only the MEASUREMENT protocol is shared (optim/eigentools.py + the eigen-tracking
+# CSV writers in utils.py). Never point a ViT config at train_lm.py: it hard-fails
+# with "LM training expects model='transformer' or 'pythia*'".
+#
+# Usage (HTCondor):
+#   executable  = nc_train_vit.sh
+#   arguments   = <config.yaml>
+#   environment = "JOB_IDX=<idx>"
+#
+# Also accepts the job index positionally for manual runs:
+#   ./nc_train_vit.sh config/vit_tinyimagenet_ggn.yaml 0
 
-REPO_DIR="/lustre/home/gtirpitz/plainCV"
-CONFIG_PATH="${1:?need config path like config/vit_cifar10_ggn.yaml}"
-EXP_NAME="${2:-}"
+cd "$(cd "$(dirname "$0")" && pwd)"
 
-cd "${REPO_DIR}"
+CONFIG="${1:?usage: nc_train_vit.sh <config.yaml> [job_idx]}"
+# Condor passes the index via the environment; allow a positional override.
+JOB_IDX="${JOB_IDX:-${2:-}}"
 
-mkdir -p job_outputs
+module load cuda/12.9 >/dev/null 2>&1 || true
 
-source /etc/profile.d/modules.sh
-module purge
-module load cuda/12.9
-module load cudnn/9.10.2
+if [[ -x ".venv/bin/python" ]]; then
+    PY=".venv/bin/python"
+else
+    PY="python"
+fi
 
-source .venv/bin/activate
-
-export WANDB_DIR="${PWD}/wandb"
-
-prepend_ld_path() {
-  if [[ -d "$1" ]]; then
-    export LD_LIBRARY_PATH="$1:${LD_LIBRARY_PATH:-}"
-  fi
-}
-
-prepend_ld_path "${CUDA_HOME:-/usr/local/cuda}/lib64"
-prepend_ld_path "${CUDA_HOME:-/usr/local/cuda}/extras/CUPTI/lib64"
-
-while IFS= read -r lib_dir; do
-  prepend_ld_path "${lib_dir}"
-done < <(
-  python3 - <<'PY'
-import pathlib, site, sysconfig
-roots = set(site.getsitepackages())
-purelib = sysconfig.get_paths().get("purelib")
-if purelib:
-    roots.add(purelib)
-for root in sorted(roots):
-    nvidia_root = pathlib.Path(root) / "nvidia"
-    if nvidia_root.is_dir():
-        for lib_dir in sorted(nvidia_root.glob("*/lib")):
-            print(lib_dir)
+# --- Guard: refuse to launch an LM config through the image entrypoint. -------
+# Cheap structural check so a mis-wired .sub fails loudly here instead of
+# burning a GPU slot and dying inside train.py.
+MODEL="$("${PY}" - "${CONFIG}" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f) or {}
+print(str(cfg.get("model", "")).strip())
 PY
-)
+)"
+case "${MODEL}" in
+    transformer|pythia*)
+        echo "ERROR: ${CONFIG} has model='${MODEL}', which is an LM config." >&2
+        echo "       Use nc_train_lm.sh / train_lm.py for language-model runs." >&2
+        exit 2
+        ;;
+    "")
+        echo "ERROR: could not read 'model' from ${CONFIG}." >&2
+        exit 2
+        ;;
+esac
 
-module list
+echo "=== ViT run: config=${CONFIG} model=${MODEL} job_idx=${JOB_IDX:-<none>} ==="
 
-echo "HOSTNAME=$(hostname)"
-echo "PWD=${PWD}"
-echo "CONFIG_PATH=${CONFIG_PATH}"
-echo "EXP_NAME=${EXP_NAME:-<config default>}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not set>}"
-echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<not set>}"
-nvidia-smi -L || true
-
-EXTRA_FLAGS=()
-if [[ -n "${EXP_NAME}" ]]; then
-  EXTRA_FLAGS+=(--exp_name="${EXP_NAME}")
+if [[ -n "${JOB_IDX}" ]]; then
+    exec "${PY}" train.py --config="${CONFIG}" --job_idx="${JOB_IDX}"
+else
+    exec "${PY}" train.py --config="${CONFIG}"
 fi
-# JOB_IDX (set by the seed-sweep .sub files) selects one seed from the
-# sweep_keys=["seed"] list in the config; output lands in <exp>/job_idx_<JOB_IDX>.
-if [[ -n "${JOB_IDX:-}" ]]; then
-  EXTRA_FLAGS+=(--job_idx="${JOB_IDX}")
-fi
-
-python3 train.py --config="${CONFIG_PATH}" "${EXTRA_FLAGS[@]}"
