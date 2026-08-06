@@ -1,8 +1,8 @@
 universe   = vanilla
 initialdir = /Users/georgtirpitz/Library/CloudStorage/OneDrive-Persönlich/Uni/Master/Research_project/plainCV
 
-executable = nc_train_ggn.sh
-arguments  = config/seed_sweep/vit_tinyimagenet_soap_seeds.yaml _ ggn
+executable = nc_train_vit.sh
+arguments  = config/seed_sweep/vit_tinyimagenet_soap_seeds.yaml
 
 environment = "JOB_IDX=2"
 
@@ -13,9 +13,9 @@ log    = job_outputs/GGN_vit_soap_s137.$(Cluster).log
 request_cpus   = 4
 request_memory = 16384
 request_gpus   = 1
-min_gpu_mem_mb = 40000
+min_gpu_mem_mb = 80000
 requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb)) \
-                 && !regexp("^(g146|g193|g194|g195)\\.", Machine)
+                 && !regexp("^(g146|g174|g193|g194|g195)\\.", Machine)
 
 getenv = True
 

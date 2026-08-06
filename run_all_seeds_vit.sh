@@ -50,9 +50,15 @@ BID="${BID:-30}"
 CURV_BACKEND="ggn"
 
 # ViT-small on tiny-imagenet is far lighter than the LLM run; override as needed.
+# Match the known-good LM submits (nc_train_ggn_muon.sub / _soap.sub): those
+# require >=80 GB GPUs and steer clear of the same bad nodes. A ViT-small needs
+# far less memory, but landing on the same proven node pool removes an entire
+# class of driver/CUDA-mismatch failures.
 GPUS="${GPUS:-1}"
 REQUEST_MEMORY="${REQUEST_MEMORY:-16384}"
-MIN_GPU_MEM_MB="${MIN_GPU_MEM_MB:-40000}"
+MIN_GPU_MEM_MB="${MIN_GPU_MEM_MB:-80000}"
+# g174 is excluded in the working LM submits but was missing from ours.
+BAD_NODES="${BAD_NODES:-g146|g174|g193|g194|g195}"
 
 if [[ -n "${SEEDS:-}" ]]; then
     read -ra SEED_LIST <<< "${SEEDS}"
@@ -167,7 +173,7 @@ request_memory = ${REQUEST_MEMORY}
 request_gpus   = ${GPUS}
 min_gpu_mem_mb = ${MIN_GPU_MEM_MB}
 requirements   = (TARGET.CUDAGlobalMemoryMb >= \$(min_gpu_mem_mb)) \\
-                 && !regexp("^(g146|g193|g194|g195)\\\\.", Machine)
+                 && !regexp("^(${BAD_NODES})\\\\.", Machine)
 
 getenv = True
 
