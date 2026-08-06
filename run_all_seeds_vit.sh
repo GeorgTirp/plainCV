@@ -94,6 +94,26 @@ echo ""
 mkdir -p job_outputs
 mkdir -p config/seed_sweep
 
+# --- Pre-stage tiny-imagenet before submitting. -------------------------------
+# All jobs share one dataset dir. _ensure_dataset() is lock-protected, so a cold
+# cache is *correct* either way -- but without pre-staging, 20 jobs sit on GPU
+# slots waiting for the one holding the lock to finish downloading. Fetch it once
+# here instead. Non-fatal: the in-job lock still covers us if this can't run.
+if [[ "${SKIP_PRESTAGE:-0}" != "1" && "${DRY_RUN}" != "1" ]]; then
+    echo "Pre-staging tiny-imagenet (SKIP_PRESTAGE=1 to skip) ..."
+    if python3 -c '
+import sys
+sys.path.insert(0, ".")
+from data.tiny_imagenet import _ensure_dataset, DEFAULT_DATA_ROOT
+print("  dataset ready at:", _ensure_dataset(DEFAULT_DATA_ROOT))
+'; then
+        echo ""
+    else
+        echo "WARNING: pre-stage failed; jobs will fetch it themselves (lock-protected)." >&2
+        echo ""
+    fi
+fi
+
 JOB_NUM=0
 
 for opt in "${OPTIMIZERS[@]}"; do

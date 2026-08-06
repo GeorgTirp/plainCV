@@ -1,4 +1,5 @@
 # data/tiny_imagenet.py
+import fcntl
 import os
 from pathlib import Path
 from typing import Iterator, Tuple, Optional
@@ -60,12 +61,34 @@ def _ensure_dataset(data_root: Path) -> Path:
     We avoid relying on the (missing) TFDS builder and instead download the
     official archive if it's not already unpacked. If downloading is blocked,
     the raised error tells the user where to place the files manually.
+
+    Concurrency-safe: a seed sweep launches many jobs at once against this same
+    shared directory. Without a lock they race on one zip -- some extract a
+    half-written archive and die with "failed to extract". We serialize the
+    download/extract behind an exclusive file lock and re-check inside it, so
+    exactly one process fetches and the rest simply wait and reuse the result.
     """
     existing = _find_dataset_dir(data_root)
     if existing:
         return existing
 
     data_root.mkdir(parents=True, exist_ok=True)
+
+    lock_path = data_root / ".tiny_imagenet.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            # Another process may have finished while we waited for the lock.
+            existing = _find_dataset_dir(data_root)
+            if existing:
+                return existing
+            return _download_and_extract(data_root)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _download_and_extract(data_root: Path) -> Path:
+    """Fetch + unpack the archive. Callers must hold the data_root lock."""
     try:
         tf.keras.utils.get_file(
             fname="tiny-imagenet-200.zip",
