@@ -17,11 +17,19 @@ set -euo pipefail
 # seed via JOB_IDX (utils.load_config maps JOB_IDX -> --job_idx -> combos[job_idx]).
 # This is entrypoint-agnostic; train.py (ViT) and train_lm.py (LLM) share load_config.
 #
-# NOTE: `nc_train_ggn.sh` is the cluster-side wrapper (not in the repo, same as
-# `nc_train_lm.sh` for the LLM). It must exist on the cluster and forward the
-# JOB_IDX environment variable to `--job_idx`, matching its nc_train_lm.sh sibling.
-# If your nc_train_ggn.sh uses a different argument convention, adjust the
-# `arguments` line in the generated .sub below.
+# ENTRYPOINT: jobs run `nc_train_vit.sh` -> `train.py`, which is version-controlled
+# in this repo. The image and LM pipelines are kept strictly separate:
+#
+#     train.py      <- ViT / ResNet / MLP  (this sweep)
+#     train_lm.py   <- transformer / pythia LM  (run_all_seeds.sh)
+#
+# Only the MEASUREMENT protocol is shared (optim/eigentools.py + the eigen-tracking
+# CSV writers in utils.py), so both produce identical columns.
+#
+# Do NOT point this at nc_train_ggn.sh / nc_train_lm.sh: despite the "ggn" name
+# (which refers to the curvature backend, not the model) both drive train_lm.py,
+# and a ViT config there dies with
+#   "LM training expects model='transformer' or 'pythia*', got vit."
 #
 # Usage:
 #   ./run_all_seeds_vit.sh              # submit all 21 jobs
@@ -125,8 +133,8 @@ PY
 universe   = vanilla
 initialdir = ${REPO_DIR}
 
-executable = nc_train_ggn.sh
-arguments  = ${SEED_CONFIG} _ ${CURV_BACKEND}
+executable = nc_train_vit.sh
+arguments  = ${SEED_CONFIG}
 
 environment = "JOB_IDX=${idx}"
 
