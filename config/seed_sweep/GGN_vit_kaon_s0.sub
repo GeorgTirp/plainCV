@@ -1,8 +1,8 @@
 universe   = vanilla
-initialdir = /Users/georgtirpitz/Library/CloudStorage/OneDrive-Persönlich/Uni/Master/Research_project/plainCV
+initialdir = /home/gtirpitz/plainCV
 
-executable = nc_train_ggn.sh
-arguments  = config/seed_sweep/vit_tinyimagenet_kaon_seeds.yaml _ ggn
+executable = nc_train_vit.sh
+arguments  = config/seed_sweep/vit_tinyimagenet_kaon_seeds.yaml
 
 environment = "JOB_IDX=0"
 
