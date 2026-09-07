@@ -26,4 +26,9 @@ MaxTime = 129600
 periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
 periodic_hold_reason = "Job runtime exceeded MaxTime"
 
+# nc_train_lm.sh exits 42 when JAX cannot see a GPU (it refuses to burn cluster
+# time training on CPU). Put the job back in the queue on that code so it retries
+# on a healthy node; every other exit code is final.
+on_exit_remove = (ExitBySignal == true) || (ExitCode =!= 42)
+
 queue 1

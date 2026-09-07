@@ -2,7 +2,12 @@
 program: train_lm.py
 method: bayes
 metric:
-  name: eval_loss
+  # NOT `eval_loss`: define_metric("eval_loss", summary="min") stores that as
+  # {"min": ...}, which does not resolve to a number, leaving the sweep with
+  # no objective (server-side bestLoss stayed 0/None). train.py and
+  # train_lm.py log `best_eval_loss` as a running min, so the run summary
+  # holds a plain float that any sweep controller can read.
+  name: best_eval_loss
   goal: minimize
 
 command:

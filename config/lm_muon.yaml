@@ -49,25 +49,41 @@ dtype: "bfloat16"
 optim: muon
 fused_optim: False
 #lr: 0.0049664781711662425
-lr: 0.008721198402419975
-weight_decay: 0.016510933735912593
-beta1: 0.8732925489555765
-beta2: 0.9453534792484316
+lr: 0.006168817382935121
+# lr for the AdamW fallback branch (embeddings, lm_head, norms, biases), tuned
+# independently of `lr` in config/lm_sweep_muon.yaml.
+# Comment out to fall back to the shared `lr`.
+adam_fallback_lr: 0.005376566006191521
+weight_decay: 0.025741976398137977
+beta1: 0.9439299127728824
+beta2: 0.933199474383129
 
-muon_beta: 0.92102295653509
+muon_beta: 0.8814949632665319
 muon_ns_steps: 5
 muon_ns_coeffs: [3.4445, -4.7750, 2.0315]
-muon_nesterov: true
+muon_nesterov: false
 muon_adaptive: false
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
+# OFF at LM scale, on purpose. extract_precond_eigsystem allocates a dense
+# (precond_criterion_max_dirs=40, num_params=162.1M) float32 Q_hat ~= 26 GB
+# on the host at the first tracking step and OOM-holds the job
+# (optim/eigentools.py:739); no request_memory can cover it. Feasible at
+# ViT scale, where config/vit_tinyimagenet_ggn_*.yaml keep it enabled.
+precond_criterion_enabled: false
 measurement_momentum: true
 eigen_tracking_every: 576
+# Shared probe grid for every arm: steps 50, 626, 1202, ...
+# 50 = (precondition_frequency + 2) + precondition_frequency/2 = 34 + 16, which
+# puts SOAP at staleness 16 of 32 (mid-cycle) at EVERY probe, since
+# 576 % 32 == 0. All arms use the identical grid, so cross-arm checkpoint
+# clusters have diameter 0 instead of the old 34.
+eigen_tracking_offset: 50
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_topk: 5
-eigen_tracking_extra_modes: 5
-eigen_tracking_curvature_batches: 1
+eigen_tracking_topk: 1
+eigen_tracking_extra_modes: 0
+eigen_tracking_curvature_batches: 8
 eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false
@@ -82,6 +98,13 @@ effective_curvature_tracking_enabled: true
 # --- Revision Section 1 probe measures (participation ratio, AM trace, per-block) ---
 eigen_tracking_hutchinson_probes: 32
 eigen_tracking_block_measures: true
+# A6 native-frame decomposition (SVD of each namesake block + 2x8 probe draws).
+# The one measurement item that is not free: ~16 extra curvature products and
+# one SVD per routed block per probe.
+native_frame_enabled: false
+native_frame_draws: 8
+# A10 probe-batch transfer: 8 batches held out from the fixed curvature probe.
+probe_transfer_batches: 8
 
 scheduler: null
 warmup_steps: 0.05

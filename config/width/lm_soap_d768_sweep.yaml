@@ -1,0 +1,39 @@
+program: train_lm.py
+method: bayes
+metric:
+  name: best_eval_loss
+  goal: minimize
+command:
+- ${env}
+- ${interpreter}
+- -u
+- ${program}
+- --config=config/width/lm_soap_d768.yaml
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-05
+    max: 0.03
+  adam_fallback_lr:
+    distribution: log_uniform_values
+    min: 1.0e-05
+    max: 0.03
+  d_model:
+    value: 768
+  n_heads:
+    value: 12
+  n_layers:
+    value: 12
+  steps_budget:
+    value: 3000
+  eigen_tracking_enabled:
+    value: false
+  effective_curvature_tracking_enabled:
+    value: false
+  precond_criterion_enabled:
+    value: false
+  use_wandb:
+    value: true
+  wandb_project:
+    value: width-soap-d768-12
+run_cap: 12

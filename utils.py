@@ -333,6 +333,19 @@ def get_exp_dir_path(cfg) -> str:
     exp_name = flag_exp_name or getattr(cfg, "exp_name", None) or default_name
     if exp_name == "run":
         exp_name = default_name
+    # Optional HTCondor run id in the folder name. nc_train_lm.sh rewrites
+    # exp_name to "{backend}_{optim}", so several concurrent measurement jobs
+    # that differ only in a probe setting (e.g. a sweep over
+    # eigen_tracking_curvature_batches) otherwise share one directory and
+    # interleave their rows into a single CSV, with no way to attribute a row to
+    # a run. Set CONDOR_CLUSTER in the .sub to keep them apart. The paper
+    # seed-sweep submits deliberately do not set it, so their layout -- and the
+    # analysis globs over exp/paper_runs/llm/*/job_idx_* -- are unchanged.
+    cluster = os.environ.get("CONDOR_CLUSTER", "").strip()
+    if cluster:
+        proc = os.environ.get("CONDOR_PROCESS", "0").strip() or "0"
+        exp_name = f"{exp_name}_job_{cluster}_{proc}"
+
     exp_dir = os.path.join(out_dir, exp_name)
 
     if FLAGS.job_idx is not None:
@@ -499,6 +512,7 @@ def init_eigen_tracking_csv(
     soap_perlayer_sin2: bool = False,
     muon_topk_energy: bool = False,
     num_2d_layers: int = 0,
+    lanczos_iters: int = 0,
 ) -> str:
     exp_dir = get_exp_dir_path(cfg)
     os.makedirs(exp_dir, exist_ok=True)
@@ -510,6 +524,10 @@ def init_eigen_tracking_csv(
             "tracking_phase_offset",
             "tracking_phase_index",
             "tracking_phase_frac",
+            # Cost accounting for the measurement itself (acceptance: the added
+            # certificate must stay under a fixed fraction of wall clock).
+            "tracking_seconds",
+            "precond_criterion_seconds",
             "refresh_T",
             "refresh_offset",
             "rotation_diff",
@@ -529,8 +547,31 @@ def init_eigen_tracking_csv(
             "probe_acc_before",
             "probe_acc_after",
             "probe_acc_gain",
+            # A10 — batch transfer. probe_loss_reduction above is R_same: it is
+            # measured on the fixed curvature batch, which is also the batch
+            # whose gradient built the update (probe_batch_is_grad_batch == 1).
+            # The *_fresh columns evaluate the same parameter change on batches
+            # disjoint from it.
+            # A4.1 Lanczos tridiagonal: leading j x j submatrix gives the exact
+            # j-iteration Ritz values for every j <= lanczos_iters, and a beta
+            # collapsing to ~0 identifies a breakdown (tiny residual, garbage
+            # Ritz value) that the residual column alone cannot distinguish
+            # from genuine convergence.
+            *[f"lanczos_alpha_{i}" for i in range(lanczos_iters)],
+            *[f"lanczos_beta_{i}" for i in range(lanczos_iters)],
+            "probe_loss_before_fresh",
+            "probe_loss_after_fresh",
+            "probe_loss_reduction_fresh",
+            "probe_loss_reduction_fresh_se",
+            "probe_transfer_n_batches",
+            "probe_batch_is_grad_batch",
             "eval_loss",
             "eval_accuracy",
+            # Train-side counterparts on the *same* probe grid and measured the
+            # same way (eval mode, fixed subset), so generalisation gap is
+            # eval_loss - train_loss_probe row by row.
+            "train_loss_probe",
+            "train_accuracy_probe",
             "grad_norm",
             "update_norm",
             "tracked_update_energy_frac",
@@ -606,9 +647,15 @@ def init_eigen_tracking_csv(
                 "A_Muon_block",
                 "crit_resid",
                 "precond_basis_sin2",
+                # B: M*Cov(phat, a) numerator of the direction-level certificate,
+                # and SOAP's believed-basis staleness at this measurement.
+                "precond_cov_phat_a",
+                "steps_since_precond_refresh",
             ]
             + [f"a_per_dir_{i}" for i in range(num_precond_dirs)]
             + [f"phat_per_dir_{i}" for i in range(num_precond_dirs)]
+            + [f"lambda_hat_per_dir_{i}" for i in range(num_precond_dirs)]
+            + [f"stratum_per_dir_{i}" for i in range(num_precond_dirs)]
             if precond_criterion
             else []
         )
@@ -636,35 +683,50 @@ def init_eigen_tracking_csv(
     return csv_path
 
 
-def _append_precond_criterion_row(tracking_state) -> list:
-    """Return the Exp 1b scalar + per-dir values for one CSV row."""
+_PRECOND_SCALARS = (
+    "A_P_believed",
+    "A_Muon_block",
+    "crit_resid",
+    "precond_basis_sin2",
+    "precond_cov_phat_a",
+    "steps_since_precond_refresh",
+)
+_PRECOND_ARRAYS = ("a_per_dir", "phat_per_dir", "lambda_hat_per_dir", "stratum_per_dir")
+
+
+def _append_precond_criterion_row(
+    tracking_state, num_precond_dirs: int, precond_metrics=None
+) -> list:
+    """Return the Exp 1b scalar + per-dir values for one CSV row.
+
+    Values come from ``precond_metrics`` (the host-driven
+    ``precond_criterion_from_directions`` output) when given, else from the
+    in-JIT ``track_eigenstate`` fields on ``tracking_state``. Arrays are padded
+    to ``num_precond_dirs`` so the row width always matches the header.
+    """
     import jax
     nan_val = float("nan")
+    src = precond_metrics or {}
 
     def _scalar(name: str) -> float:
-        v = getattr(tracking_state, name, nan_val)
+        v = src[name] if name in src else getattr(tracking_state, name, nan_val)
         try:
             return float(jax.device_get(v))
         except Exception:
             return nan_val
 
     def _array(name: str) -> list:
-        v = getattr(tracking_state, name, [])
+        v = src[name] if name in src else getattr(tracking_state, name, [])
         try:
-            return [float(x) for x in jax.device_get(v)]
+            vals = [float(x) for x in jax.device_get(v)]
         except Exception:
-            return []
+            vals = []
+        vals = vals[:num_precond_dirs]
+        return vals + [nan_val] * (num_precond_dirs - len(vals))
 
-    return (
-        [
-            _scalar("A_P_believed"),
-            _scalar("A_Muon_block"),
-            _scalar("crit_resid"),
-            _scalar("precond_basis_sin2"),
-        ]
-        + _array("a_per_dir")
-        + _array("phat_per_dir")
-    )
+    return [_scalar(n) for n in _PRECOND_SCALARS] + [
+        x for n in _PRECOND_ARRAYS for x in _array(n)
+    ]
 
 
 def append_eigen_tracking_row(
@@ -677,8 +739,21 @@ def append_eigen_tracking_row(
     soap_perlayer_sin2: bool = False,
     muon_topk_energy: bool = False,
     num_2d_layers: int = 0,
+    lanczos_iters: int = 0,
+    precond_metrics=None,
 ) -> None:
     measurement_metrics = measurement_metrics or {}
+
+    def _arr(v, n: int) -> list:
+        """n floats from a device array, NaN-padded (A4.1 tridiagonal)."""
+        if n <= 0:
+            return []
+        try:
+            vals = [float(x) for x in jax.device_get(v)]
+        except Exception:
+            vals = []
+        vals = vals[:n]
+        return vals + [float("nan")] * (n - len(vals))
 
     def _metric(name: str) -> float:
         value = measurement_metrics.get(name, float("nan"))
@@ -902,6 +977,8 @@ def append_eigen_tracking_row(
             _metric("tracking_phase_offset"),
             _metric("tracking_phase_index"),
             _metric("tracking_phase_frac"),
+            _metric("tracking_seconds"),
+            _metric("precond_criterion_seconds"),
             _metric("refresh_T"),
             _metric("refresh_offset"),
             float(scalar_rotation),
@@ -921,8 +998,18 @@ def append_eigen_tracking_row(
             _metric("probe_acc_before"),
             _metric("probe_acc_after"),
             _metric("probe_acc_gain"),
+            *_arr(getattr(tracking_state, "lanczos_alpha", None), lanczos_iters),
+            *_arr(getattr(tracking_state, "lanczos_beta", None), lanczos_iters),
+            _metric("probe_loss_before_fresh"),
+            _metric("probe_loss_after_fresh"),
+            _metric("probe_loss_reduction_fresh"),
+            _metric("probe_loss_reduction_fresh_se"),
+            _metric("probe_transfer_n_batches"),
+            _metric("probe_batch_is_grad_batch"),
             _metric("eval_loss"),
             _metric("eval_accuracy"),
+            _metric("train_loss_probe"),
+            _metric("train_accuracy_probe"),
             float(grad_norm),
             float(update_norm),
             float(tracked_update_energy_frac),
@@ -989,7 +1076,9 @@ def append_eigen_tracking_row(
         + [float(x) for x in extra_preconditioned_dir_gain]
         # Experiment 1b columns
         + (
-            _append_precond_criterion_row(tracking_state)
+            _append_precond_criterion_row(
+                tracking_state, num_precond_dirs, precond_metrics
+            )
             if precond_criterion
             else []
         )
@@ -1015,12 +1104,19 @@ def append_eigen_tracking_row(
         writer.writerow(row)
 
 
+# Relative tolerance for the three Section-5 block-ledger closure identities.
+# The sums are float32 segment reductions over ~10^8 coordinates, so round-off
+# alone reaches ~1e-6; anything above this is a partition bug, not arithmetic.
+SECTION1_ID_TOL = 1e-6
+
+
 def init_section1_csv(
     cfg,
     total_keep: int,
     n_blocks: int,
     n_types: int,
     block_meta: dict,
+    namesake_norms: bool = False,
     filename: str = "section1_measures.csv",
 ) -> str:
     """Create the Section-1 measures CSV plus a static per-block tags file.
@@ -1042,6 +1138,29 @@ def init_section1_csv(
             "hutch_m", "tr_C", "tr_C_se", "AM", "lambda_max", "AM_over_lammax",
             # full exposure
             "A_full", "A_over_lammax",
+            # wall-clock cost of this Section-1 measurement
+            "section1_seconds",
+            # A3 — second trace moment and contraharmonic (GD) rung, full space
+            "tr_C2", "tr_C2_se", "CH", "CH_over_lammax",
+            # A1 — full-space gradient energy (acceptance: == sum_b block_gnorm2)
+            "grad_norm2_full",
+            # full-space update energy and first-order gain, the right-hand sides
+            # of the other two block-ledger closure identities
+            "update_energy_full", "grad_update_full",
+            # relative gap of each closure identity; hard acceptance is < 1e-5
+            "id_gnorm2_rel", "id_update_energy_rel", "id_grad_update_rel",
+            # A5 — coordinate-frame allocation vs coupling. Signed pair; do NOT
+            # form a "fraction of excess exposure", both terms can cancel.
+            "A_diag_coord", "cov_term", "cov_term_se", "Gamma_coord", "nnz_frac",
+            "A_diag_coord_check", "A_diag_coord_check_se",
+            # A9 — two-group split (namesake M vs fallback F)
+            "A_fallback", "w_fallback", "Gamma_MF",
+            # A6 — native-frame three-way split (NaN unless native_frame_enabled).
+            # subspace = lambda_bar_Q - AM_S, allocation = A_diag_Q - lambda_bar_Q,
+            # coupling = A_actual_Q - A_diag_Q; the three telescope to
+            # A_actual_Q - AM_S.
+            "lambda_bar_Q", "lambda_bar_Q_se", "A_diag_Q", "A_diag_Q_se",
+            "A_actual_Q",
             # 1d — restricted (namesake-governed) exposure + reference
             "A_restricted", "AM_S", "A_restricted_over_lammax", "AM_S_over_lammax",
             "r_S", "namesake_energy_frac",
@@ -1059,6 +1178,32 @@ def init_section1_csv(
         + [f"block_w_{b}" for b in range(n_blocks)]
         + [f"block_A_{b}" for b in range(n_blocks)]
         + [f"block_AM_{b}" for b in range(n_blocks)]
+        # A1/A2 — per-block gradient energy and signed descent cosine
+        + [f"block_gnorm2_{b}" for b in range(n_blocks)]
+        + [f"block_cos_{b}" for b in range(n_blocks)]
+        # Section-5 ledger: un-normalised ||Delta_b||^2 and the raw -<g_b, Delta_b>
+        + [f"block_energy_{b}" for b in range(n_blocks)]
+        + [f"block_grad_update_{b}" for b in range(n_blocks)]
+        # A7 / A8 — per-block step-size coefficients
+        + [f"block_norm_{b}" for b in range(n_blocks)]
+        + [f"block_s_rms_{b}" for b in range(n_blocks)]
+        + [f"kappa_b_{b}" for b in range(n_blocks)]
+        # A6 / A8-exact — per-block SVD diagnostics on the namesake blocks
+        + [f"block_numerical_rank_{b}" for b in range(n_blocks)]
+        + [f"block_kappa_pred_{b}" for b in range(n_blocks)]
+        + [f"block_eps_NS_{b}" for b in range(n_blocks)]
+        + [f"block_p_spread_{b}" for b in range(n_blocks)]
+        + [f"block_p_max_r_{b}" for b in range(n_blocks)]
+        # A4 — matrix norms on namesake blocks (NaN elsewhere), flag-gated
+        + (
+            [f"block_g_fro_{b}" for b in range(n_blocks)]
+            + [f"block_g_nuc_{b}" for b in range(n_blocks)]
+            + [f"block_g_nuc_k_{b}" for b in range(n_blocks)]
+            + [f"block_d_sigma_{b}" for b in range(n_blocks)]
+            + [f"block_r_{b}" for b in range(n_blocks)]
+            if namesake_norms
+            else []
+        )
     )
     with open(csv_path, "w", newline="") as f:
         csv.writer(f).writerow(header)
@@ -1093,8 +1238,16 @@ def append_section1_row(
     total_keep: int,
     n_blocks: int,
     n_types: int,
+    namesake_norms: dict = None,
+    section1_seconds: float = float("nan"),
 ) -> None:
-    """Append one Section-1 measures row from the ``section1_measures`` output."""
+    """Append one Section-1 measures row from the ``section1_measures`` output.
+
+    ``namesake_norms`` is the (host-side) output of
+    :func:`optim.eigentools.namesake_matrix_norms`, or None when A4 is disabled;
+    it must be passed exactly when ``init_section1_csv`` was called with
+    ``namesake_norms=True``, so the row width matches the header.
+    """
     g = {k: jax.device_get(v) for k, v in out.items()}
 
     def s(name: str) -> float:
@@ -1110,6 +1263,18 @@ def append_section1_row(
     bw = np.asarray(g.get("block_w", []), dtype=float).ravel()
     bA = np.asarray(g.get("block_A", []), dtype=float).ravel()
     bAM = np.asarray(g.get("block_AM", []), dtype=float).ravel()
+    bgn2 = np.asarray(g.get("block_gnorm2", []), dtype=float).ravel()
+    bcos = np.asarray(g.get("block_cos", []), dtype=float).ravel()
+    ben = np.asarray(g.get("block_energy", []), dtype=float).ravel()
+    bgu = np.asarray(g.get("block_grad_update", []), dtype=float).ravel()
+    bnorm = np.asarray(g.get("block_norm", []), dtype=float).ravel()
+    bsrms = np.asarray(g.get("block_s_rms", []), dtype=float).ravel()
+    bkap = np.asarray(g.get("kappa_b", []), dtype=float).ravel()
+    bnr = np.asarray(g.get("block_numerical_rank", []), dtype=float).ravel()
+    bkp = np.asarray(g.get("block_kappa_pred", []), dtype=float).ravel()
+    bns = np.asarray(g.get("block_eps_NS", []), dtype=float).ravel()
+    bps = np.asarray(g.get("block_p_spread", []), dtype=float).ravel()
+    bpm = np.asarray(g.get("block_p_max_r", []), dtype=float).ravel()
 
     def _pad(a, n):
         a = list(a[:n])
@@ -1121,6 +1286,16 @@ def append_section1_row(
             int(s("hutch_m")), s("tr_C"), s("tr_C_se"), s("AM"), s("lambda_max"),
             s("AM_over_lammax"),
             s("A_full"), s("A_over_lammax"),
+            float(section1_seconds),
+            s("tr_C2"), s("tr_C2_se"), s("CH"), s("CH_over_lammax"),
+            s("grad_norm2_full"),
+            s("update_energy_full"), s("grad_update_full"),
+            s("id_gnorm2_rel"), s("id_update_energy_rel"), s("id_grad_update_rel"),
+            s("A_diag_coord"), s("cov_term"), s("cov_term_se"), s("Gamma_coord"),
+            s("nnz_frac"), s("A_diag_coord_check"), s("A_diag_coord_check_se"),
+            s("A_fallback"), s("w_fallback"), s("Gamma_MF"),
+            s("lambda_bar_Q"), s("lambda_bar_Q_se"), s("A_diag_Q"),
+            s("A_diag_Q_se"), s("A_actual_Q"),
             s("A_restricted"), s("AM_S"), s("A_restricted_over_lammax"),
             s("AM_S_over_lammax"), s("r_S"), s("namesake_energy_frac"),
             s("sum_wb_Ab"), s("sum_wb_AMb"), s("cross_block_resid"),
@@ -1132,9 +1307,48 @@ def append_section1_row(
         + _pad(bw, n_blocks)
         + _pad(bA, n_blocks)
         + _pad(bAM, n_blocks)
+        + _pad(bgn2, n_blocks)
+        + _pad(bcos, n_blocks)
+        + _pad(ben, n_blocks)
+        + _pad(bgu, n_blocks)
+        + _pad(bnorm, n_blocks)
+        + _pad(bsrms, n_blocks)
+        + _pad(bkap, n_blocks)
+        + _pad(bnr, n_blocks)
+        + _pad(bkp, n_blocks)
+        + _pad(bns, n_blocks)
+        + _pad(bps, n_blocks)
+        + _pad(bpm, n_blocks)
     )
+    if namesake_norms is not None:
+        for key in (
+            "block_g_fro", "block_g_nuc", "block_g_nuc_k", "block_d_sigma", "block_r"
+        ):
+            row += _pad(
+                np.asarray(namesake_norms.get(key, []), dtype=float).ravel(), n_blocks
+            )
     with open(csv_path, "a", newline="") as f:
         csv.writer(f).writerow(row)
+
+    # Hard acceptance: the block partition must account for every coordinate of
+    # both g and Delta. Checked after the row is written so the offending values
+    # survive on disk for diagnosis. NaN means the gradient channel was disabled
+    # (grads=None), which is a separate condition and not a partition failure.
+    gaps = {
+        "sum_b ||g_b||^2 == ||g||^2": s("id_gnorm2_rel"),
+        "sum_b ||Delta_b||^2 == ||Delta||^2": s("id_update_energy_rel"),
+        "sum_b <g_b,Delta_b> == <g,Delta>": s("id_grad_update_rel"),
+    }
+    bad = {k: v for k, v in gaps.items() if np.isfinite(v) and v > SECTION1_ID_TOL}
+    if bad:
+        detail = "; ".join(f"{k}: relative gap {v:.3e}" for k, v in bad.items())
+        raise RuntimeError(
+            f"Section-1 block ledger failed its closure identities at step "
+            f"{int(global_step)} (tolerance {SECTION1_ID_TOL:g}): {detail}. The "
+            f"per-block partition does not sum to the full-space quantity, so no "
+            f"block-level result from this run is trustworthy. Row was still "
+            f"written to {csv_path}."
+        )
 
 
 def init_hessian_probe_csv(

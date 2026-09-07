@@ -1,0 +1,51 @@
+program: train_lm.py
+method: bayes
+metric:
+  name: best_eval_loss
+  goal: minimize
+command:
+- ${env}
+- ${interpreter}
+- -u
+- ${program}
+- --config=config/lm_kaon.yaml
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-06
+    max: 0.03
+  adam_fallback_lr:
+    distribution: log_uniform_values
+    min: 1.0e-06
+    max: 0.03
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.3
+  beta1:
+    distribution: uniform
+    min: 0.85
+    max: 0.95
+  beta2:
+    distribution: uniform
+    min: 0.92
+    max: 0.995
+  muon_beta:
+    distribution: uniform
+    min: 0.85
+    max: 0.99
+  muon_nesterov:
+    value: false
+  kaon_sv_dist:
+    value: halfnormal
+  eigen_tracking_enabled:
+    value: false
+  effective_curvature_tracking_enabled:
+    value: false
+  use_wandb:
+    value: true
+  precond_criterion_enabled:
+    value: false
+  wandb_project:
+    value: tune-kaon-lm-fwedu-16
+run_cap: 16

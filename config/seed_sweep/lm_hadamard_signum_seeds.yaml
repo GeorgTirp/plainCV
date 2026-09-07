@@ -32,13 +32,14 @@ grad_accumulation_steps: 8
 dtype: bfloat16
 optim: hadamard_signum
 fused_optim: false
-lr: 6.361387942129539e-05
-weight_decay: 0.217590785906466
+lr: 3.808574605795532e-05
+weight_decay: 0.2463639336919812
 beta1: 0.9
 beta2: 0.95
-signum_momentum: 0.8846546273088175
+signum_momentum: 0.8792230153656504
 signum_nesterov: false
 eigen_tracking_enabled: true
+precond_criterion_enabled: false
 measurement_momentum: true
 eigen_tracking_every: 576
 eigen_tracking_measurement_mode: probe_update

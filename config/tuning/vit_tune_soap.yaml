@@ -1,0 +1,54 @@
+program: train.py
+method: bayes
+metric:
+  name: best_eval_loss
+  goal: minimize
+command:
+- ${env}
+- ${interpreter}
+- -u
+- ${program}
+- --config=config/vit_tinyimagenet_ggn_soap.yaml
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5.0e-05
+    max: 0.005
+  adam_fallback_lr:
+    distribution: log_uniform_values
+    min: 1.0e-05
+    max: 0.005
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.1
+  beta1:
+    distribution: uniform
+    min: 0.75
+    max: 0.95
+  beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.999
+  shampoo_beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.999
+  precondition_frequency:
+    values:
+    - 25
+  eigen_tracking_enabled:
+    value: false
+  effective_curvature_tracking_enabled:
+    value: false
+  num_epochs:
+    value: 30
+  use_wandb:
+    value: true
+  wandb_project:
+    value: tune-soap-vit-tinyimagenet-16
+  precond_criterion_enabled:
+    value: false
+  hessian_probe_enabled:
+    value: false
+run_cap: 16

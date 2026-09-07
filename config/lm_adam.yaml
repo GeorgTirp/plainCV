@@ -51,10 +51,10 @@ dtype: "bfloat16"
 optim: adam
 fused_optim: False
 #lr: 0.00019457109803718195
-lr: 0.00034171387260699556
-weight_decay: 0.027816321283115952
-beta1: 0.8598532157519392
-beta2: 0.9131686189635
+lr: 0.0003592023360942209
+weight_decay: 0.11149982454104584
+beta1: 0.8387750187730029
+beta2: 0.8676855953493199
 
 
 
@@ -62,10 +62,16 @@ beta2: 0.9131686189635
 eigen_tracking_enabled: true
 measurement_momentum: true
 eigen_tracking_every: 576
+# Shared probe grid for every arm: steps 50, 626, 1202, ...
+# 50 = (precondition_frequency + 2) + precondition_frequency/2 = 34 + 16, which
+# puts SOAP at staleness 16 of 32 (mid-cycle) at EVERY probe, since
+# 576 % 32 == 0. All arms use the identical grid, so cross-arm checkpoint
+# clusters have diameter 0 instead of the old 34.
+eigen_tracking_offset: 50
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_topk: 5
-eigen_tracking_extra_modes: 5
-eigen_tracking_curvature_batches: 1
+eigen_tracking_topk: 1
+eigen_tracking_extra_modes: 0
+eigen_tracking_curvature_batches: 8
 eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false
@@ -80,10 +86,24 @@ effective_curvature_tracking_enabled: true
 # --- Revision Section 1 probe measures (participation ratio, AM trace, per-block) ---
 eigen_tracking_hutchinson_probes: 32
 eigen_tracking_block_measures: true
-# Disabled at LM (162M-param) scale: extract_precond_eigsystem builds a dense
-# (precond_criterion_max_dirs, num_params) host array (~26 GB) at the first
-# tracking step, which OOM-holds the job. See optim/eigentools.py.
-precond_criterion_enabled: false
+# A6 native-frame decomposition (SVD of each namesake block + 2x8 probe draws).
+# The one measurement item that is not free: ~16 extra curvature products and
+# one SVD per routed block per probe.
+native_frame_enabled: false
+native_frame_draws: 8
+# A10 probe-batch transfer: 8 batches held out from the fixed curvature probe.
+probe_transfer_batches: 8
+# ON since the sparse rewrite (B). Adam's believed directions are coordinate
+# axes, so extract_precond_directions stores one index per direction and
+# precond_criterion_from_directions builds the one-hot on the fly; the dense
+# (M, 162.1M) float32 Q_hat ~= 26 GB that used to OOM-hold this job is never
+# allocated. Cost is M curvature matvecs per measurement.
+precond_criterion_enabled: true
+# M/2 top + M/2 bottom by believed nu: top-only samples only the stiff end,
+# where the preconditioner is least wrong, so it cannot see calibration.
+precond_criterion_stratified: true
+precond_criterion_max_dirs: 32
+precond_criterion_damping: 1.e-6
 
 scheduler: null
 warmup_steps: 0.05

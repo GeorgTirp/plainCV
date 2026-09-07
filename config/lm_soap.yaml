@@ -49,24 +49,34 @@ dtype: "bfloat16"
 optim: soap
 fused_optim: False
 #lr: 0.00021140560730609868
-lr: 0.0006601861784305773
-weight_decay: 0.02456939618430241
-beta1: 0.8445311418026576
-beta2: 0.976349707978438
-eps: 1.329620780745006e-9
+lr: 0.0005142138854798203
+# lr for the AdamW fallback branch (embeddings, lm_head, norms, biases),
+# tuned independently of `lr` in config/lm_sweep_soap.yaml.
+# Comment out to fall back to the shared `lr`.
+adam_fallback_lr: 0.00031840895804913845
+weight_decay: 0.13914417230329906
+beta1: 0.8625334043673486
+beta2: 0.8665023323380612
+eps: 3.63444592438095e-8
 
 precondition_frequency: 32
-shampoo_beta2: 0.9908117914248408
+shampoo_beta2: 0.8622990269332041
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
 measurement_momentum: true
 eigen_tracking_every: 576
+# Shared probe grid for every arm: steps 50, 626, 1202, ...
+# 50 = (precondition_frequency + 2) + precondition_frequency/2 = 34 + 16, which
+# puts SOAP at staleness 16 of 32 (mid-cycle) at EVERY probe, since
+# 576 % 32 == 0. All arms use the identical grid, so cross-arm checkpoint
+# clusters have diameter 0 instead of the old 34.
+eigen_tracking_offset: 50
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_post_soap_refresh: true
-eigen_tracking_topk: 5
-eigen_tracking_extra_modes: 5
-eigen_tracking_curvature_batches: 1
+eigen_tracking_post_soap_refresh: false
+eigen_tracking_topk: 1
+eigen_tracking_extra_modes: 0
+eigen_tracking_curvature_batches: 8
 eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false
@@ -78,10 +88,18 @@ wasserstein_laplacian_ridge: 1.e-4
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 effective_curvature_tracking_enabled: true
-# Disabled at LM (162M-param) scale: extract_precond_eigsystem builds a dense
-# (precond_criterion_max_dirs, num_params) host array (~26 GB) at the first
-# tracking step, which OOM-holds the job. See optim/eigentools.py.
-precond_criterion_enabled: false
+# ON since the sparse rewrite (B). extract_precond_directions keeps SOAP's
+# believed basis in its Kronecker generator form (u_i, v_j per direction) and
+# precond_criterion_from_directions materializes one direction at a time as a
+# params-shaped pytree, so the dense (M, 162.1M) float32 Q_hat ~= 26 GB that
+# used to OOM-hold this job is never allocated. Cost is M curvature matvecs per
+# measurement.
+precond_criterion_enabled: true
+# M/2 top + M/2 bottom of the believed spectrum: top-only samples only the stiff
+# end, where the preconditioner is least wrong, so it cannot see calibration.
+precond_criterion_stratified: true
+precond_criterion_max_dirs: 32
+precond_criterion_damping: 1.e-6
 # Section 4 (SOAP believed-basis vs GGN eigenvectors): the O(k*m^2*n^2) einsum
 # hang was fixed (compute_soap_perlayer_sin2 now uses two batched matmuls,
 # O(k*m*n*(m+n))). It is memory-light and now runs under pmap, so enable it.
@@ -89,6 +107,13 @@ soap_perlayer_sin2_enabled: true
 # --- Revision Section 1 probe measures (participation ratio, AM trace, per-block) ---
 eigen_tracking_hutchinson_probes: 32
 eigen_tracking_block_measures: true
+# A6 native-frame decomposition (SVD of each namesake block + 2x8 probe draws).
+# The one measurement item that is not free: ~16 extra curvature products and
+# one SVD per routed block per probe.
+native_frame_enabled: false
+native_frame_draws: 8
+# A10 probe-batch transfer: 8 batches held out from the fixed curvature probe.
+probe_transfer_batches: 8
 
 scheduler: "warmup_cosine"
 warmup_steps: 0.05

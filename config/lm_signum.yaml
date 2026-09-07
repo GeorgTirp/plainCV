@@ -47,21 +47,33 @@ dtype: "bfloat16"
 optim: signum
 fused_optim: False
 #lr: 3.622632222670203e-05
-lr: 0.00006361387942129539
-weight_decay: 0.217590785906466
+lr: 0.00011015669479950736
+weight_decay: 0.028960809921711756
 beta1: 0.9
 beta2: 0.95
-signum_momentum: 0.8846546273088175
+signum_momentum: 0.9053188005701304
 signum_nesterov: False
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
+# OFF at LM scale, on purpose. extract_precond_eigsystem allocates a dense
+# (precond_criterion_max_dirs=40, num_params=162.1M) float32 Q_hat ~= 26 GB
+# on the host at the first tracking step and OOM-holds the job
+# (optim/eigentools.py:739); no request_memory can cover it. Feasible at
+# ViT scale, where config/vit_tinyimagenet_ggn_*.yaml keep it enabled.
+precond_criterion_enabled: false
 measurement_momentum: true
 eigen_tracking_every: 576
+# Shared probe grid for every arm: steps 50, 626, 1202, ...
+# 50 = (precondition_frequency + 2) + precondition_frequency/2 = 34 + 16, which
+# puts SOAP at staleness 16 of 32 (mid-cycle) at EVERY probe, since
+# 576 % 32 == 0. All arms use the identical grid, so cross-arm checkpoint
+# clusters have diameter 0 instead of the old 34.
+eigen_tracking_offset: 50
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_topk: 5
-eigen_tracking_extra_modes: 5
-eigen_tracking_curvature_batches: 1
+eigen_tracking_topk: 1
+eigen_tracking_extra_modes: 0
+eigen_tracking_curvature_batches: 8
 eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false
@@ -76,6 +88,13 @@ effective_curvature_tracking_enabled: true
 # --- Revision Section 1 probe measures (participation ratio, AM trace, per-block) ---
 eigen_tracking_hutchinson_probes: 32
 eigen_tracking_block_measures: true
+# A6 native-frame decomposition (SVD of each namesake block + 2x8 probe draws).
+# The one measurement item that is not free: ~16 extra curvature products and
+# one SVD per routed block per probe.
+native_frame_enabled: false
+native_frame_draws: 8
+# A10 probe-batch transfer: 8 batches held out from the fixed curvature probe.
+probe_transfer_batches: 8
 
 scheduler: "warmup_cosine"
 warmup_steps: 0.05

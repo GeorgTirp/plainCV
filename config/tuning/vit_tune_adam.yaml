@@ -1,0 +1,43 @@
+program: train.py
+method: bayes
+metric:
+  name: best_eval_loss
+  goal: minimize
+command:
+- ${env}
+- ${interpreter}
+- -u
+- ${program}
+- --config=config/vit_tinyimagenet_ggn.yaml
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5.0e-05
+    max: 0.005
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.1
+  beta1:
+    distribution: uniform
+    min: 0.8
+    max: 0.95
+  beta2:
+    distribution: uniform
+    min: 0.9
+    max: 0.999
+  eigen_tracking_enabled:
+    value: false
+  effective_curvature_tracking_enabled:
+    value: false
+  num_epochs:
+    value: 30
+  use_wandb:
+    value: true
+  wandb_project:
+    value: tune-adam-vit-tinyimagenet-16
+  precond_criterion_enabled:
+    value: false
+  hessian_probe_enabled:
+    value: false
+run_cap: 16

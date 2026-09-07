@@ -1,0 +1,31 @@
+universe   = vanilla
+initialdir = /lustre/home/gtirpitz/plainCV
+
+executable = nc_train_lm.sh
+arguments  = config/smoke/lm_memgate_fix_cb8.yaml LAMCHK_cb8 ggn
+
+environment = "JOB_IDX=0 CONDOR_CLUSTER=$(Cluster) CONDOR_PROCESS=$(Process)"
+
+output = job_outputs/LAMCHK_cb8.$(Cluster).$(Process).out
+error  = job_outputs/LAMCHK_cb8.$(Cluster).$(Process).err
+log    = job_outputs/LAMCHK_cb8.$(Cluster).log
+
+request_cpus   = 4
+request_memory = 24576
+request_gpus   = 1
+min_gpu_mem_mb = 80000
+requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb)) \
+                 && !regexp("^(g146|g193|g194|g195)\\.", Machine)
+
+getenv = True
+
++JobBatchName = "ab-smoke"
+
+MaxTime = 21600
+
+periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+on_exit_remove = (ExitBySignal == true) || (ExitCode =!= 42)
+
+queue 1

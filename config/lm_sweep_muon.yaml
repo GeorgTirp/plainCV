@@ -1,0 +1,75 @@
+# W&B Bayesian sweep — Muon on the LM (train_lm.py).
+# Register with:  wandb sweep config/lm_sweep_muon.yaml
+# Then update nc_sweep_muon.sub with the returned sweep ID.
+#
+# Muon runs on the routed 2D kernels only; embeddings, lm_head, norms and biases
+# fall back to AdamW. `lr` and `adam_fallback_lr` are sampled independently so
+# the two branches are not forced onto a shared optimum.
+program: train_lm.py
+method: bayes
+metric:
+  # NOT `eval_loss`: define_metric("eval_loss", summary="min") stores that as
+  # {"min": ...}, which does not resolve to a number, leaving the sweep with
+  # no objective (server-side bestLoss stayed 0/None). train.py and
+  # train_lm.py log `best_eval_loss` as a running min, so the run summary
+  # holds a plain float that any sweep controller can read.
+  name: best_eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/lm_muon.yaml
+
+parameters:
+  # Use names that match keys in the base config YAML.
+  # lr drives the Muon (2D kernel) branch only.
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 3.0e-2
+
+  # Independent lr for the AdamW fallback branch (embeddings, lm_head, norms,
+  # biases).
+  adam_fallback_lr:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 3.0e-2
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.30
+
+  beta1:
+    distribution: uniform
+    min: 0.85
+    max: 0.95
+
+  beta2:
+    distribution: uniform
+    min: 0.92
+    max: 0.995
+
+  muon_beta:
+    distribution: uniform
+    min: 0.85
+    max: 0.99
+
+  muon_nesterov:
+    value: false
+
+  # Curvature measurement is a post-tuning protocol — far too expensive to carry
+  # through a sweep (config/lm_muon.yaml enables it for the paper runs).
+  eigen_tracking_enabled:
+    value: false
+
+  effective_curvature_tracking_enabled:
+    value: false
+
+  use_wandb:
+    value: true
+
+run_cap: 24

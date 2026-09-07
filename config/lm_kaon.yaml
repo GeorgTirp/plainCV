@@ -46,15 +46,19 @@ dtype: "bfloat16"
 optim: kaon
 fused_optim: False
 # Inherited verbatim from Muon (see lm_muon.yaml); not retuned.
-lr: 0.008721198402419975
-weight_decay: 0.016510933735912593
-beta1: 0.8732925489555765
-beta2: 0.9453534792484316
+lr: 0.005618966095345044
+# lr for the AdamW fallback branch (embeddings, lm_head, norms, biases), tuned
+# independently of `lr` in config/lm_sweep_kaon.yaml.
+# Comment out to fall back to the shared `lr`.
+adam_fallback_lr: 0.0009790168681682325
+weight_decay: 0.06915012753520602
+beta1: 0.8945588884874422
+beta2: 0.9624344365125296
 
-muon_beta: 0.92102295653509
+muon_beta: 0.899692436989686
 muon_ns_steps: 5
 muon_ns_coeffs: [3.4445, -4.7750, 2.0315]
-muon_nesterov: true
+muon_nesterov: false
 muon_adaptive: false
 # Kaon-specific: distribution for the random positive singular values.
 # {"halfnormal" -> |N(0,1)|, "exp" -> Exp(1)}; normalized to unit RMS.
@@ -62,12 +66,24 @@ kaon_sv_dist: "halfnormal"
 
 # --- Generic eigen tracking (works with any optimizer) ---
 eigen_tracking_enabled: true
+# OFF at LM scale, on purpose. extract_precond_eigsystem allocates a dense
+# (precond_criterion_max_dirs=40, num_params=162.1M) float32 Q_hat ~= 26 GB
+# on the host at the first tracking step and OOM-holds the job
+# (optim/eigentools.py:739); no request_memory can cover it. Feasible at
+# ViT scale, where config/vit_tinyimagenet_ggn_*.yaml keep it enabled.
+precond_criterion_enabled: false
 measurement_momentum: true
 eigen_tracking_every: 576
+# Shared probe grid for every arm: steps 50, 626, 1202, ...
+# 50 = (precondition_frequency + 2) + precondition_frequency/2 = 34 + 16, which
+# puts SOAP at staleness 16 of 32 (mid-cycle) at EVERY probe, since
+# 576 % 32 == 0. All arms use the identical grid, so cross-arm checkpoint
+# clusters have diameter 0 instead of the old 34.
+eigen_tracking_offset: 50
 eigen_tracking_measurement_mode: probe_update
-eigen_tracking_topk: 5
-eigen_tracking_extra_modes: 5
-eigen_tracking_curvature_batches: 1
+eigen_tracking_topk: 1
+eigen_tracking_extra_modes: 0
+eigen_tracking_curvature_batches: 8
 eigen_tracking_lanczos_iters: 10
 eigen_tracking_backend: ggn
 eigen_tracking_sort_by_abs: false

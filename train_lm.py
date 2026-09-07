@@ -62,9 +62,12 @@ from optim.eigentools import (
     init_eigentracking,
     track_eigenstate,
     extract_momentum_pytree,
-    extract_precond_eigsystem,
     compute_soap_perlayer_sin2,
     compute_muon_topk_energy,
+    namesake_matrix_norms,
+    extract_precond_directions,
+    precond_criterion_from_directions,
+    soap_steps_since_refresh,
 )
 from optim.factory import get_optimizer, build_lm_dynamic_curvature_matvec_fn
 from utils import (
@@ -562,10 +565,12 @@ def _make_probe_measurement_fn(
                 probe_attn_mask,
             )
 
+        # Sequential over microbatches: a Python loop here unrolls inside jit and
+        # holds N sets of logits (8*2048*50257 = 3.07 GiB fp32 each) live at once.
         num_probe_batches = int(probe_inputs.shape[0])
-        loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
-        acc_sum = jnp.asarray(0.0, dtype=jnp.float32)
-        for i in range(num_probe_batches):
+
+        def _loss_body(i, carry):
+            loss_sum, acc_sum = carry
             batch_attn_mask = None if probe_attn_mask is None else probe_attn_mask[i]
             loss_i, acc_i = probe_loss_acc_for_batch(
                 params,
@@ -573,8 +578,14 @@ def _make_probe_measurement_fn(
                 probe_labels[i],
                 batch_attn_mask,
             )
-            loss_sum = loss_sum + loss_i
-            acc_sum = acc_sum + acc_i
+            return loss_sum + loss_i, acc_sum + acc_i
+
+        loss_sum, acc_sum = jax.lax.fori_loop(
+            0,
+            num_probe_batches,
+            _loss_body,
+            (jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(0.0, dtype=jnp.float32)),
+        )
         scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
         return loss_sum / scale, acc_sum / scale
 
@@ -588,21 +599,28 @@ def _make_probe_measurement_fn(
                 probe_attn_mask,
             )
         else:
+            # Same unroll as above, but fwd+bwd per microbatch -- the dominant
+            # term. Mean over all microbatches is unchanged.
             num_probe_batches = int(probe_inputs.shape[0])
-            grads_sum = None
-            for i in range(num_probe_batches):
-                batch_attn_mask = None if probe_attn_mask is None else probe_attn_mask[i]
+
+            def _grad_body(i, grads_sum):
+                batch_attn_mask = (
+                    None if probe_attn_mask is None else probe_attn_mask[i]
+                )
                 grads_i = probe_grad_for_batch(
                     params,
                     probe_inputs[i],
                     probe_labels[i],
                     batch_attn_mask,
                 )
-                grads_sum = grads_i if grads_sum is None else jtu.tree_map(
-                    lambda acc, x: acc + x,
-                    grads_sum,
-                    grads_i,
-                )
+                return jtu.tree_map(lambda acc, x: acc + x, grads_sum, grads_i)
+
+            grads_sum = jax.lax.fori_loop(
+                0,
+                num_probe_batches,
+                _grad_body,
+                jtu.tree_map(jnp.zeros_like, params),
+            )
             scale = jnp.asarray(num_probe_batches, dtype=jnp.float32)
             probe_grads = jtu.tree_map(lambda g: g / scale, grads_sum)
 
@@ -622,6 +640,46 @@ def _make_probe_measurement_fn(
         return probe_grads, probe_updates, measurement_metrics
 
     return compute_probe_measurement
+
+
+def _make_transfer_eval_fn(model, use_doc_mask: bool, transfer_batches):
+    """A10: R_fresh on batches disjoint from the update-generating batch.
+
+    R_same (the logged probe_loss_reduction) is measured on the same fixed batch
+    whose gradient produced the update, so it is a reduction on data that
+    selected the step. R_fresh evaluates the identical parameter change on held
+    out batches. The gap is selection bias / batch transfer -- not memorization,
+    which is a different claim about a different mechanism.
+    """
+    t_inputs, t_labels, t_attn = transfer_batches
+    n_transfer = int(t_inputs.shape[0])
+
+    def _loss_on(params, i):
+        attn = None
+        if t_attn is not None and use_doc_mask:
+            attn = t_attn[i]
+        logits = model.apply(
+            {"params": params}, t_inputs[i], attn_mask=attn, deterministic=True
+        )
+        loss, _acc = _loss_and_acc(logits, t_labels[i])
+        return loss
+
+    @jax.jit
+    def transfer_reduction(params, updates):
+        params_after = optax.apply_updates(params, updates)
+        before = jnp.stack([_loss_on(params, i) for i in range(n_transfer)])
+        after = jnp.stack([_loss_on(params_after, i) for i in range(n_transfer)])
+        red = before - after
+        denom = jnp.sqrt(jnp.asarray(n_transfer, jnp.float32))
+        return {
+            "probe_loss_before_fresh": jnp.mean(before),
+            "probe_loss_after_fresh": jnp.mean(after),
+            "probe_loss_reduction_fresh": jnp.mean(red),
+            "probe_loss_reduction_fresh_se": jnp.std(red) / denom,
+            "probe_transfer_n_batches": jnp.asarray(n_transfer, jnp.float32),
+        }
+
+    return transfer_reduction
 
 
 def _make_effective_update_transform_fn(
@@ -763,6 +821,44 @@ def _build_curvature_probe_batch(
     )
 
 
+def _build_transfer_batches(
+    cfg,
+    loader,
+    *,
+    seq_len: int,
+    use_doc_mask: bool,
+    grouped_batches: int,
+    n_transfer: int = 8,
+):
+    """A10: batches held out from the curvature probe, for the transfer check.
+
+    The curvature probe batch B is fixed for the whole run and is *also* the
+    batch whose gradient builds the probe update and on which probe_loss_before
+    / _after are evaluated, so the logged ``probe_loss_reduction`` is R_same:
+    the reduction on the batch that selected the update. These batches continue
+    from the same deterministic iterator past everything the curvature probe
+    consumed, so they are disjoint from B and give R_fresh.
+    """
+    num_probe_batches = int(getattr(cfg, "eigen_tracking_curvature_batches", 1) or 1)
+    it = iter(loader)
+    # Skip exactly what _build_curvature_probe_batch consumed, so B and these
+    # never overlap.
+    for _ in range(num_probe_batches):
+        _skip, it = _next_batch(it, loader, num_batches=grouped_batches)
+    inputs_list, labels_list, attn_list = [], [], []
+    for _ in range(int(n_transfer)):
+        raw, it = _next_batch(it, loader, num_batches=grouped_batches)
+        bi, bl, ba = _prepare_batch(raw, seq_len, use_doc_mask)
+        inputs_list.append(bi)
+        labels_list.append(bl)
+        attn_list.append(ba)
+    return (
+        jnp.stack(inputs_list, axis=0),
+        jnp.stack(labels_list, axis=0),
+        _stack_optional(attn_list),
+    )
+
+
 def _iter_grouped_batches(loader, num_batches: int = 1):
     if num_batches == 1:
         yield from loader
@@ -864,8 +960,30 @@ def _eigen_tracking_phase_info(cfg, completed_step: int) -> tuple[bool, float, f
         raise ValueError(f"Unknown eigen_tracking_schedule: {schedule}")
 
     if not bool(getattr(cfg, "eigen_tracking_post_soap_refresh", False)):
-        should_run = (completed_step % eigen_tracking_every) == 0
-        return should_run, float("nan"), float("nan"), float("nan")
+        # Shared probe grid: every arm fires at the same absolute steps,
+        # completed_step = offset + k * eigen_tracking_every. The offset exists so
+        # that SOAP lands at a chosen point in its preconditioner-staleness cycle
+        # while every other arm stays on the identical grid, which also drops the
+        # cross-arm checkpoint-cluster diameter to 0 (it was 34 when SOAP had its
+        # own +34 grid). Because eigen_tracking_every is a multiple of
+        # precondition_frequency, one offset pins the phase for the whole run.
+        offset = int(getattr(cfg, "eigen_tracking_offset", 0))
+        if offset < 0:
+            raise ValueError("eigen_tracking_offset must be >= 0.")
+        should_run = (
+            completed_step >= offset
+            and ((completed_step - offset) % eigen_tracking_every) == 0
+        )
+        # Report SOAP's realised staleness so "always measured at phase k" is
+        # checkable from the logs instead of being asserted.
+        phase = float("nan")
+        phase_frac = float("nan")
+        if str(getattr(cfg, "optim", "")).lower() in _SOAP_LIKE_OPTIMS:
+            pf = int(getattr(cfg, "precondition_frequency", 0))
+            if pf > 0 and completed_step >= pf + 2:
+                phase = float((completed_step - (pf + 2)) % pf)
+                phase_frac = phase / max(1, pf - 1)
+        return should_run, phase, float("nan"), phase_frac
 
     if str(getattr(cfg, "optim", "")).lower() not in _SOAP_LIKE_OPTIMS:
         raise ValueError(
@@ -957,6 +1075,21 @@ def _probe_pmap_collectives(n_devices: int, timeout_secs: float = 60.0) -> None:
         sys.exit(1)
 
 
+def _peak_device_mem_mib() -> float:
+    """Peak device HBM in MiB, or NaN if the backend does not report it.
+
+    Used to gate the curvature-batch increase: if peak memory roughly doubles as
+    eigen_tracking_curvature_batches goes 1 -> 2 -> 4, the Python for-loop in
+    ggn_matvec is unrolling and holding every microbatch's activations live.
+    """
+    try:
+        stats = jax.local_devices()[0].memory_stats() or {}
+        peak = stats.get("peak_bytes_in_use")
+        return float(peak) / (1024.0 ** 2) if peak is not None else float("nan")
+    except Exception:
+        return float("nan")
+
+
 def _ts() -> str:
     """Compact timestamp for init-phase prints."""
     return time.strftime("%H:%M:%S")
@@ -967,6 +1100,7 @@ def run(cfg):
         raise ValueError(f"LM training expects model='transformer' or 'pythia*', got {cfg.model}.")
 
     optim_name = getattr(cfg, "optim", "?")
+    _optim_key = str(optim_name).lower().strip()
     print(f"[{_ts()}][init] run() started  optim={optim_name}", flush=True)
 
     wb_run = init_wandb(cfg)
@@ -1028,6 +1162,22 @@ def run(cfg):
         # If an optimizer needs curvature, it'll raise later with a clearer message.
         print(f"Warning: could not build curvature_batch: {exc}", flush=True)
 
+    # A10 — probe-batch transfer. Off by default only if explicitly disabled.
+    transfer_batches = None
+    _n_transfer = int(getattr(cfg, "probe_transfer_batches", 8))
+    if _n_transfer > 0:
+        try:
+            transfer_batches = _build_transfer_batches(
+                cfg,
+                trainloader,
+                seq_len=cfg.seq_len,
+                use_doc_mask=use_doc_mask,
+                grouped_batches=grouped_batches,
+                n_transfer=_n_transfer,
+            )
+        except Exception as exc:
+            print(f"Warning: could not build transfer_batches: {exc}", flush=True)
+
     rng = jax.random.PRNGKey(getattr(cfg, "seed", 0))
     print(f"[{_ts()}][init] constructing model...", flush=True)
     model, model_cfg, variables = construct_model(cfg, rng=rng, init_batch_size=cfg.micro_batch_size)
@@ -1084,6 +1234,11 @@ def run(cfg):
     precond_criterion_enabled = bool(getattr(cfg, "precond_criterion_enabled", False))
     precond_criterion_max_dirs = int(getattr(cfg, "precond_criterion_max_dirs", 40))
     precond_criterion_damping = float(getattr(cfg, "precond_criterion_damping", 1e-6))
+    # Stratified = M/2 top + M/2 bottom of the believed spectrum (B2). Top-only
+    # samples just the stiff end, where the preconditioner is least wrong.
+    precond_criterion_stratified = bool(
+        getattr(cfg, "precond_criterion_stratified", True)
+    )
     _soap_perlayer_sin2_lm = (
         eigen_tracking_enabled
         and str(getattr(cfg, "optim", "")).lower() in {"soap", "ni_soap", "ni-soap", "nisoap"}
@@ -1103,6 +1258,7 @@ def run(cfg):
             "{'actual_update', 'probe_update'}."
         )
     compute_probe_measurement = None
+    compute_transfer_reduction = None
     if eigen_tracking_enabled:
         if (
             eigen_tracking_measurement_mode == "probe_update"
@@ -1162,6 +1318,12 @@ def run(cfg):
         _num_precond_dirs_lm = (
             precond_criterion_max_dirs if (precond_criterion_enabled and not use_pmap) else 0
         )
+        if precond_criterion_enabled and use_pmap:
+            print(
+                "[warn] precond_criterion_enabled is ignored under pmap "
+                "(request_gpus=1 for measurement runs).",
+                flush=True,
+            )
         _num_2d_layers_lm = sum(
             1 for l in jax.tree_util.tree_leaves(eigen_params) if l.ndim == 2
         )
@@ -1170,6 +1332,7 @@ def run(cfg):
             k=eigen_tracking_topk,
             extra_modes=eigen_tracking_extra_modes,
             num_precond_dirs=_num_precond_dirs_lm,
+            lanczos_iters=int(eigen_tracking_iters),
             seed=int(getattr(cfg, "seed", 0)),
         )
         if use_pmap:
@@ -1184,6 +1347,7 @@ def run(cfg):
             soap_perlayer_sin2=_soap_perlayer_sin2_lm,
             muon_topk_energy=_muon_topk_energy_lm and not use_pmap,
             num_2d_layers=_num_2d_layers_lm,
+                lanczos_iters=int(eigen_tracking_iters),
         )
 
         # --- Revision Section 1 probe measures (participation ratio, AM trace,
@@ -1197,6 +1361,7 @@ def run(cfg):
             from optim.eigentools import (
                 build_block_metadata as _build_block_metadata,
                 section1_measures as _section1_measures,
+                native_frame_decomposition as _native_frame_decomposition,
             )
             _s1_meta = _build_block_metadata(eigen_params)
             _s1_seg = jnp.asarray(_s1_meta["seg"], dtype=jnp.int32)
@@ -1206,15 +1371,44 @@ def run(cfg):
             _s1_type_ids = jnp.asarray(_s1_meta["type_ids"], dtype=jnp.int32)
             _s1_sizes = jnp.asarray(_s1_meta["sizes"], dtype=jnp.int32)
             _s1_n_blocks = int(_s1_meta["n_blocks"])
+            # Static contiguous (start, size) pairs -- makes the per-block
+            # reductions exact tree reductions instead of a float32 scatter-add
+            # that stagnates past 2**24 coordinates (embedding / lm_head).
+            _s1_slices = _s1_meta["slices"]
+            _s1_gamma2 = jnp.asarray(_s1_meta["gamma2"], dtype=jnp.float32)
+            _s1_polar_r = jnp.asarray(_s1_meta["polar_r"], dtype=jnp.float32)
+            # A7/A8 need the realized per-block learning rate. cfg.lr is a
+            # constant here (optim/factory.py resolves `lr = float(cfg.lr)`, no
+            # schedule), and with_adam_fallback_lr sends namesake blocks to lr
+            # and everything else to adam_fallback_lr, so eta_b is exactly
+            # determined by the routing flag. A7 assumes a single fallback lr;
+            # that holds by construction of the config.
+            _eta_main = float(cfg.lr)
+            _eta_fb = getattr(cfg, "adam_fallback_lr", None)
+            _eta_fb = float(_eta_fb) if _eta_fb is not None else _eta_main
+            _s1_eta_blocks = jnp.where(
+                jnp.asarray(np.array(_s1_meta["namesake"], dtype=bool)),
+                _eta_main,
+                _eta_fb,
+            ).astype(jnp.float32)
+            _s1_native_frame = bool(getattr(cfg, "native_frame_enabled", False))
+            _s1_native_draws = int(getattr(cfg, "native_frame_draws", 8))
             _s1_n_types = int(_s1_meta["n_types"])
             _s1_m_hutch = int(getattr(cfg, "eigen_tracking_hutchinson_probes", 32))
             _s1_block_A = bool(getattr(cfg, "eigen_tracking_block_A", True))
+            # A4 — matrix norms on namesake blocks. Off by default: it adds one
+            # full svdvals per routed 2-D leaf per measurement.
+            _s1_namesake_norms = bool(
+                getattr(cfg, "namesake_norms_enabled", False)
+            )
+            _s1_power_iters = int(getattr(cfg, "namesake_norms_power_iters", 10))
             section1_csv_path = init_section1_csv(
                 cfg,
                 total_keep=eigen_tracking_topk + eigen_tracking_extra_modes,
                 n_blocks=_s1_n_blocks,
                 n_types=_s1_n_types,
                 block_meta=_s1_meta,
+                namesake_norms=_s1_namesake_norms,
             )
 
         if use_pmap:
@@ -1342,17 +1536,30 @@ def run(cfg):
                     precond_criterion_damping=_precond_criterion_damping_lm,
                 )
 
+        # Host-driven Exp-1b certificate (B). The believed basis is kept in its
+        # compact generator form and each direction is materialized one at a
+        # time, so this never allocates the dense (M, num_params) array that
+        # used to OOM-hold the LM Adam/SOAP jobs.
+        run_precond_hvp = None
+        if precond_criterion_enabled and not use_pmap:
+
+            @jax.jit
+            def run_precond_hvp(params, q_pytree, tracking_curvature_batch, key):
+                return eigen_tracking_matvec_fn(
+                    params, q_pytree, key, tracking_curvature_batch
+                )
+
         run_section1 = None
         if _section1_enabled:
             from jax.flatten_util import ravel_pytree as _ravel_pytree
 
             def _section1_impl(
-                params, updates, tracking_curvature_batch,
+                params, updates, grads, tracking_curvature_batch,
                 evecs, extra_evecs, evals, rng_key,
                 seg, namesake, type_ids, sizes, _use_pmap,
             ):
                 _, unravel = _ravel_pytree(params)
-                mk, hk = jax.random.split(rng_key)
+                mk, hk, nk = jax.random.split(rng_key, 3)
 
                 def matvec_flat(v_flat):
                     v_pytree = unravel(v_flat.astype(jnp.float32))
@@ -1364,7 +1571,7 @@ def run(cfg):
                     hv_flat, _ = _ravel_pytree(hv)
                     return hv_flat
 
-                return _section1_measures(
+                _s1_out = _section1_measures(
                     updates,
                     evecs,
                     extra_evecs,
@@ -1378,14 +1585,32 @@ def run(cfg):
                     n_types=_s1_n_types,
                     m_hutchinson=_s1_m_hutch,
                     rng_key=hk,
+                    grads=grads,
                     compute_block_A=_s1_block_A,
+                    block_slices=_s1_slices,
+                    eta_blocks=_s1_eta_blocks,
+                    block_gamma2=_s1_gamma2,
+                    block_polar_r=_s1_polar_r,
                 )
+                if _s1_native_frame:
+                    _s1_out = dict(_s1_out)
+                    _s1_out.update(
+                        _native_frame_decomposition(
+                            _ravel_pytree(updates)[0],
+                            matvec_flat,
+                            _s1_meta,
+                            eta_blocks=_s1_eta_blocks,
+                            rng_key=nk,
+                            n_draws=_s1_native_draws,
+                        )
+                    )
+                return _s1_out
 
             if use_pmap:
                 run_section1 = jax.pmap(
                     partial(_section1_impl, _use_pmap=True),
                     axis_name="data",
-                    in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None),
+                    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, None, None, None),
                 )
             else:
                 run_section1 = jax.jit(
@@ -1402,6 +1627,10 @@ def run(cfg):
                 batch_stats=None,
                 override_weight_decay=0.0,
             )
+            if transfer_batches is not None:
+                compute_transfer_reduction = _make_transfer_eval_fn(
+                    model, use_doc_mask, transfer_batches
+                )
             compute_probe_measurement = _make_probe_measurement_fn(
                 model,
                 tx_no_wd,
@@ -1437,6 +1666,43 @@ def run(cfg):
     train_iter = iter(trainloader)
     global_step = 0
     start_time = time.time()
+    # Running best, logged at every eval so the run summary ends up holding a
+    # plain float. W&B sweeps read the objective off the summary, and
+    # define_metric(..., summary="min") stores eval_loss as {"min": ...}, which
+    # does not resolve to a number -- see config/*_sweep_*.yaml.
+    best_eval_loss = float("inf")
+
+    def _split_metrics(params, loader, max_batches=None):
+        """Mean (loss, acc) over a split, using the eval path.
+
+        Used both for the periodic eval and for the eigen-tracking probe grid.
+        Passing the train loader gives a train-side number computed with exactly
+        the same estimator, so eval - train is a like-for-like gap. The loaders
+        are sequential, so a capped pass is the same subset at every checkpoint.
+        """
+        total_loss = 0.0
+        total_acc = 0.0
+        n_batches = 0
+        for batch in _iter_grouped_batches(loader, num_batches=grouped_batches):
+            if max_batches is not None and n_batches >= max_batches:
+                break
+            inputs, labels, attn_mask = _prepare_batch_for_devices(
+                batch, cfg.seq_len, use_doc_mask, n_devices
+            )
+            if use_doc_mask:
+                loss, acc = eval_step(params, inputs, labels, attn_mask)
+            else:
+                loss, acc = eval_step(params, inputs, labels)
+            total_loss += _unwrap_replicated(loss, use_pmap)
+            total_acc += _unwrap_replicated(acc, use_pmap)
+            n_batches += 1
+        if n_batches == 0:
+            return None, None, 0
+        return (
+            float(jax.device_get(total_loss / n_batches)),
+            float(jax.device_get(total_acc / n_batches)),
+            n_batches,
+        )
 
     while global_step < steps_budget:
         tracking_this_step = (
@@ -1497,6 +1763,7 @@ def run(cfg):
         global_step += 1
 
         if tracking_this_step:
+            _track_t0 = time.time()
             measurement_metrics = None
             if eigen_tracking_measurement_mode == "probe_update":
                 tracking_grads, tracking_updates, measurement_metrics = compute_probe_measurement(
@@ -1531,13 +1798,14 @@ def run(cfg):
                         n_devices,
                     )
 
-            _lm_precond_eigsys = None
+            _lm_precond_dirs = None
             if not use_pmap and precond_criterion_enabled:
-                _lm_precond_eigsys = extract_precond_eigsystem(
+                _lm_precond_dirs = extract_precond_directions(
                     opt_state_before,
                     optim_name,
                     params_before,
                     precond_criterion_max_dirs,
+                    stratified=precond_criterion_stratified,
                 )
             eigen_tracking_state = run_eigen_tracking(
                 params_before,
@@ -1547,7 +1815,9 @@ def run(cfg):
                 state.step,
                 eigen_tracking_state,
                 tracking_curvature_batch,
-                **({"precond_eigsys": _lm_precond_eigsys} if not use_pmap else {}),
+                # The criterion is computed on the host from the compact basis
+                # below, so the in-JIT dense path stays off at LM scale.
+                **({"precond_eigsys": None} if not use_pmap else {}),
             )
             should_track_now, phase_offset, phase_index, phase_frac = (
                 _eigen_tracking_phase_info(cfg, global_step)
@@ -1556,6 +1826,17 @@ def run(cfg):
             measurement_metrics = dict(
                 _unwrap_measurement_metrics(measurement_metrics, use_pmap) or {}
             )
+            if compute_transfer_reduction is not None and tracking_updates is not None:
+                _tr = compute_transfer_reduction(
+                    _unwrap_replicated(params_before, use_pmap),
+                    _unwrap_replicated(tracking_updates, use_pmap),
+                )
+                measurement_metrics.update(
+                    {k: float(jax.device_get(v)) for k, v in _tr.items()}
+                )
+                # R_probe is measured on the fixed curvature batch, which is also
+                # the batch whose gradient built the update.
+                measurement_metrics["probe_batch_is_grad_batch"] = 1.0
             measurement_metrics.update(
                 {
                     "tracking_phase_offset": phase_offset,
@@ -1563,6 +1844,21 @@ def run(cfg):
                     "tracking_phase_frac": phase_frac,
                 }
             )
+
+            # Eval + train loss on the probe grid itself, so every tracking row
+            # carries the generalisation gap alongside the curvature measures
+            # rather than needing to be joined against the eval_every schedule.
+            if validloader is not None:
+                _e_loss, _e_acc, _n_eval = _split_metrics(state.params, validloader)
+                if _e_loss is not None:
+                    measurement_metrics["eval_loss"] = _e_loss
+                    measurement_metrics["eval_accuracy"] = _e_acc
+                    _t_loss, _t_acc, _ = _split_metrics(
+                        state.params, trainloader, max_batches=_n_eval
+                    )
+                    if _t_loss is not None:
+                        measurement_metrics["train_loss_probe"] = _t_loss
+                        measurement_metrics["train_accuracy_probe"] = _t_acc
 
             _unwrapped_tracking_state = _unwrap_replicated(
                 eigen_tracking_state, use_pmap
@@ -1598,6 +1894,60 @@ def run(cfg):
                     measurement_metrics[f"muon_topk_energy_layer_{_i}"] = _e
                     measurement_metrics[f"muon_topk_energy_baseline_layer_{_i}"] = _b
 
+            # Everything above is the pre-existing measurement; time it before
+            # the certificate so the two costs can be compared directly.
+            jax.block_until_ready(_unwrapped_tracking_state.eigenvalues)
+            measurement_metrics["tracking_seconds"] = time.time() - _track_t0
+            _pk = _peak_device_mem_mib()
+            measurement_metrics["peak_device_mem_mib"] = _pk
+            print(
+                f"[{_ts()}][mem] step={global_step} "
+                f"curvature_batches={int(getattr(cfg, 'eigen_tracking_curvature_batches', 1) or 1)} "
+                f"topk={eigen_tracking_topk} extra={eigen_tracking_extra_modes} "
+                f"peak_device_mem={_pk:.0f} MiB",
+                flush=True,
+            )
+
+            _precond_t0 = time.time()
+            _lm_precond_metrics = None
+            if run_precond_hvp is not None and _lm_precond_dirs is not None:
+                # One key for all M directions on purpose: for a stochastic
+                # curvature backend every a_d must be a Rayleigh quotient of the
+                # *same* operator, or Cov(phat, a) mixes directions with sampling
+                # noise. The GGN backend ignores it.
+                _pc_key = jax.random.PRNGKey(
+                    (int(getattr(cfg, "seed", 0)) * 7919 + global_step) & 0x7FFFFFFF
+                )
+                _lm_precond_metrics = precond_criterion_from_directions(
+                    _lm_precond_dirs,
+                    params_before,
+                    jnp.concatenate(
+                        [
+                            _unwrapped_tracking_state.eigenvectors,
+                            _unwrapped_tracking_state.extra_eigenvectors,
+                        ],
+                        axis=0,
+                    ),
+                    lambda q: run_precond_hvp(
+                        params_before, q, tracking_curvature_batch, _pc_key
+                    ),
+                    damping=precond_criterion_damping,
+                )
+                _lm_precond_metrics["steps_since_precond_refresh"] = (
+                    soap_steps_since_refresh(
+                        opt_state_before,
+                        _optim_key in {"ni_soap", "ni-soap", "nisoap"},
+                        int(getattr(cfg, "precondition_frequency", 0)),
+                    )
+                    if _optim_key in {"soap", "ni_soap", "ni-soap", "nisoap"}
+                    else float("nan")
+                )
+
+            measurement_metrics["precond_criterion_seconds"] = (
+                time.time() - _precond_t0 if _lm_precond_metrics is not None
+                else float("nan")
+            )
+
             append_eigen_tracking_row(
                 eigen_tracking_csv_path,
                 _unwrapped_tracking_state,
@@ -1608,9 +1958,12 @@ def run(cfg):
                 soap_perlayer_sin2=_soap_perlayer_sin2_lm,
                 muon_topk_energy=_muon_topk_energy_lm and not use_pmap,
                 num_2d_layers=_num_2d_layers_lm,
+                lanczos_iters=int(eigen_tracking_iters),
+                precond_metrics=_lm_precond_metrics,
             )
 
             if run_section1 is not None:
+                _s1_t0 = time.time()
                 _s1_key = jax.random.PRNGKey(
                     (int(getattr(cfg, "seed", 0)) * 1000003 + global_step) & 0x7FFFFFFF
                 )
@@ -1619,6 +1972,7 @@ def run(cfg):
                 _section1_out = run_section1(
                     params_before,
                     tracking_updates,
+                    tracking_grads,
                     tracking_curvature_batch,
                     eigen_tracking_state.eigenvectors,
                     eigen_tracking_state.extra_eigenvectors,
@@ -1630,6 +1984,15 @@ def run(cfg):
                     _s1_sizes,
                 )
                 _section1_out = _unwrap_replicated(_section1_out, use_pmap)
+                _s1_norms = None
+                if _s1_namesake_norms:
+                    _s1_norms = namesake_matrix_norms(
+                        _unwrap_replicated(tracking_grads, use_pmap),
+                        _unwrap_replicated(tracking_updates, use_pmap),
+                        _s1_meta,
+                        seed=int(getattr(cfg, "seed", 0)) + global_step,
+                        power_iters=_s1_power_iters,
+                    )
                 append_section1_row(
                     section1_csv_path,
                     global_step,
@@ -1637,6 +2000,8 @@ def run(cfg):
                     total_keep=eigen_tracking_topk + eigen_tracking_extra_modes,
                     n_blocks=_s1_n_blocks,
                     n_types=_s1_n_types,
+                    namesake_norms=_s1_norms,
+                    section1_seconds=time.time() - _s1_t0,
                 )
 
         if global_step % log_every == 0:
@@ -1685,6 +2050,8 @@ def run(cfg):
                 "eval_acc": eval_acc,
                 "eval_ppl": float(jnp.exp(eval_loss)),
             }
+            best_eval_loss = min(best_eval_loss, eval_loss)
+            metrics["best_eval_loss"] = best_eval_loss
             log_scalar_dict(cfg, metrics)
 
     print("Training complete.")

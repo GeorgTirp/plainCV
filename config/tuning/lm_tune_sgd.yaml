@@ -1,0 +1,37 @@
+program: train_lm.py
+method: bayes
+metric:
+  name: best_eval_loss
+  goal: minimize
+command:
+- ${env}
+- ${interpreter}
+- -u
+- ${program}
+- --config=config/lm_sgd.yaml
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-07
+    max: 0.1
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1.0e-06
+    max: 0.25
+  sgd_momentum:
+    distribution: uniform
+    min: 0.5
+    max: 0.99
+  sgd_nesterov:
+    value: false
+  eigen_tracking_enabled:
+    value: false
+  effective_curvature_tracking_enabled:
+    value: false
+  precond_criterion_enabled:
+    value: false
+  use_wandb:
+    value: true
+  wandb_project:
+    value: tune-sgd-lm-fwedu-16
+run_cap: 16

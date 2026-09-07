@@ -1,0 +1,47 @@
+program: train.py
+method: bayes
+metric:
+  name: best_eval_loss
+  goal: minimize
+command:
+- ${env}
+- ${interpreter}
+- -u
+- ${program}
+- --config=config/vit_tinyimagenet_ggn_kaon.yaml
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  adam_fallback_lr:
+    distribution: log_uniform_values
+    min: 1.0e-05
+    max: 0.01
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.1
+  muon_beta:
+    distribution: uniform
+    min: 0.85
+    max: 0.99
+  muon_nesterov:
+    value: false
+  kaon_sv_dist:
+    value: halfnormal
+  eigen_tracking_enabled:
+    value: false
+  effective_curvature_tracking_enabled:
+    value: false
+  num_epochs:
+    value: 30
+  use_wandb:
+    value: true
+  wandb_project:
+    value: tune-kaon-vit-tinyimagenet-16
+  precond_criterion_enabled:
+    value: false
+  hessian_probe_enabled:
+    value: false
+run_cap: 16

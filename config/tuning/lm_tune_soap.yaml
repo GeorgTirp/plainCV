@@ -1,0 +1,57 @@
+program: train_lm.py
+method: bayes
+metric:
+  name: best_eval_loss
+  goal: minimize
+command:
+- ${env}
+- ${interpreter}
+- -u
+- ${program}
+- --config=config/lm_soap.yaml
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-07
+    max: 0.03
+  adam_fallback_lr:
+    distribution: log_uniform_values
+    min: 1.0e-07
+    max: 0.03
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.3
+  beta1:
+    distribution: uniform
+    min: 0.75
+    max: 0.95
+  beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.995
+  eps:
+    distribution: log_uniform_values
+    min: 1.0e-10
+    max: 1.0e-06
+  precondition_frequency:
+    values:
+    - 32
+  shampoo_beta2:
+    distribution: uniform
+    min: 0.85
+    max: 0.999
+  soap_log_skipped:
+    values:
+    - false
+  eigen_tracking_enabled:
+    value: false
+  effective_curvature_tracking_enabled:
+    value: false
+  use_wandb:
+    value: true
+  precond_criterion_enabled:
+    value: false
+  wandb_project:
+    value: tune-soap-lm-fwedu-16
+run_cap: 16

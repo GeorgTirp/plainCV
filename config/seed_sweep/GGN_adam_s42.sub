@@ -1,5 +1,5 @@
 universe   = vanilla
-initialdir = /home/gtirpitz/plainCV
+initialdir = /lustre/home/gtirpitz/plainCV
 
 executable = nc_train_lm.sh
 arguments  = config/seed_sweep/lm_adam_seeds.yaml _ ggn
@@ -11,7 +11,10 @@ error  = job_outputs/GGN_adam_s42.$(Cluster).$(Process).err
 log    = job_outputs/GGN_adam_s42.$(Cluster).log
 
 request_cpus   = 4
-request_memory = 16384
+# SOAP is the binding arm: a smoke run at the final probe config peaked at
+# 24485 MB host RAM and was held against a 22118 MB cap (HTCondor enforces ~90%
+# of request_memory). 48 GB leaves headroom for the full-length run.
+request_memory = 49152
 request_gpus   = 1
 min_gpu_mem_mb = 80000
 requirements   = (TARGET.CUDAGlobalMemoryMb >= $(min_gpu_mem_mb)) \
@@ -25,5 +28,10 @@ MaxTime = 129600
 
 periodic_hold = (JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
 periodic_hold_reason = "Job runtime exceeded MaxTime"
+
+# nc_train_lm.sh exits 42 when JAX cannot see a GPU (it refuses to burn cluster
+# time training on CPU). Put the job back in the queue on that code so it retries
+# on a healthy node; every other exit code is final.
+on_exit_remove = (ExitBySignal == true) || (ExitCode =!= 42)
 
 queue 1

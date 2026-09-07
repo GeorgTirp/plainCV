@@ -1,0 +1,64 @@
+# W&B Bayesian sweep — Hadamard-Signum on the LM (train_lm.py).
+# Register with:  wandb sweep config/lm_sweep_hadamard_signum.yaml
+# Then update nc_sweep_hadamard_signum.sub with the returned sweep ID.
+#
+# Mirrors config/lm_sweep_signum.yaml (same search space, same budget) so the
+# two arms stay comparable. Hadamard-Signum only changes the frame in which the
+# sign is taken on routed matrices, which shifts the update scale — hence the lr
+# must be re-tuned rather than inherited from Signum, as
+# config/lm_hadamard_signum.yaml currently does.
+#
+# There is no AdamW fallback here (non-routed leaves take the plain
+# coordinate-wise sign), so unlike the Muon/Kaon/SOAP sweeps there is no
+# separate `adam_fallback_lr` axis.
+#
+# `seed` is deliberately not a sweep axis: it also seeds the fixed random
+# Walsh-Hadamard frame, so varying it would confound frame draw with run noise.
+program: train_lm.py
+method: bayes
+metric:
+  # NOT `eval_loss`: define_metric("eval_loss", summary="min") stores that as
+  # {"min": ...}, which does not resolve to a number, leaving the sweep with
+  # no objective (server-side bestLoss stayed 0/None). train.py and
+  # train_lm.py log `best_eval_loss` as a running min, so the run summary
+  # holds a plain float that any sweep controller can read.
+  name: best_eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/lm_hadamard_signum.yaml
+
+parameters:
+  # Use names that match keys in the base config YAML.
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 3.0e-2
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.25
+
+  signum_momentum:
+    distribution: uniform
+    min: 0.75
+    max: 0.99
+
+  # Curvature measurement is a post-tuning protocol — far too expensive to carry
+  # through a sweep (config/lm_hadamard_signum.yaml enables it for the paper
+  # runs).
+  eigen_tracking_enabled:
+    value: false
+
+  effective_curvature_tracking_enabled:
+    value: false
+
+  use_wandb:
+    value: true
+
+run_cap: 16

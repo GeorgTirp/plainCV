@@ -1,0 +1,78 @@
+# W&B Bayesian sweep — Kaon on ViT-S/4 / tiny-imagenet.
+# Register with:  wandb sweep config/vit_sweep_kaon.yaml
+# Then update nc_sweep_vit_kaon.sub with the returned sweep ID.
+#
+# Mirrors config/vit_sweep_muon.yaml: Kaon keeps Muon's momentum buffer, shape
+# scaling and AdamW fallback (same matrix routing), and only replaces the
+# singular values of the orthogonalized momentum by random positive noise. The
+# search space is therefore identical to Muon's, plus the sv-distribution knob
+# held fixed at the arm's default.
+program: train.py
+method: bayes
+metric:
+  # NOT `eval_loss`: define_metric("eval_loss", summary="min") stores that as
+  # {"min": ...}, which does not resolve to a number, leaving the sweep with
+  # no objective (server-side bestLoss stayed 0/None). train.py and
+  # train_lm.py log `best_eval_loss` as a running min, so the run summary
+  # holds a plain float that any sweep controller can read.
+  name: best_eval_loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -u
+  - ${program}
+  - --config=config/vit_tinyimagenet_ggn_kaon.yaml
+
+parameters:
+  # lr drives the Kaon (2D kernel) branch only.
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 1.0e-2
+
+  # Independent lr for the AdamW fallback branch (embeddings, norms, biases).
+  # Sampled separately from `lr` so the two branches are not forced to share
+  # an optimum; the range is one decade wider at the bottom because the
+  # fallback params usually prefer a smaller step than the routed kernels.
+  adam_fallback_lr:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1.0e-2
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 0.1
+
+  muon_beta:
+    distribution: uniform
+    min: 0.85
+    max: 0.99
+
+  muon_nesterov:
+    value: false
+
+  # Kaon ablation knob, not a tuning axis: keep the arm's singular-value
+  # distribution fixed so the sweep does not mix |N(0,1)| and Exp(1) runs.
+  kaon_sv_dist:
+    value: "halfnormal"
+
+  # Disable eigentracking during sweep — too expensive
+  eigen_tracking_enabled:
+    value: false
+
+  effective_curvature_tracking_enabled:
+    value: false
+
+  num_epochs:
+    value: 30
+
+  use_wandb:
+    value: true
+
+  wandb_project:
+    value: vit-tinyimagenet-tune
+
+run_cap: 30

@@ -19,11 +19,12 @@ vit_dropout: 0.2
 vit_use_layernorm: true
 vit_use_batchnorm: false
 optim: kaon
-lr: 0.0022989324808814432
-weight_decay: 0.08202160491660175
+lr: 0.002026824548307793
+adam_fallback_lr: 8.279745507842141e-05
+weight_decay: 0.03853680921771853
 beta1: 0.9
 beta2: 0.999
-muon_beta: 0.8897271787640741
+muon_beta: 0.8829596232660777
 muon_ns_steps: 5
 muon_ns_coeffs:
 - 3.4445
@@ -47,7 +48,7 @@ eigen_tracking_sort_by_abs: false
 eigen_tracking_light_ortho: false
 eigen_tracking_light_ortho_every: 4
 eigen_tracking_measurement_mode: probe_update
-precond_criterion_enabled: true
+precond_criterion_enabled: false
 effective_curvature_tracking_enabled: true
 effective_curvature_transform_base: zero
 effective_curvature_direction_scale: 1.0

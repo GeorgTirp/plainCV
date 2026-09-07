@@ -35,7 +35,9 @@ from optim.eigentools import (
     init_eigentracking,
     track_eigenstate,
     extract_momentum_pytree,
-    extract_precond_eigsystem,
+    extract_precond_directions,
+    densify_precond_directions,
+    _leaf_offsets_of,
     compute_soap_perlayer_sin2,
     compute_muon_topk_energy,
 )
@@ -305,6 +307,9 @@ def main(_argv):
     eigen_tracking_enabled = bool(getattr(cfg, "eigen_tracking_enabled", False))
     measurement_momentum = bool(getattr(cfg, "measurement_momentum", False))
     precond_criterion_enabled = bool(getattr(cfg, "precond_criterion_enabled", False))
+    precond_criterion_stratified = bool(
+        getattr(cfg, "precond_criterion_stratified", True)
+    )
     precond_criterion_max_dirs = int(getattr(cfg, "precond_criterion_max_dirs", 40))
     precond_criterion_damping = float(getattr(cfg, "precond_criterion_damping", 1e-6))
     eigen_tracking_state = None
@@ -653,6 +658,11 @@ def main(_argv):
 
     training_start_time = time.time()
     train_global_step = 0
+    # Running best, logged every epoch so the run summary ends up holding a
+    # plain float. W&B sweeps read the objective off the summary, and
+    # define_metric(..., summary="min") stores eval_loss as {"min": ...}, which
+    # does not resolve to a number -- see config/*_sweep_*.yaml.
+    best_eval_loss = float("inf")
 
     # --------------------
     # Training loop
@@ -699,7 +709,7 @@ def main(_argv):
                         (_completed - phase_sweep_first_fresh) % phase_sweep_T
                     )
 
-                _, eval_ds_meas = get_datasets(
+                train_ds_meas, eval_ds_meas = get_datasets(
                     dataset=cfg.dataset,
                     batch_size=cfg.batch_size,
                     seed=cfg.seed,
@@ -713,14 +723,47 @@ def main(_argv):
                     jnp.mean(jnp.array([m["accuracy"] for m in _eval_metrics_meas]))
                 )
 
+                # Train-side loss on the same probe grid, measured with the same
+                # estimator (eval_step -> train=False, so no dropout) over as
+                # many train batches as the eval split has. The split is not
+                # augmented and get_datasets is seeded, so this is the same
+                # subset at every checkpoint and eval_loss - train_loss_probe is
+                # a like-for-like generalisation gap.
+                _n_meas_batches = len(_eval_metrics_meas)
+                _train_metrics_meas = []
+                for _meas_batch in train_ds_meas:
+                    if len(_train_metrics_meas) >= _n_meas_batches:
+                        break
+                    _train_metrics_meas.append(eval_step(state, _meas_batch))
+                if _train_metrics_meas:
+                    measurement_metrics["train_loss_probe"] = float(
+                        jnp.mean(jnp.array([m["loss"] for m in _train_metrics_meas]))
+                    )
+                    measurement_metrics["train_accuracy_probe"] = float(
+                        jnp.mean(jnp.array([m["accuracy"] for m in _train_metrics_meas]))
+                    )
+
                 _precond_eigsys = None
+                _precond_meta = None
                 if precond_criterion_enabled:
-                    _precond_eigsys = extract_precond_eigsystem(
+                    _precond_dirs = extract_precond_directions(
                         opt_state_before,
                         _optim_name,
                         params_before,
                         precond_criterion_max_dirs,
+                        stratified=precond_criterion_stratified,
                     )
+                    if _precond_dirs is not None:
+                        _, _, _pc_dim = _leaf_offsets_of(params_before)
+                        _precond_eigsys = densify_precond_directions(
+                            _precond_dirs, _pc_dim
+                        )
+                        # a_d/phat_d come from the in-JIT path; lambda_hat and the
+                        # stratum label are only known here, at extraction time.
+                        _precond_meta = {
+                            "lambda_hat_per_dir": _precond_dirs.lambda_hat,
+                            "stratum_per_dir": _precond_dirs.stratum,
+                        }
                 eigen_tracking_state = run_eigen_tracking(
                     params_before,
                     opt_state_before,
@@ -763,6 +806,7 @@ def main(_argv):
                     soap_perlayer_sin2=_soap_perlayer_sin2,
                     muon_topk_energy=_muon_topk_energy,
                     num_2d_layers=_num_2d_layers,
+                    precond_metrics=_precond_meta,
                 )
 
                 if hessian_probe_enabled:
@@ -808,6 +852,10 @@ def main(_argv):
         eval_accs.append(float(eval_summary["accuracy"]))
 
         metrics = {
+                # define_metric("*", step_metric="step") above makes every chart
+                # plot against "step", so it has to be logged -- without it W&B
+                # fills 0 for every epoch and all curves collapse onto x=0.
+                "step": train_global_step,
                 "epoch": epoch,
                 "train_loss": float(train_summary["loss"]),
                 "train_accuracy": float(train_summary["accuracy"]),
@@ -815,6 +863,8 @@ def main(_argv):
                 "eval_accuracy": float(eval_summary["accuracy"]),
                 "epoch_time": epoch_time,
             }
+        best_eval_loss = min(best_eval_loss, float(eval_summary["loss"]))
+        metrics["best_eval_loss"] = best_eval_loss
         # Console + optional wandb logging
         log_scalar_dict(
             cfg,
